@@ -10,6 +10,7 @@ end of every session (no crashes, tests and clippy clean, smoke tests cover new 
 | 1 | User interface | Every Orca page, sidebar, all 580 settings in Orca's layout, 3D plates, Move/Rotate/Scale/Lay on face, STL/OBJ import |
 | 2 | Slicing engine core | Layers, walls, top/bottom/solid/sparse, 7 infill generators, skirt/brim, normal supports, cooling, G-code, estimates, real toolpath Preview, export |
 | 3 | CI, autosave, crash recovery | GitHub Actions on Linux/Windows/macOS (+ real app run on a software GPU), autosave with OS-lock crash detection and restore prompt, crash reports, atomic settings files, shader validation test |
+| 4 | Profiles | OrcaSlicer's library (72 vendors, 1,192 printers) embedded, setup wizard, compatibility filtering, printer defaults, the custom G-code macro language (all 4,768 library templates render), user presets as Orca-style files, import/export |
 
 ## Order, and why
 Get a user's own printer printing well and safely first (profiles, correct motion G-code,
@@ -54,7 +55,7 @@ CI comes early because the Windows and macOS builds are not yet checked by anyth
 
 **Done when:** CI is green on all three; killing the app mid-edit and reopening it restores the plate.
 
-## 4 · Profiles
+## 4 · Profiles — done
 - Read Orca's `resources/profiles` (vendors, printer models, variants, filaments, processes)
   with `inherits`, `compatible_printers` / `compatible_printers_condition` and per-nozzle variants.
 - The setup wizard: pick printers and filaments by vendor, as Orca's first-run guide does.

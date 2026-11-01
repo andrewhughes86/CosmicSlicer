@@ -24,6 +24,11 @@ variable layer height, painting tools, 3MF projects and printer connections.
 
 Script it: `CosmicSlicer model.stl --set sparse_infill_density=30% --export out.gcode`.
 
+Step 4 — profiles: OrcaSlicer's whole library (72 vendors, 1,192 printers, every filament and
+process) with the setup wizard; filaments and processes filtered to what suits the selected
+printer; each printer's own start/end G-code, run through OrcaSlicer's macro language; user
+presets saved as OrcaSlicer-style files, with import and export.
+
 ## Your work is safe
 CosmicSlicer autosaves the open project a minute after each change and before slicing. If it
 ever closes unexpectedly, the next start offers the project back. Crash reports, settings and

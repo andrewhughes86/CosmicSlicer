@@ -57,6 +57,7 @@ pub fn job(session: &Session, plate: usize) -> Job {
     let filaments = (0..p.project_filaments.len()).map(|i| p.effective(TabKind::Filament, i)).collect();
     let bed = session.plate_settings.get(plate).and_then(|s| s.bed_type).unwrap_or(session.bed_type);
     let bed_key = BED_TYPES.get(bed).map_or("textured_plate_temp", |b| b.1).to_owned();
+    let bed_type_name = BED_TYPES.get(bed).map_or("Textured PEI Plate", |b| b.0).to_owned();
     let mut process = p.effective(TabKind::Process, 0);
     if let Some(s) = session.plate_settings.get(plate) {
         match s.spiral {
@@ -70,6 +71,7 @@ pub fn job(session: &Session, plate: usize) -> Job {
         process,
         filaments,
         bed_key,
+        bed_type_name,
         objects: session
             .model
             .objects
@@ -189,5 +191,58 @@ mod tests {
         let (lo, size) = session.bed();
         assert!(b.min.x >= lo.x && b.max.x <= lo.x + size.x, "{b:?}");
         assert!(job(&session, 0).objects.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod library_printers {
+    use super::*;
+    use crate::state::Prefs;
+
+    fn slice_on(printer: &str) -> Result<CosmicSlicer_engine::Sliced, String> {
+        let prefs = Prefs { installed_printers: vec![printer.to_owned()], ..Prefs::default() };
+        let mut session = Session::new();
+        session.presets = crate::profiles::build(&prefs);
+        if session.presets.current_printer().is_none_or(|p| p.name != printer) {
+            return Err(format!("{printer} is not in the library"));
+        }
+        session.add_primitive("Cube");
+        let runner = Runner::start(&session)?;
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(r) = runner.poll() {
+                return r.map_err(|e| e.to_string());
+            }
+            if started.elapsed().as_secs() > 120 {
+                return Err("timed out".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn real_printers_slice_with_their_own_gcode() {
+        for (printer, expect) in [
+            ("Bambu Lab X1 Carbon 0.4 nozzle", "M1002"),
+            ("Prusa MK4S 0.4 nozzle", "M555"),
+            ("Creality K1C 0.4 nozzle", "START_PRINT"),
+            ("Voron 2.4 350 0.4 nozzle", "PRINT_START"),
+            ("MyKlipper 0.4 nozzle", "PRINT_START"),
+        ] {
+            let out = slice_on(printer);
+            assert!(out.is_ok(), "{printer}: {:?}", out.as_ref().err());
+            let Ok(out) = out else { continue };
+            let start: String =
+                out.gcode.lines().take_while(|l| !l.starts_with(";LAYER_CHANGE")).collect::<Vec<_>>().join("\n");
+            assert!(
+                start.contains(expect),
+                "{printer}: start G-code lacks {expect}:\n{}",
+                &start[..start.len().min(1500)]
+            );
+            let leftover =
+                out.gcode.lines().map(|l| l.split(';').next().unwrap_or("")).find(|c| c.contains(['{', '}']));
+            assert!(leftover.is_none(), "{printer}: template text in G-code: {leftover:?}");
+            assert!(out.gcode.contains(";TYPE:Outer wall"), "{printer}");
+        }
     }
 }

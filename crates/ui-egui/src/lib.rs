@@ -17,6 +17,7 @@ pub mod icons;
 mod menus;
 mod pages;
 mod preview;
+mod profiles;
 mod recovery;
 mod settings;
 mod sidebar;
@@ -27,6 +28,7 @@ pub mod theme;
 mod topbar;
 pub mod ui_kit;
 mod viewport;
+mod wizard;
 
 use std::path::PathBuf;
 
@@ -69,6 +71,10 @@ pub enum Action {
     ZoomFit,
     ToggleSidebar,
     Rename(u64),
+    /// Open the setup wizard (on its filament page when true).
+    Wizard(bool),
+    ImportConfig,
+    ExportPreset(TabKind, usize),
     /// A feature not built yet, by name.
     Unavailable(&'static str),
 }

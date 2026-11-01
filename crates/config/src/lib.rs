@@ -7,8 +7,11 @@
 
 #![allow(non_snake_case)]
 
+pub mod expr;
+pub mod library;
 pub mod presets;
 pub mod schema;
+pub mod userfiles;
 
 pub use presets::{Preset, PresetBundle, PresetKind, Slot};
 pub use schema::{Entry, Group, Mode, OptionDef, OptionType, Page, Schema, TabKind};

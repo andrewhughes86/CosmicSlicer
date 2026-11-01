@@ -85,6 +85,9 @@ pub struct CosmicSlicerApp {
     autosaver: Option<crate::recovery::Autosaver>,
     /// The settings file as last written, so unchanged settings are not rewritten.
     saved_settings: String,
+    /// The user's preset files, kept in step with the bundle.
+    user_files: Option<crate::profiles::UserFiles>,
+    user_presets_seen: u64,
 }
 
 impl CosmicSlicerApp {
@@ -101,27 +104,41 @@ impl CosmicSlicerApp {
         };
         crate::recovery::install_crash_reports(&dir);
         // Settings: our own file, else what older versions kept in eframe's storage.
+        let mut saved = SavedPresets::default();
         match crate::store::read_json::<Persisted>(&dir.join("settings.json")) {
             Ok(Some(p)) => {
                 app.session.prefs = p.prefs;
-                restore_presets(&mut app.session, p.presets);
+                saved = p.presets;
             }
             Ok(None) => {
                 if let Some(storage) = cc.storage {
-                    let session = &mut app.session;
                     if let Some(prefs) =
                         storage.get_string(PREFS_KEY).and_then(|s| serde_json::from_str::<Prefs>(&s).ok())
                     {
-                        session.prefs = prefs;
+                        app.session.prefs = prefs;
                     }
-                    if let Some(saved) =
+                    if let Some(s) =
                         storage.get_string(PRESETS_KEY).and_then(|s| serde_json::from_str::<SavedPresets>(&s).ok())
                     {
-                        restore_presets(session, saved);
+                        saved = s;
                     }
                 }
             }
             Err(e) => app.session.notify(Level::Warning, e),
+        }
+        // Presets: the library for the installed printers, then the user's own files.
+        app.session.presets = crate::profiles::build(&app.session.prefs);
+        let (files, errors) = crate::profiles::UserFiles::load(&dir, &mut app.session.presets);
+        for e in errors {
+            app.session.notify(Level::Warning, format!("A user preset could not be read: {e}"));
+        }
+        app.user_files = Some(files);
+        restore_presets(&mut app.session, saved);
+        app.user_presets_seen = user_presets_hash(&app.session);
+        // First run: the setup wizard, as OrcaSlicer opens it.
+        if !app.session.prefs.setup_done {
+            app.dialogs.wizard =
+                Some(crate::wizard::Wizard::new(&app.session.prefs, crate::wizard::WizardPage::Printers));
         }
         match crate::recovery::Autosaver::start(&dir) {
             Ok((saver, orphans)) => {
@@ -174,6 +191,8 @@ impl CosmicSlicerApp {
             data_dir: None,
             autosaver: None,
             saved_settings: String::new(),
+            user_files: None,
+            user_presets_seen: 0,
         }
     }
 
@@ -355,6 +374,8 @@ impl CosmicSlicerApp {
                 "about" => actions.push(Action::About),
                 "shortcuts" => actions.push(Action::Shortcuts),
                 "compare" => actions.push(Action::ComparePresets),
+                "wizard" => actions.push(Action::Wizard(false)),
+                "wizard-filaments" => actions.push(Action::Wizard(true)),
                 other => eprintln!("--dialog: unknown dialog {other}"),
             },
             Step::Slice => actions.push(Action::Slice),
@@ -408,6 +429,55 @@ impl CosmicSlicerApp {
             self.session.import(&path);
         }
         self.viewport.fit_pending = true;
+    }
+
+    /// Imports OrcaSlicer or CosmicSlicer preset files as user presets.
+    fn import_config(&mut self) {
+        let files =
+            rfd::FileDialog::new().set_title("Import Configs").add_filter("Preset (.json)", &["json"]).pick_files();
+        let s = &mut self.session;
+        for path in files.unwrap_or_default() {
+            let result = std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|t| CosmicSlicer_config::userfiles::from_json(&t, None));
+            match result {
+                Ok((kind, p)) => {
+                    let name = p.name.clone();
+                    let index = s.presets.add_user(kind, p);
+                    if kind == TabKind::Printer {
+                        s.presets.select(kind, 0, index);
+                    }
+                    s.notify(Level::Info, format!("Imported {} preset \"{name}\".", kind.title().to_lowercase()));
+                }
+                Err(e) => s.notify(Level::Error, format!("{}: {e}", path.display())),
+            }
+        }
+    }
+
+    /// Writes the selected preset of `kind` as an OrcaSlicer-style JSON file.
+    fn export_preset(&mut self, kind: TabKind, filament: usize) {
+        let s = &mut self.session;
+        let Some(p) = s.presets.preset(kind, filament).cloned() else { return };
+        let mut p = p;
+        // Export what is on screen, edits included, as a preset based on the selected one.
+        p.config = s.presets.effective(kind, filament);
+        if p.system {
+            p.inherits = p.name.clone();
+            p.system = false;
+        }
+        let text = CosmicSlicer_config::userfiles::to_text(s.schema, kind, &p);
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export preset")
+            .add_filter("Preset (.json)", &["json"])
+            .set_file_name(CosmicSlicer_config::userfiles::file_name(&p.name))
+            .save_file()
+        else {
+            return;
+        };
+        match crate::store::write_atomic(&path, text.as_bytes()) {
+            Ok(()) => s.notify(Level::Info, format!("Exported {}", path.display())),
+            Err(e) => s.notify(Level::Error, format!("Could not write {}: {e}", path.display())),
+        }
     }
 
     fn export_stl(&mut self) {
@@ -495,6 +565,13 @@ impl CosmicSlicerApp {
                 let name = s.model.get(id).map(|o| o.name.clone()).unwrap_or_default();
                 self.dialogs.rename = Some((id, name));
             }
+            Action::Wizard(filaments) => {
+                let page =
+                    if filaments { crate::wizard::WizardPage::Filaments } else { crate::wizard::WizardPage::Printers };
+                self.dialogs.wizard = Some(crate::wizard::Wizard::new(&s.prefs, page));
+            }
+            Action::ImportConfig => self.import_config(),
+            Action::ExportPreset(kind, filament) => self.export_preset(kind, filament),
             Action::Unavailable(what) => s.notify(Level::Warning, format!("{what} arrives in a later step.")),
         }
     }
@@ -730,45 +807,43 @@ fn simulated_panic() -> ! {
 
 fn saved_presets(session: &Session) -> SavedPresets {
     let b = &session.presets;
-    let user = |list: &[Preset]| list.iter().filter(|p| !p.system).cloned().collect::<Vec<_>>();
     let name = |list: &[Preset], i: usize| list.get(i).map(|p| p.name.clone()).unwrap_or_default();
+    // User presets live in their own files now; only the selections are kept here.
     SavedPresets {
-        printers: user(&b.printers),
-        filaments: user(&b.filaments),
-        processes: user(&b.processes),
+        printers: Vec::new(),
+        filaments: Vec::new(),
+        processes: Vec::new(),
         printer: name(&b.printers, b.printer.preset),
         process: name(&b.processes, b.process.preset),
         project_filaments: b.project_filaments.iter().map(|s| name(&b.filaments, s.preset)).collect(),
     }
 }
 
+/// Puts back the selections, and user presets an older version kept in the settings file.
 fn restore_presets(session: &mut Session, saved: SavedPresets) {
     let b = &mut session.presets;
-    let add = |list: &mut Vec<Preset>, user: Vec<Preset>| {
-        for p in user {
-            if !list.iter().any(|q| q.name == p.name) {
-                list.push(Preset { system: false, ..p });
+    for (kind, list) in
+        [(TabKind::Printer, saved.printers), (TabKind::Filament, saved.filaments), (TabKind::Process, saved.processes)]
+    {
+        for p in list {
+            if !b.list(kind).iter().any(|q| q.name == p.name) {
+                b.add_user(kind, Preset { system: false, ..p });
             }
         }
-    };
-    add(&mut b.printers, saved.printers);
-    add(&mut b.filaments, saved.filaments);
-    add(&mut b.processes, saved.processes);
-    let find = |list: &[Preset], name: &str| list.iter().position(|p| p.name == name);
-    if let Some(i) = find(&b.printers, &saved.printer) {
-        b.printer.preset = i;
     }
-    if let Some(i) = find(&b.processes, &saved.process) {
-        b.process.preset = i;
+    crate::profiles::select_by_name(b, &saved.printer, &saved.process, &saved.project_filaments);
+}
+
+/// Changes when any user preset is added, changed, renamed or deleted.
+fn user_presets_hash(session: &Session) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for kind in [TabKind::Printer, TabKind::Filament, TabKind::Process] {
+        for p in session.presets.list(kind).iter().filter(|p| !p.system) {
+            format!("{}{:?}{:?}", p.name, p.inherits, p.config).hash(&mut h);
+        }
     }
-    let filaments: Vec<usize> = saved.project_filaments.iter().filter_map(|n| find(&b.filaments, n)).collect();
-    if !filaments.is_empty() {
-        b.project_filaments = filaments
-            .into_iter()
-            .take(CosmicSlicer_config::presets::MAX_FILAMENTS)
-            .map(|preset| CosmicSlicer_config::Slot { preset, ..Default::default() })
-            .collect();
-    }
+    h.finish()
 }
 
 impl eframe::App for CosmicSlicerApp {
@@ -836,6 +911,29 @@ impl CosmicSlicerApp {
         {
             self.session.notify(Level::Warning, e);
         }
+        // User presets are written as soon as they change.
+        let seen = user_presets_hash(&self.session);
+        if seen != self.user_presets_seen {
+            self.user_presets_seen = seen;
+            if let Some(files) = self.user_files.as_mut() {
+                for e in files.sync(&self.session.presets) {
+                    self.session.notify(Level::Warning, e);
+                }
+            }
+        }
+        if let Some(wizard) = self.dialogs.wizard.as_mut()
+            && let Some(outcome) = wizard.show(&ctx, tokens)
+        {
+            self.dialogs.wizard = None;
+            self.session.prefs.setup_done = true;
+            if let crate::wizard::Outcome::Finished { printers, filaments } = outcome {
+                self.session.prefs.installed_printers = printers;
+                self.session.prefs.visible_filaments = filaments;
+                self.session.presets = crate::profiles::rebuild(&self.session.presets, &self.session.prefs);
+                self.session.sliced = None;
+                self.save_settings();
+            }
+        }
         topbar::resize_edges(&ctx);
         topbar::show(ui, &mut self.session, tokens, &mut self.choices, &mut actions);
 
@@ -882,6 +980,9 @@ impl CosmicSlicerApp {
         self.dialogs.show(&ctx, &mut self.session, tokens, &mut self.device);
         if std::mem::take(&mut self.dialogs.export_requested) {
             actions.push(Action::ExportGcode);
+        }
+        if let Some((kind, filament)) = self.dialogs.export_preset.take() {
+            actions.push(Action::ExportPreset(kind, filament));
         }
         if let Some(restore) = self.dialogs.restore_choice.take() {
             self.answer_restore(restore);
@@ -1008,6 +1109,20 @@ mod smoke {
             report: Some(PathBuf::from("/nonexistent/crash.txt")),
         });
         frames(&mut app, &ctx, 3);
+        for page in [crate::wizard::WizardPage::Printers, crate::wizard::WizardPage::Filaments] {
+            app.dialogs.wizard = Some(crate::wizard::Wizard::new(&app.session.prefs, page));
+            frames(&mut app, &ctx, 2);
+        }
+        app.dialogs.wizard = None;
+        // A user preset to rename and delete.
+        let schema = app.session.schema;
+        app.session.presets.set_value(schema, TabKind::Process, 0, "wall_loops", "3".into());
+        assert!(app.session.presets.save_as(TabKind::Process, 0, "Mine").is_ok());
+        let mine = app.session.presets.process.preset;
+        app.dialogs.editor = Some(Editor { kind: TabKind::Process, filament: 0, page: 0, search: String::new() });
+        app.dialogs.rename_preset = Some((TabKind::Process, mine, "Mine 2".into()));
+        app.dialogs.delete_preset = Some((TabKind::Process, mine));
+        frames(&mut app, &ctx, 2);
         // Restoring a snapshot that is gone is an error notice, not a crash.
         app.dialogs.restore_choice = Some(true);
         frames(&mut app, &ctx, 2);

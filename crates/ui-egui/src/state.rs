@@ -68,6 +68,12 @@ pub struct Prefs {
     /// Imperial shows inches in the object panels; settings stay in OrcaSlicer's units.
     pub imperial: bool,
     pub recent: Vec<PathBuf>,
+    /// Printer presets installed in the setup wizard.
+    pub installed_printers: Vec<String>,
+    /// Filament base names made visible in the setup wizard ("Generic PLA").
+    pub visible_filaments: Vec<String>,
+    /// The setup wizard has been completed.
+    pub setup_done: bool,
 }
 
 impl Default for Prefs {
@@ -82,6 +88,9 @@ impl Default for Prefs {
             zoom_to_mouse: true,
             imperial: false,
             recent: Vec::new(),
+            installed_printers: Vec::new(),
+            visible_filaments: Vec::new(),
+            setup_done: false,
         }
     }
 }
@@ -179,7 +188,7 @@ impl Session {
     pub fn new() -> Self {
         Self {
             schema: Schema::get(),
-            presets: PresetBundle::builtin(),
+            presets: crate::profiles::build(&Prefs::default()),
             model: Model::new(),
             selection: Vec::new(),
             plate: 0,

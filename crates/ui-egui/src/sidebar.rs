@@ -68,21 +68,84 @@ pub fn preset_combo(
     modified: bool,
     width: f32,
 ) -> Option<usize> {
+    let all: Vec<usize> = (0..list.len()).collect();
+    match preset_combo_filtered(ui, id, list, current, modified, width, &all, None) {
+        Some(Pick::Preset(i)) => Some(i),
+        _ => None,
+    }
+}
+
+/// What a preset dropdown returned.
+pub enum Pick {
+    Preset(usize),
+    /// The entry at the bottom ("Add/Remove printers…").
+    Footer,
+}
+
+/// A preset dropdown showing only `shown` (user presets first, then by vendor), with an
+/// optional `footer` entry.
+#[allow(clippy::too_many_arguments)]
+pub fn preset_combo_filtered(
+    ui: &mut Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    list: &[Preset],
+    current: usize,
+    modified: bool,
+    width: f32,
+    shown: &[usize],
+    footer: Option<&str>,
+) -> Option<Pick> {
     let text = list.get(current).map(|p| preset_label(p, modified)).unwrap_or_default();
     let mut chosen = None;
-    egui::ComboBox::from_id_salt(id).selected_text(text).width(width).height(420.0).show_ui(ui, |ui| {
+    let mut order: Vec<usize> = shown.to_vec();
+    order.sort_by_key(|&i| list.get(i).is_some_and(|p| p.system));
+    egui::ComboBox::from_id_salt(id).selected_text(text).width(width).height(460.0).show_ui(ui, |ui| {
         let mut vendor = "";
-        for (i, p) in list.iter().enumerate() {
+        for i in order {
+            let Some(p) = list.get(i) else { continue };
             if p.vendor != vendor {
                 vendor = &p.vendor;
                 ui.label(RichText::new(vendor).small().weak());
             }
             if ui.selectable_label(i == current, format!("   {}", p.name)).clicked() {
-                chosen = Some(i);
+                chosen = Some(Pick::Preset(i));
+            }
+        }
+        if let Some(label) = footer {
+            ui.separator();
+            if ui.selectable_label(false, format!("   {label}")).clicked() {
+                chosen = Some(Pick::Footer);
             }
         }
     });
-    chosen.filter(|i| *i != current)
+    match chosen {
+        Some(Pick::Preset(i)) if i == current => None,
+        other => other,
+    }
+}
+
+/// A filament or process dropdown listing what suits the selected printer.
+#[allow(clippy::too_many_arguments)]
+fn preset_combo_compatible(
+    ui: &mut Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    session: &Session,
+    kind: TabKind,
+    current: usize,
+    modified: bool,
+    width: f32,
+    actions: &mut Vec<Action>,
+) -> Option<usize> {
+    let shown = session.presets.compatible(kind);
+    let footer = (kind == TabKind::Filament).then_some("Add/Remove filaments…");
+    match preset_combo_filtered(ui, id, session.presets.list(kind), current, modified, width, &shown, footer) {
+        Some(Pick::Preset(i)) => Some(i),
+        Some(Pick::Footer) => {
+            actions.push(Action::Wizard(true));
+            None
+        }
+        None => None,
+    }
 }
 
 pub fn show(ui: &mut Ui, sb: &mut Sidebar, session: &mut Session, t: &Tokens, actions: &mut Vec<Action>) {
@@ -122,15 +185,20 @@ fn printer(ui: &mut Ui, sb: &mut Sidebar, session: &mut Session, t: &Tokens, act
             ui.vertical(|ui| {
                 let width = ui.available_width() - 4.0;
                 let slot = session.presets.printer.clone();
-                if let Some(i) = preset_combo(
+                let all: Vec<usize> = (0..session.presets.printers.len()).collect();
+                match preset_combo_filtered(
                     ui,
                     "printer-preset",
                     &session.presets.printers,
                     slot.preset,
                     slot.is_modified(),
                     width,
+                    &all,
+                    Some("Add/Remove printers…"),
                 ) {
-                    actions.push(Action::SelectPreset(TabKind::Printer, 0, i));
+                    Some(Pick::Preset(i)) => actions.push(Action::SelectPreset(TabKind::Printer, 0, i)),
+                    Some(Pick::Footer) => actions.push(Action::Wizard(false)),
+                    None => {}
                 }
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Plate type").color(t.text_muted));
@@ -146,22 +214,31 @@ fn printer(ui: &mut Ui, sb: &mut Sidebar, session: &mut Session, t: &Tokens, act
                 });
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Nozzle").color(t.text_muted));
+                    // The installed nozzle sizes of this printer model; picking one switches to that
+                    // printer preset, as in OrcaSlicer.
                     let schema = session.schema;
-                    let nozzle = session.presets.value(schema, TabKind::Printer, 0, "nozzle_diameter");
-                    let nozzle = nozzle.split(',').next().unwrap_or("0.4").trim().to_owned();
+                    let variants = crate::profiles::nozzle_variants(&session.presets, schema);
+                    let current = session.presets.printer.preset;
+                    let nozzle = variants.iter().find(|(i, _)| *i == current).map_or_else(String::new, |v| v.1.clone());
                     let mut chosen = None;
                     egui::ComboBox::from_id_salt("nozzle").selected_text(format!("{nozzle} mm")).width(110.0).show_ui(
                         ui,
                         |ui| {
-                            for d in ["0.2", "0.4", "0.6", "0.8"] {
-                                if ui.selectable_label(d == nozzle, format!("{d} mm")).clicked() {
-                                    chosen = Some(d);
+                            for (i, d) in &variants {
+                                if ui.selectable_label(*i == current, format!("{d} mm")).clicked() {
+                                    chosen = Some(*i);
                                 }
+                            }
+                            ui.separator();
+                            if ui.selectable_label(false, "Add nozzles…").clicked() {
+                                chosen = Some(usize::MAX);
                             }
                         },
                     );
-                    if let Some(d) = chosen {
-                        session.presets.set_value(schema, TabKind::Printer, 0, "nozzle_diameter", d.to_owned());
+                    match chosen {
+                        Some(usize::MAX) => actions.push(Action::Wizard(false)),
+                        Some(i) if i != current => actions.push(Action::SelectPreset(TabKind::Printer, 0, i)),
+                        _ => {}
                     }
                 });
             });
@@ -238,9 +315,16 @@ fn filament_item(ui: &mut Ui, session: &mut Session, t: &Tokens, i: usize, width
     });
     let Some(slot) = session.presets.project_filaments.get(i).cloned() else { return };
     let combo_w = (width - 26.0 - 30.0).max(60.0);
-    if let Some(p) =
-        preset_combo(ui, ("filament-preset", i), &session.presets.filaments, slot.preset, slot.is_modified(), combo_w)
-    {
+    if let Some(p) = preset_combo_compatible(
+        ui,
+        ("filament-preset", i),
+        session,
+        TabKind::Filament,
+        slot.preset,
+        slot.is_modified(),
+        combo_w,
+        actions,
+    ) {
         actions.push(Action::SelectPreset(TabKind::Filament, i, p));
     }
     if icons::button(ui, "edit", t, 20.0, false, "Edit this filament").clicked() {
@@ -409,9 +493,16 @@ fn process(ui: &mut Ui, sb: &mut Sidebar, session: &mut Session, t: &Tokens, act
         let slot = session.presets.process.clone();
         ui.horizontal(|ui| {
             let w = ui.available_width() - 30.0;
-            if let Some(i) =
-                preset_combo(ui, "process-preset", &session.presets.processes, slot.preset, slot.is_modified(), w)
-            {
+            if let Some(i) = preset_combo_compatible(
+                ui,
+                "process-preset",
+                session,
+                TabKind::Process,
+                slot.preset,
+                slot.is_modified(),
+                w,
+                actions,
+            ) {
                 actions.push(Action::SelectPreset(TabKind::Process, 0, i));
             }
             if icons::button(ui, "edit", t, 22.0, false, "Edit process settings").clicked() {

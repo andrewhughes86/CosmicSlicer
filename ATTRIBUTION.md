@@ -11,6 +11,12 @@ Taken from OrcaSlicer (commit 95a27321456e73cf6c6270d37dccfe819a96b130, 2026-11-
   the settings page / group layout, extracted from `src/libslic3r/PrintConfig.cpp` and
   `src/slic3r/GUI/Tab.cpp`.
 - The preview legend's feature colours, from `src/libvgcode/src/ViewerImpl.cpp`.
+- `assets/profiles/orca_profiles.bin` — OrcaSlicer's printer, filament and process profile
+  library (`resources/profiles`, 72 vendors), packed by `tools/pack_orca_profiles.py`. The
+  vendor profiles were contributed to OrcaSlicer by the printer and filament makers and the
+  OrcaSlicer community.
+- The custom G-code macro language follows PrusaSlicer's PlaceholderParser as OrcaSlicer uses it;
+  the list of template variables follows OrcaSlicer's `PrintConfig.cpp`.
 
 ## CosmicSlicer's own
 - `assets/icons/app/cosmicslicer.svg` and `assets/icons/cosmic/cosmic_logo.svg` — original.

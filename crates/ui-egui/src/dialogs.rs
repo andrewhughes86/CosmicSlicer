@@ -50,6 +50,14 @@ pub struct Dialogs {
     pub print: bool,
     /// The Print dialog's "Export G-code" was clicked.
     pub export_requested: bool,
+    /// The setup wizard, while open.
+    pub wizard: Option<crate::wizard::Wizard>,
+    /// User preset being renamed: (kind, index, new name so far).
+    pub rename_preset: Option<(TabKind, usize, String)>,
+    /// User preset to delete once confirmed.
+    pub delete_preset: Option<(TabKind, usize)>,
+    /// "Export…" was clicked in a settings window.
+    pub export_preset: Option<(TabKind, usize)>,
     /// A project left by a session that did not exit cleanly, and the answer to restoring it.
     pub restore: Option<crate::recovery::Orphan>,
     pub restore_choice: Option<bool>,
@@ -77,7 +85,7 @@ impl Dialogs {
                 return true;
             }
         }
-        self.calibration.take().is_some() || self.editor.take().is_some()
+        self.calibration.take().is_some() || self.editor.take().is_some() || self.wizard.take().is_some()
     }
 
     pub fn show(&mut self, ctx: &egui::Context, session: &mut Session, t: &Tokens, device: &mut DeviceState) {
@@ -91,6 +99,7 @@ impl Dialogs {
         self.printer_window(ctx, session, t, device);
         self.small_windows(ctx, session, t);
         self.restore_window(ctx, t);
+        self.preset_windows(ctx, session, t);
     }
 
     fn editor_window(&mut self, ctx: &egui::Context, session: &mut Session, t: &Tokens) {
@@ -120,20 +129,43 @@ impl Dialogs {
                     true,
                 );
                 let list = session.presets.list(ed.kind).to_vec();
+                let shown = session.presets.compatible(ed.kind);
                 if let Some(slot) = session.presets.slot(ed.kind, ed.filament).cloned()
-                    && let Some(i) = preset_combo(
+                    && let Some(crate::sidebar::Pick::Preset(i)) = crate::sidebar::preset_combo_filtered(
                         ui,
                         ("editor-preset", ed.kind.title(), ed.filament),
                         &list,
                         slot.preset,
                         slot.is_modified(),
                         340.0,
+                        &shown,
+                        None,
                     )
                 {
                     chosen = Some(i);
                 }
                 if icons::button(ui, "save", t, 24.0, false, "Save preset").clicked() {
                     save = true;
+                }
+                // User presets can be renamed, deleted and cut loose from their system parent.
+                let index = session.presets.slot(ed.kind, ed.filament).map_or(0, |s| s.preset);
+                let current = session.presets.list(ed.kind).get(index).cloned();
+                let user = current.as_ref().is_some_and(|p| !p.system);
+                if icons::button_enabled(ui, "edit", t, 24.0, false, user, "Rename").clicked()
+                    && let Some(p) = &current
+                {
+                    self.rename_preset = Some((ed.kind, index, p.name.clone()));
+                }
+                if icons::button_enabled(ui, "delete", t, 24.0, false, user, "Delete").clicked() {
+                    self.delete_preset = Some((ed.kind, index));
+                }
+                if let Some(p) = current.as_ref().filter(|p| !p.system && !p.inherits.is_empty())
+                    && ui.small_button("Detach").on_hover_text(format!("Stop following \"{}\"", p.inherits)).clicked()
+                {
+                    session.presets.detach(ed.kind, index);
+                }
+                if ui.small_button("Export…").clicked() {
+                    self.export_preset = Some((ed.kind, ed.filament));
                 }
                 if icons::button(ui, "compare", t, 24.0, false, "Compare presets").clicked() {
                     let current = session.presets.slot(ed.kind, ed.filament).map_or(0, |s| s.preset);
@@ -571,6 +603,56 @@ impl Dialogs {
         });
         if !open {
             self.physical_printer = false;
+        }
+    }
+
+    fn preset_windows(&mut self, ctx: &egui::Context, session: &mut Session, t: &Tokens) {
+        if let Some((kind, index, mut name)) = self.rename_preset.clone() {
+            let mut open = true;
+            let mut done = false;
+            Window::dialog("Rename preset").show(ctx, t, &mut open, |ui| {
+                ui.set_width(380.0);
+                let edit = ui.add(egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY));
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    done = true;
+                }
+                if ui.button("Rename").clicked() {
+                    done = true;
+                }
+            });
+            if done {
+                match session.presets.rename(kind, index, &name) {
+                    Ok(()) => open = false,
+                    Err(e) => session.notify(Level::Warning, e),
+                }
+            }
+            self.rename_preset = open.then_some((kind, index, name));
+        }
+        if let Some((kind, index)) = self.delete_preset {
+            let mut open = true;
+            let name = session.presets.list(kind).get(index).map(|p| p.name.clone()).unwrap_or_default();
+            let mut answer = None;
+            Window::dialog("Delete preset").show(ctx, t, &mut open, |ui| {
+                ui.set_width(380.0);
+                ui.label(format!("Delete the user preset \"{name}\"? Its file is removed too."));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+            if answer == Some(true)
+                && let Err(e) = session.presets.delete(kind, index)
+            {
+                session.notify(Level::Warning, e);
+            }
+            if answer.is_some() || !open {
+                self.delete_preset = None;
+            }
         }
     }
 

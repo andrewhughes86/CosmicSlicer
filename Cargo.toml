@@ -40,8 +40,10 @@ env_logger = { version = "0.11", default-features = false, features = ["auto-col
 glam = "0.30"
 i_overlay = { version = "9.1", default-features = false }
 log = "0.4"
+miniz_oxide = "0.8"
 png = "0.18"
 rayon = "1.10"
+regex = { version = "1.11", default-features = false, features = ["std", "unicode-perl", "unicode-case"] }
 resvg = { version = "=0.48.1", default-features = false }
 rfd = "0.17.2"
 serde = { version = "1", features = ["derive"] }

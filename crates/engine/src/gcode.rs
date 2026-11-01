@@ -8,6 +8,7 @@ use glam::{DVec2, DVec3};
 use crate::geom;
 use crate::settings::{Filament, Settings, bead_area};
 use crate::toolpath::{Island, LayerPlan, Path, Role};
+use CosmicSlicer_config::expr::Value;
 
 /// One extrusion move for the Preview.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -68,12 +69,14 @@ pub struct Context<'a> {
     /// Extruder (0-based) per object.
     pub object_extruder: &'a [usize],
     pub object_names: &'a [String],
-    /// Values for `[key]` / `{key}` placeholders in custom G-code.
-    pub lookup: &'a dyn Fn(&str) -> Option<String>,
+    /// Custom G-code rendering.
+    pub macros: &'a crate::macros::Macros<'a>,
     pub plate_name: String,
 }
 
 pub struct Output {
+    /// The first custom G-code that could not be rendered; the slice fails with it.
+    pub error: Option<String>,
     pub gcode: String,
     pub preview: Preview,
     pub stats: Stats,
@@ -485,40 +488,6 @@ fn fan_command(percent: f64) -> String {
     if s == 0 { "M107".into() } else { format!("M106 S{s}") }
 }
 
-/// Fills `[key]`, `{key}` and `{key[0]}` from `lookup`; anything else is left as written.
-pub fn placeholders(text: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(i) = rest.find(['[', '{']) {
-        out.push_str(&rest[..i]);
-        let open = rest.as_bytes().get(i).copied().unwrap_or(b'[');
-        let close = if open == b'[' { ']' } else { '}' };
-        let after = &rest[i + 1..];
-        let Some(j) = after.find(close) else {
-            out.push_str(&rest[i..]);
-            rest = "";
-            break;
-        };
-        let inner = after[..j].trim();
-        // `name` or `name[0]`.
-        let name = inner.split('[').next().unwrap_or("").trim();
-        let valid = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-        match valid.then(|| lookup(name)).flatten() {
-            Some(v) => {
-                let index = inner.split('[').nth(1).and_then(|s| s.trim_end_matches(']').trim().parse::<usize>().ok());
-                let value = v.split(',').nth(index.unwrap_or(0)).unwrap_or(&v).trim().to_owned();
-                out.push_str(&value);
-            }
-            None => {
-                out.push_str(&rest[i..i + 1 + j + 1]);
-            }
-        }
-        rest = &after[j + 1..];
-    }
-    out.push_str(rest);
-    out
-}
-
 fn has_command(gcode: &str, words: &[&str]) -> bool {
     gcode.lines().any(|l| {
         let code = l.split(';').next().unwrap_or("").trim_start();
@@ -583,7 +552,17 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
     w.temp = nozzle_first;
 
     // ---- start ----
-    let start = placeholders(&s.gcode.start, cx.lookup);
+    let mut error: Option<String> = None;
+    let mut render = |what: &str, template: &str, layer: &[(&str, Value)]| -> String {
+        match cx.macros.render(what, template, layer) {
+            Ok(t) => t,
+            Err(e) => {
+                error.get_or_insert(e);
+                String::new()
+            }
+        }
+    };
+    let start = render("Machine start G-code", &s.gcode.start, &[]);
     w.line("M73 P0 R0");
     if !has_command(&start, &["M140", "M190"]) {
         w.line(&format!("M140 S{}", bed_first.round() as i64));
@@ -627,19 +606,15 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         let prev_print_z = w.print_z;
         w.print_z = plan.print_z;
         let z = plan.print_z + s.z_offset;
-        let lookup_layer = |key: &str| -> Option<String> {
-            match key {
-                "layer_num" => Some(li.to_string()),
-                "layer_z" => Some(f3(plan.print_z)),
-                "previous_layer_z" => Some(f3(prev_print_z)),
-                "max_layer_z" => Some(f3(plans.last().map_or(0.0, |p| p.print_z))),
-                _ => (cx.lookup)(key),
-            }
-        };
+        let layer_vars = [
+            ("layer_num", Value::Num(li as f64)),
+            ("layer_z", Value::Num(plan.print_z)),
+            ("previous_layer_z", Value::Num(prev_print_z)),
+        ];
         w.line(";LAYER_CHANGE");
         w.line(&format!(";Z:{}", f3(plan.print_z)));
         w.line(&format!(";HEIGHT:{}", f3(plan.height)));
-        let before = placeholders(&s.gcode.before_layer, &lookup_layer);
+        let before = render("Before layer change G-code", &s.gcode.before_layer, &layer_vars);
         if !before.trim().is_empty() {
             w.out.push_str(before.trim_end());
             w.out.push('\n');
@@ -654,7 +629,7 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         w.line(&format!("G1 Z{}{f}", f3(z)));
         w.hopped = false;
         w.pos.z = plan.print_z;
-        let after = placeholders(&s.gcode.layer_change, &lookup_layer);
+        let after = render("Layer change G-code", &s.gcode.layer_change, &layer_vars);
         if !after.trim().is_empty() {
             w.out.push_str(after.trim_end());
             w.out.push('\n');
@@ -755,7 +730,7 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
     w.set_fan(0.0);
     w.line("M73 P100 R0");
     w.line("; machine end G-code");
-    let end = placeholders(&s.gcode.end, cx.lookup);
+    let end = render("Machine end G-code", &s.gcode.end, &[]);
     w.out.push_str(end.trim_end());
     w.out.push('\n');
 
@@ -789,7 +764,7 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
     header.push('\n');
     let mut gcode = header;
     gcode.push_str(&w.out);
-    Output { gcode, preview: w.preview, stats, warnings: w.warnings }
+    Output { error, gcode, preview: w.preview, stats, warnings: w.warnings }
 }
 
 fn join(v: &[f64], decimals: usize) -> String {
@@ -829,20 +804,6 @@ fn rough_layer_time(plan: &LayerPlan) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn placeholders_fill_known_keys_only() {
-        let lookup = |k: &str| match k {
-            "bed_temperature_initial_layer_single" => Some("60".to_owned()),
-            "nozzle_temperature_initial_layer" => Some("215,220".to_owned()),
-            _ => None,
-        };
-        let out = placeholders(
-            "M190 S[bed_temperature_initial_layer_single]\nM109 S{nozzle_temperature_initial_layer[1]}\n{if x}G1{endif} [unknown] [",
-            &lookup,
-        );
-        assert_eq!(out, "M190 S60\nM109 S220\n{if x}G1{endif} [unknown] [");
-    }
 
     #[test]
     fn spots_temperature_commands() {

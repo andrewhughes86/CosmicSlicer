@@ -14,6 +14,7 @@
 pub mod gcode;
 pub mod geom;
 pub mod infill;
+pub mod macros;
 pub mod plan;
 pub mod settings;
 pub mod skirt;
@@ -61,6 +62,8 @@ pub struct Job {
     pub filaments: Vec<Config>,
     /// The plate type's temperature option, e.g. `textured_plate_temp`.
     pub bed_key: String,
+    /// The plate type's name, e.g. "Textured PEI Plate" (custom G-code's `curr_bed_type`).
+    pub bed_type_name: String,
     pub objects: Vec<JobObject>,
     pub plate_name: String,
 }
@@ -118,6 +121,8 @@ pub enum SliceError {
     TooTall(f64, f64),
     #[error("an object lies outside the printable area")]
     Outside,
+    #[error("the printer's custom G-code could not be prepared: {0}")]
+    Gcode(String),
     #[error("the slicing engine hit a bug ({0}); nothing was printed or changed")]
     Bug(String),
 }
@@ -138,16 +143,10 @@ pub fn slice(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
     }
 }
 
-/// The values custom G-code can ask for.
-fn lookup_table(
-    schema: &Schema,
-    base: &Config,
-    filaments: &[Config],
-    fil: &[Filament],
-    extra: Vec<(&str, String)>,
-) -> Config {
+/// The merged settings custom G-code reads: printer and process values, and the filament
+/// options as lists across the extruders, as OrcaSlicer passes them.
+fn macro_table(schema: &Schema, base: &Config, filaments: &[Config]) -> Config {
     let mut table = base.clone();
-    // Filament options as lists across the extruders, as OrcaSlicer passes them.
     let mut keys: Vec<&String> = filaments.iter().flat_map(|f| f.values.keys()).collect();
     keys.sort();
     keys.dedup();
@@ -155,30 +154,6 @@ fn lookup_table(
         let v: Vec<String> =
             filaments.iter().map(|f| f.get(schema, k).split(',').next().unwrap_or("").trim().to_owned()).collect();
         table.set(k.clone(), v.join(","));
-    }
-    let join = |f: &dyn Fn(&Filament) -> f64| {
-        fil.iter().map(|x| format!("{}", f(x).round() as i64)).collect::<Vec<_>>().join(",")
-    };
-    let bed_first = fil.iter().map(|f| f.bed_temp_first).fold(0.0, f64::max);
-    let bed = fil.iter().map(|f| f.bed_temp).fold(0.0, f64::max);
-    for (k, v) in [
-        ("nozzle_temperature_initial_layer", join(&|f| f.nozzle_temp_first)),
-        ("first_layer_temperature", join(&|f| f.nozzle_temp_first)),
-        ("nozzle_temperature", join(&|f| f.nozzle_temp)),
-        ("temperature", join(&|f| f.nozzle_temp)),
-        ("bed_temperature_initial_layer_single", format!("{}", bed_first.round() as i64)),
-        ("bed_temperature_initial_layer", format!("{}", bed_first.round() as i64)),
-        ("first_layer_bed_temperature", format!("{}", bed_first.round() as i64)),
-        ("bed_temperature", format!("{}", bed.round() as i64)),
-        ("initial_extruder", "0".into()),
-        ("initial_tool", "0".into()),
-        ("current_extruder", "0".into()),
-        ("filament_extruder_id", "0".into()),
-    ] {
-        table.set(k, v);
-    }
-    for (k, v) in extra {
-        table.set(k, v);
     }
     table
 }
@@ -296,25 +271,35 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
 
     progress.set(0.88, "Generating G-code");
     let (min, max) = geom::bounds(&footprint).map_or(([0.0, 0.0], [0.0, 0.0]), |(lo, hi)| ([lo.x, lo.y], [hi.x, hi.y]));
-    let table = lookup_table(
-        schema,
-        &base,
-        &job.filaments,
-        &filaments,
-        vec![
-            ("total_layer_count", n.to_string()),
-            ("first_layer_print_min", format!("{:.3},{:.3}", min[0], min[1])),
-            ("first_layer_print_max", format!("{:.3},{:.3}", max[0], max[1])),
-            ("print_bed_min", format!("{:.3},{:.3}", min[0], min[1])),
-            ("print_bed_max", format!("{:.3},{:.3}", max[0], max[1])),
-            ("first_layer_height", format!("{}", s.first_layer_height)),
-            ("max_layer_z", format!("{:.3}", top)),
-            ("plate_name", job.plate_name.clone()),
-        ],
-    );
-    let lookup = |key: &str| -> Option<String> {
-        table.values.get(key).cloned().or_else(|| schema.option(key).map(|_| table.get(schema, key).to_owned()))
+    let table = macro_table(schema, &base, &job.filaments);
+    let (lo, size) = {
+        let pts = CosmicSlicer_config::parse_points(base.get(schema, "printable_area"));
+        let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+        for [x, y] in &pts {
+            lo = [lo[0].min(*x), lo[1].min(*y)];
+            hi = [hi[0].max(*x), hi[1].max(*y)];
+        }
+        if lo[0].is_finite() { (lo, [hi[0] - lo[0], hi[1] - lo[1]]) } else { ([0.0, 0.0], [220.0, 220.0]) }
     };
+    let used_extruders: Vec<usize> = {
+        let mut u: Vec<usize> = job.objects.iter().map(|o| o.extruder.min(filaments.len().saturating_sub(1))).collect();
+        u.sort_unstable();
+        u.dedup();
+        u
+    };
+    let facts = macros::PlateFacts {
+        plate_name: job.plate_name.clone(),
+        bed_type_name: job.bed_type_name.clone(),
+        first_layer_min: min,
+        first_layer_max: max,
+        bed_min: lo,
+        bed_max: [lo[0] + size[0], lo[1] + size[1]],
+        layer_count: n,
+        max_z: top,
+        initial_extruder: used_extruders.first().copied().unwrap_or(0),
+        used_extruders,
+    };
+    let macros = macros::Macros::new(schema, &table, &s, &filaments, &facts);
     let names: Vec<String> = job.objects.iter().map(|o| o.name.clone()).collect();
     let extruders: Vec<usize> = job.objects.iter().map(|o| o.extruder.min(filaments.len().saturating_sub(1))).collect();
     let cx = gcode::Context {
@@ -322,10 +307,13 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
         filaments: &filaments,
         object_extruder: &extruders,
         object_names: &names,
-        lookup: &lookup,
+        macros: &macros,
         plate_name: job.plate_name.clone(),
     };
     let out = gcode::emit(&plans, &cx);
+    if let Some(e) = out.error {
+        return Err(SliceError::Gcode(e));
+    }
     warnings.extend(out.warnings);
     if extruders.iter().any(|e| *e != extruders.first().copied().unwrap_or(0)) {
         warnings.push("Several filaments print without a prime tower for now; expect some colour bleed.".into());
@@ -353,6 +341,7 @@ mod tests {
             process: Config::default(),
             filaments: vec![filament],
             bed_key: "textured_plate_temp".into(),
+            bed_type_name: "Textured PEI Plate".into(),
             objects,
             plate_name: "Plate 1".into(),
         }

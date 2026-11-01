@@ -53,7 +53,7 @@ pub fn file_menu(ui: &mut Ui, session: &mut Session, actions: &mut Vec<Action>) 
         }
         menu_item(ui, "Import ZIP Archive", "", false);
         if menu_item(ui, "Import Configs", "", true) {
-            actions.push(Action::Unavailable("Importing configs"));
+            actions.push(Action::ImportConfig);
         }
     });
     ui.menu_button("Export", |ui| {
@@ -69,8 +69,14 @@ pub fn file_menu(ui: &mut Ui, session: &mut Session, actions: &mut Vec<Action>) 
             actions.push(Action::ExportGcode);
         }
         menu_item(ui, "Export toolpaths as OBJ", "", false);
-        if menu_item(ui, "Export Preset Bundle", "", true) {
-            actions.push(Action::Unavailable("Exporting preset bundles"));
+        if menu_item(ui, "Export printer preset", "", true) {
+            actions.push(Action::ExportPreset(CosmicSlicer_config::TabKind::Printer, 0));
+        }
+        if menu_item(ui, "Export filament preset", "", true) {
+            actions.push(Action::ExportPreset(CosmicSlicer_config::TabKind::Filament, 0));
+        }
+        if menu_item(ui, "Export process preset", "", true) {
+            actions.push(Action::ExportPreset(CosmicSlicer_config::TabKind::Process, 0));
         }
     });
     ui.separator();
@@ -141,6 +147,9 @@ pub fn window_menu(ui: &mut Ui, session: &mut Session, actions: &mut Vec<Action>
         actions.push(Action::Settings(TabKind::Process));
     }
     ui.separator();
+    if menu_item(ui, "Setup Wizard", "", true) {
+        actions.push(Action::Wizard(false));
+    }
     if menu_item(ui, "Compare Presets", "", true) {
         actions.push(Action::ComparePresets);
     }
