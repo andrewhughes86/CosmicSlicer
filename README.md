@@ -36,6 +36,12 @@ on request), arc fitting (G2/G3), Klipper exclude-object and Marlin object label
 thumbnails; G-code files open in the Preview (File → Open G-code, or drop one on the window),
 with travel, retraction and seam marks and a tool marker.
 
+Step 6 — walls: thin walls and gap fill as variable-width lines down narrow parts (Arachne or
+classic), precise outer wall, wall direction; overhang walls slowed, cooled and marked by how far
+they hang, as OrcaSlicer does; "make overhangs printable"; bridges laid the way they are best
+anchored, internal and thick bridges; seams hidden in concave corners and kept off overhangs,
+scarf joint seams, seam gap, staggered inner seams, role-based wipe and wipe on loops.
+
 ## Your work is safe
 CosmicSlicer autosaves the open project a minute after each change and before slicing. If it
 ever closes unexpectedly, the next start offers the project back. Crash reports, settings and
@@ -52,4 +58,3 @@ Linux needs the usual X11/Wayland development packages for winit.
 
 ## License
 AGPL-3.0-or-later, as OrcaSlicer. See `ATTRIBUTION.md`.
-# CosmicSlicer

@@ -110,6 +110,7 @@ pub fn paths(sl: &SupportLayers, i: usize, s: &Settings, first_layer: bool, z: f
                 width: w,
                 speed: if first_layer { s.speeds.first_layer } else { s.speeds.support },
                 flow: 1.0,
+                overhang: Vec::new(),
             });
         }
         let inside = geom::offset(base, -w, Join::Round);
@@ -125,6 +126,7 @@ pub fn paths(sl: &SupportLayers, i: usize, s: &Settings, first_layer: bool, z: f
                 width: w,
                 speed: if first_layer { s.speeds.first_layer } else { s.speeds.support },
                 flow: 1.0,
+                overhang: Vec::new(),
             });
         }
     }
@@ -139,6 +141,7 @@ pub fn paths(sl: &SupportLayers, i: usize, s: &Settings, first_layer: bool, z: f
                 width: w,
                 speed: s.speeds.support_interface,
                 flow: 1.0,
+                overhang: Vec::new(),
             });
         }
     }

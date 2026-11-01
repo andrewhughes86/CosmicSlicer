@@ -25,7 +25,8 @@ pub fn role_of(name: &str) -> Role {
         "internal solid infill" | "solid infill" => Role::SolidInfill,
         "top surface" | "top solid infill" | "skin" => Role::TopSurface,
         "bottom surface" => Role::BottomSurface,
-        "bridge" | "bridge infill" | "internal bridge" => Role::Bridge,
+        "bridge" | "bridge infill" => Role::Bridge,
+        "internal bridge" | "internal bridge infill" => Role::InternalBridge,
         "gap infill" | "gap fill" => Role::GapFill,
         "ironing" => Role::Ironing,
         "skirt" | "skirt/brim" => Role::Skirt,
@@ -93,6 +94,11 @@ pub fn read(text: &str, s: &Settings, fil: &[Filament]) -> Viewed {
     let mut layer_start = (0usize, 0usize, 0usize);
     let mut layers: Vec<PreviewLayer> = Vec::new();
     let mut truncated = false;
+    // Files that mark their layers (";LAYER_CHANGE", ";Z:") are split there, so moves at
+    // another height inside a layer (scarf seams, Z hops) stay in it; others by height.
+    let mut marked = false;
+    let mut new_layer = false;
+    let mut marked_z: Option<f64> = None;
     let close_layer =
         |layers: &mut Vec<PreviewLayer>, preview: &Preview, start: (usize, usize, usize), z: f64, h: f64| {
             if preview.segments.len() > start.0 {
@@ -121,6 +127,12 @@ pub fn read(text: &str, s: &Settings, fil: &[Filament]) -> Viewed {
                 role = role_of(t);
             } else if let Some(w) = comment.strip_prefix("WIDTH:") {
                 width = w.trim().parse::<f64>().ok().filter(|v| *v > 0.0 && *v < 10.0);
+            } else if comment == "LAYER_CHANGE" {
+                marked = true;
+                new_layer = true;
+                marked_z = None;
+            } else if let Some(z) = comment.strip_prefix("Z:") {
+                marked_z = z.trim().parse::<f64>().ok().filter(|v| v.is_finite());
             } else if let Some(h) = comment.strip_prefix("HEIGHT:") {
                 height = h.trim().parse::<f64>().ok().filter(|v| *v > 0.0 && *v < 10.0);
             }
@@ -223,11 +235,14 @@ pub fn read(text: &str, s: &Settings, fil: &[Filament]) -> Viewed {
                 let extruding = de > 1e-9 && xy_len > 1e-6;
                 if extruding {
                     // A new layer when printing starts at a new height.
-                    if (pos.z - layer_z).abs() > 1e-4 {
-                        let h = height.unwrap_or(if layer_z.is_finite() { pos.z - layer_z } else { pos.z }).max(0.01);
+                    let starts = if marked { new_layer } else { (pos.z - layer_z).abs() > 1e-4 };
+                    if starts {
+                        let z = if marked { marked_z.unwrap_or(pos.z) } else { pos.z };
+                        let h = height.unwrap_or(if layer_z.is_finite() { z - layer_z } else { z }).max(0.01);
                         close_layer(&mut layers, &preview, layer_start, layer_z, h);
                         layer_start = (preview.segments.len(), preview.travels.len(), preview.retractions.len());
-                        layer_z = pos.z;
+                        layer_z = z;
+                        new_layer = false;
                     }
                     let fd = fil.get(tool).map_or(1.75, |f| f.diameter);
                     let volume = de * std::f64::consts::PI * (fd / 2.0).powi(2);

@@ -52,6 +52,7 @@ pub fn brim(footprint: &[Shape], s: &Settings, object_height: f64) -> (Vec<Path>
                 width: w,
                 speed: s.speeds.first_layer,
                 flow: 1.0,
+                overhang: Vec::new(),
             });
         }
     }
@@ -79,6 +80,7 @@ pub fn skirt(around: &[Shape], s: &Settings, width: f64, height: f64) -> Vec<Pat
                 width,
                 speed: s.speeds.skirt,
                 flow: 1.0,
+                overhang: Vec::new(),
             });
         }
     }

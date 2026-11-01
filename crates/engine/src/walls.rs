@@ -1,16 +1,71 @@
 //! Walls: loops inset from each island's outline, and the area left inside them for infill.
+//!
+//! Parts too thin for a wall loop get one line down their middle at their own width (thin
+//! walls), and the narrow gaps a loop cannot reach between walls are filled the same way: what
+//! OrcaSlicer's Arachne generator does with variable-width walls, and its classic generator with
+//! thin-wall detection and gap fill.
 
-use crate::geom::{self, Join, Shape};
+use crate::geom::{self, Join, Op, Shape};
+use crate::medial;
 use crate::settings::Settings;
 use crate::toolpath::{Path, Role};
 
 /// One island's walls (outermost first) and the region inside them.
 pub struct Walled {
     pub walls: Vec<Vec<Path>>,
+    /// Lines filling narrow gaps between walls, printed after them.
+    pub gaps: Vec<Path>,
     /// Where infill goes, already grown into the innermost wall by the overlap.
     pub infill_area: Vec<Shape>,
     /// The inner edge of the innermost wall, without overlap (for ironing and checks).
     pub inner_edge: Vec<Shape>,
+}
+
+/// The parts of `region` narrower than `width`, less features narrower than `min_feature`.
+pub fn narrow_parts(region: &[Shape], width: f64, min_feature: f64) -> Vec<Shape> {
+    if region.is_empty() {
+        return Vec::new();
+    }
+    let opened = geom::offset(&geom::offset(region, -width / 2.0, Join::Miter), width / 2.0, Join::Miter);
+    let thin = geom::boolean(region, &opened, Op::Difference);
+    let thin = geom::offset(&geom::offset(&thin, -min_feature / 2.0, Join::Miter), min_feature / 2.0, Join::Miter);
+    geom::without_slivers(thin, min_feature * min_feature)
+}
+
+/// Centre lines of narrow `parts`, as paths of near-constant width.
+pub(crate) fn fill_narrow(
+    parts: &[Shape],
+    s: &Settings,
+    max_w: f64,
+    role: Role,
+    speed: f64,
+    flow: f64,
+    min_len: f64,
+) -> Vec<Path> {
+    let mut out = Vec::new();
+    // One part at a time keeps each raster small.
+    for part in parts {
+        let lines = medial::centre_lines(std::slice::from_ref(part), s.walls.min_bead, max_w, min_len);
+        out.extend(medial::to_paths(&lines, role, speed, flow, min_len));
+    }
+    out
+}
+
+/// Orders a shape's loops for printing: the outer contour in the wall direction, holes the
+/// other way.
+fn oriented(shape: &Shape, ccw: bool) -> Vec<Vec<glam::DVec2>> {
+    shape
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let want_positive = (i == 0) == ccw;
+            let mut c = c.clone();
+            if (geom::signed_area2(&c) > 0.0) != want_positive {
+                c.reverse();
+            }
+            c
+        })
+        .collect()
 }
 
 /// Walls for one island at layer height `h`. `loops` overrides the wall count (top layers
@@ -24,44 +79,100 @@ pub fn walls(island: &Shape, s: &Settings, h: f64, first_layer: bool, loops: usi
     } else {
         (s.speeds.outer * speed_scale, s.speeds.inner * speed_scale)
     };
+    let gap_speed = if first_layer { s.speeds.first_layer } else { s.speeds.gap * speed_scale };
+    let loops = if first_layer && s.walls.one_wall_first_layer { loops.min(1) } else { loops };
     let source = std::slice::from_ref(island);
     let mut walls: Vec<Vec<Path>> = Vec::new();
+    let mut gaps: Vec<Path> = Vec::new();
+    let min_feature = s.walls.min_feature;
     // Distance from the outline to each wall's centre line.
     let mut centre = wo / 2.0;
     let mut inner_edge_at = 0.0;
+    let mut complete = true;
     for k in 0..loops {
         if k == 1 {
-            centre = wo / 2.0 + (so + si) / 2.0;
+            // "Precise outer wall": the first inner wall sits a full width in, so the outer
+            // wall is not squashed outwards and the part keeps its size.
+            centre = if s.walls.precise_outer { wo / 2.0 + (wo + wi) / 2.0 } else { wo / 2.0 + (so + si) / 2.0 };
         } else if k > 1 {
             centre += si;
         }
+        let width = if k == 0 { wo } else { wi };
+        // What this wall has to cover: from its outer edge inwards.
+        let edge = (centre - width / 2.0).max(0.0);
+        let available = if edge > 0.0 { geom::offset(source, -edge, Join::Miter) } else { source.to_vec() };
         let rings = geom::offset(source, -centre, Join::Miter);
         let rings = geom::without_slivers(rings, wo * wo * 0.25);
+        // Where this wall cannot reach: thin walls at the outside, gaps further in.
+        let narrow = if rings.is_empty() { available.clone() } else { narrow_parts(&available, width, min_feature) };
+        if !narrow.is_empty() {
+            if k == 0 {
+                if s.walls.thin_walls {
+                    let thin = fill_narrow(&narrow, s, wo * 1.5, Role::OuterWall, outer_speed, 1.0, wo);
+                    if !thin.is_empty() {
+                        walls.push(Vec::new());
+                        if let Some(w0) = walls.first_mut() {
+                            w0.extend(thin);
+                        }
+                    }
+                }
+            } else {
+                // Arachne prints these as inner walls of varying width; classic as gap fill.
+                let (role, speed, flow) = if s.walls.arachne {
+                    (Role::InnerWall, inner_speed, 1.0)
+                } else {
+                    (Role::GapFill, gap_speed, s.walls.gap_flow)
+                };
+                gaps.extend(fill_narrow(&narrow, s, wi * 1.5, role, speed, flow, s.walls.filter_gap.max(wi)));
+            }
+        }
         if rings.is_empty() {
+            complete = false;
             break;
         }
-        let (role, width, speed) =
-            if k == 0 { (Role::OuterWall, wo, outer_speed) } else { (Role::InnerWall, wi, inner_speed) };
+        let role = if k == 0 { Role::OuterWall } else { Role::InnerWall };
+        let speed = if k == 0 { outer_speed } else { inner_speed };
         let paths: Vec<Path> = rings
             .iter()
-            .flatten()
-            .map(|c| geom::simplify_loop(c, 0.01))
+            .flat_map(|shape| oriented(shape, s.walls.ccw))
+            .map(|c| geom::simplify_loop(&c, 0.01))
             .filter(|c| c.len() >= 3)
-            .map(|points| Path { role, points, closed: true, width, speed, flow: 1.0 })
+            .map(|points| Path::new(role, points, true, width, speed, 1.0))
             .collect();
         inner_edge_at = centre + width / 2.0;
-        walls.push(paths);
+        // Thin walls found at this depth went in first; the loops join them.
+        if let Some(level) = walls.get_mut(k) {
+            level.splice(0..0, paths);
+        } else {
+            walls.push(paths);
+        }
     }
-    let (inner_edge, infill_area) = if walls.is_empty() {
-        // No room for walls (or none wanted): the whole island is infill.
+    let has_loops = walls.iter().flatten().any(|p| p.closed);
+    let (inner_edge, infill_area) = if !has_loops {
+        // No room for walls (or none wanted): the whole island is infill unless walls were
+        // wanted, when thin walls took what there was.
         (vec![island.clone()], if loops == 0 { vec![island.clone()] } else { Vec::new() })
+    } else if !complete {
+        let edge = geom::offset(source, -inner_edge_at, Join::Miter);
+        (edge, Vec::new())
     } else {
         let w_last = if walls.len() == 1 { wo } else { wi };
         let edge = geom::offset(source, -inner_edge_at, Join::Miter);
-        let area = geom::offset(source, -(inner_edge_at - s.infill_wall_overlap * w_last), Join::Miter);
+        // Strips inside the last wall too narrow for infill are gap filled instead.
+        let narrow = narrow_parts(&edge, wi, min_feature);
+        let mut area = geom::offset(source, -(inner_edge_at - s.infill_wall_overlap * w_last), Join::Miter);
+        if !narrow.is_empty() {
+            let (role, speed, flow) = if s.walls.arachne {
+                (Role::InnerWall, inner_speed, 1.0)
+            } else {
+                (Role::GapFill, gap_speed, s.walls.gap_flow)
+            };
+            gaps.extend(fill_narrow(&narrow, s, wi * 1.5, role, speed, flow, s.walls.filter_gap.max(wi)));
+            area = geom::boolean(&area, &geom::offset(&narrow, wi * 0.25, Join::Miter), Op::Difference);
+        }
         (edge, area)
     };
-    Walled { walls, infill_area: geom::without_slivers(infill_area, wi * wi), inner_edge }
+    Walled { walls, gaps, infill_area: geom::without_slivers(infill_area, wi * wi), inner_edge }
 }
 
 #[cfg(test)]
@@ -70,9 +181,15 @@ mod tests {
     use CosmicSlicer_config::{Config, Schema};
     use glam::DVec2;
 
+    fn settings(generator: &str) -> Settings {
+        let mut c = Config::default();
+        c.set("wall_generator", generator);
+        Settings::read(Schema::get(), &c)
+    }
+
     #[test]
     fn two_walls_round_a_square() {
-        let s = Settings::read(Schema::get(), &Config::default());
+        let s = settings("arachne");
         let sq = geom::rectangle(DVec2::ZERO, DVec2::splat(20.0));
         let w = walls(&sq, &s, 0.2, false, 2, 1.0);
         assert_eq!(w.walls.len(), 2);
@@ -82,11 +199,59 @@ mod tests {
         assert!((outer - 4.0 * (20.0 - 0.42)).abs() < 0.05, "{outer}");
         let a = geom::area(&w.infill_area);
         assert!(a > 15.0 * 15.0 && a < 19.0 * 19.0, "{a}");
+        // A plain square leaves no gaps.
+        assert!(w.gaps.is_empty(), "{:?}", w.gaps.len());
+        // Counter-clockwise by default.
+        assert!(geom::signed_area2(&w.walls[0][0].points) > 0.0);
+    }
+
+    #[test]
+    fn walls_turn_the_way_asked() {
+        let mut c = Config::default();
+        c.set("wall_direction", "cw");
+        let s = Settings::read(Schema::get(), &c);
+        let ring = vec![
+            vec![DVec2::ZERO, DVec2::new(20.0, 0.0), DVec2::new(20.0, 20.0), DVec2::new(0.0, 20.0)],
+            vec![DVec2::new(5.0, 5.0), DVec2::new(5.0, 15.0), DVec2::new(15.0, 15.0), DVec2::new(15.0, 5.0)],
+        ];
+        let w = walls(&ring, &s, 0.2, false, 1, 1.0);
+        let areas: Vec<f64> = w.walls[0].iter().map(|p| geom::signed_area2(&p.points)).collect();
+        // The outside clockwise, the hole counter-clockwise.
+        assert!(areas.iter().any(|a| *a < 0.0 && a.abs() > 300.0), "{areas:?}");
+        assert!(areas.iter().any(|a| *a > 0.0 && a.abs() < 300.0), "{areas:?}");
+    }
+
+    #[test]
+    fn a_thin_fin_gets_a_thin_wall() {
+        // A body with a 0.3 mm fin: too thin for a loop.
+        let s = settings("arachne");
+        let fin = geom::rectangle(DVec2::ZERO, DVec2::new(20.0, 0.3));
+        let w = walls(&fin, &s, 0.2, false, 2, 1.0);
+        let thin: Vec<&Path> = w.walls.iter().flatten().filter(|p| !p.closed).collect();
+        assert!(!thin.is_empty());
+        let len: f64 = thin.iter().map(|p| p.length()).sum();
+        assert!(len > 18.0, "{len}");
+        assert!(thin.iter().all(|p| p.role == Role::OuterWall && p.width < 0.42), "{:?}", thin[0].width);
+        // Classic without thin-wall detection drops it, as OrcaSlicer does.
+        let none = walls(&fin, &settings("classic"), 0.2, false, 2, 1.0);
+        assert!(none.walls.iter().flatten().next().is_none());
+    }
+
+    #[test]
+    fn a_gap_between_walls_is_filled() {
+        // 1.9 mm wide: two walls a side leave a strip in the middle no wall fits.
+        let s = settings("classic");
+        let bar = geom::rectangle(DVec2::ZERO, DVec2::new(30.0, 1.9));
+        let w = walls(&bar, &s, 0.2, false, 2, 1.0);
+        assert_eq!(w.walls.len(), 2);
+        let gap: f64 = w.gaps.iter().filter(|p| p.role == Role::GapFill).map(Path::length).sum();
+        assert!(gap > 20.0, "{gap}");
+        assert!(w.gaps.iter().all(|p| p.width >= s.walls.min_bead - 1e-9 && p.width < 0.42 * 1.5 + 1e-9));
     }
 
     #[test]
     fn a_thin_island_gets_what_fits() {
-        let s = Settings::read(Schema::get(), &Config::default());
+        let s = settings("classic");
         let sliver = geom::rectangle(DVec2::ZERO, DVec2::new(20.0, 0.6));
         let w = walls(&sliver, &s, 0.2, false, 3, 1.0);
         assert!(w.walls.len() <= 1);

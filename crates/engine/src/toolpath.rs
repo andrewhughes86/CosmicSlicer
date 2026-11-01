@@ -13,6 +13,7 @@ pub enum Role {
     TopSurface,
     BottomSurface,
     Bridge,
+    InternalBridge,
     GapFill,
     Ironing,
     Skirt,
@@ -25,7 +26,9 @@ pub enum Role {
 }
 
 impl Role {
-    pub const ALL: [Role; 17] = [
+    pub const COUNT: usize = 18;
+
+    pub const ALL: [Role; Role::COUNT] = [
         Role::InnerWall,
         Role::OuterWall,
         Role::OverhangWall,
@@ -34,6 +37,7 @@ impl Role {
         Role::TopSurface,
         Role::BottomSurface,
         Role::Bridge,
+        Role::InternalBridge,
         Role::GapFill,
         Role::Ironing,
         Role::Skirt,
@@ -56,6 +60,7 @@ impl Role {
             Role::TopSurface => "Top surface",
             Role::BottomSurface => "Bottom surface",
             Role::Bridge => "Bridge",
+            Role::InternalBridge => "Internal Bridge",
             Role::GapFill => "Gap infill",
             Role::Ironing => "Ironing",
             Role::Skirt => "Skirt",
@@ -80,6 +85,10 @@ impl Role {
     pub fn is_wall(self) -> bool {
         matches!(self, Role::InnerWall | Role::OuterWall | Role::OverhangWall)
     }
+
+    pub fn is_bridge(self) -> bool {
+        matches!(self, Role::Bridge | Role::InternalBridge)
+    }
 }
 
 /// One extrusion: a line or a loop at one width and speed.
@@ -94,6 +103,9 @@ pub struct Path {
     pub speed: f64,
     /// Extrusion multiplier on top of the filament's flow ratio (bridges).
     pub flow: f64,
+    /// Walls: how far each segment (from point `i` to the next) overhangs the layer below,
+    /// 0 (not) to 5 (95 % or more of the line width). Empty when none does.
+    pub overhang: Vec<u8>,
 }
 
 impl Path {
@@ -105,12 +117,75 @@ impl Path {
         }
     }
 
+    /// A path with no overhang marks.
+    pub fn new(role: Role, points: Vec<DVec2>, closed: bool, width: f64, speed: f64, flow: f64) -> Path {
+        Path { role, points, closed, width, speed, flow, overhang: Vec::new() }
+    }
+
+    /// The overhang degree of segment `i`.
+    pub fn overhang_at(&self, i: usize) -> u8 {
+        self.overhang.get(i).copied().unwrap_or(0)
+    }
+
+    /// Starts a loop at point `i`.
+    pub fn rotate(&mut self, i: usize) {
+        let n = self.points.len();
+        if n == 0 {
+            return;
+        }
+        self.points.rotate_left(i % n);
+        if self.overhang.len() == n {
+            self.overhang.rotate_left(i % n);
+        }
+    }
+
+    /// Runs the other way round, keeping each segment's overhang mark.
+    pub fn reverse(&mut self) {
+        let n = self.points.len();
+        self.points.reverse();
+        if self.overhang.len() == n && n >= 2 {
+            // Segment j now runs from old point n-1-j to n-2-j: old segment n-2-j; a loop's
+            // closing segment stays last.
+            let old = std::mem::take(&mut self.overhang);
+            self.overhang = (0..n)
+                .map(|j| {
+                    if j + 1 < n {
+                        old.get(n - 2 - j).copied().unwrap_or(0)
+                    } else {
+                        old.get(n - 1).copied().unwrap_or(0)
+                    }
+                })
+                .collect();
+        } else {
+            self.overhang.clear();
+        }
+    }
+
     pub fn start(&self) -> Option<DVec2> {
         self.points.first().copied()
     }
 
     pub fn end(&self) -> Option<DVec2> {
         if self.closed { self.points.first().copied() } else { self.points.last().copied() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reversing_keeps_overhang_marks_on_their_segments() {
+        let mut p = Path::new(Role::OuterWall, vec![DVec2::ZERO, DVec2::X, DVec2::ONE, DVec2::Y], true, 0.4, 1.0, 1.0);
+        // Only the segment from X to ONE overhangs.
+        p.overhang = vec![0, 3, 0, 0];
+        p.reverse();
+        let i = p.points.iter().position(|q| *q == DVec2::ONE).unwrap_or(9);
+        assert_eq!(p.points.get(i + 1), Some(&DVec2::X));
+        assert_eq!(p.overhang_at(i), 3);
+        assert_eq!(p.overhang.iter().filter(|d| **d > 0).count(), 1);
+        p.rotate(i);
+        assert_eq!(p.overhang_at(0), 3);
     }
 }
 

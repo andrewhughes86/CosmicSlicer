@@ -203,14 +203,15 @@ mod tests {
         let n = sliced.preview.segments.len();
         assert!(n > 1000);
         for view in 0..preview::VIEW_TYPES.len() {
-            let (colours, range) = preview::colours(&sliced, view, &[false; 17]);
+            let (colours, range) =
+                preview::colours(&sliced, view, &[false; CosmicSlicer_engine::toolpath::Role::COUNT]);
             assert_eq!(colours.len(), n);
             if (1..=8).contains(&view) {
                 assert!(range.is_some_and(|r| r.min <= r.max), "view {view}");
             }
         }
         // Hidden features are transparent.
-        let mut hidden = [false; 17];
+        let mut hidden = [false; CosmicSlicer_engine::toolpath::Role::COUNT];
         hidden[CosmicSlicer_engine::Role::OuterWall.index()] = true;
         let (colours, _) = preview::colours(&sliced, 0, &hidden);
         let outer = sliced.preview.segments.iter().position(|s| s.role == CosmicSlicer_engine::Role::OuterWall);

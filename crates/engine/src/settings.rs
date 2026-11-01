@@ -44,6 +44,11 @@ pub struct Settings {
     pub spiral: bool,
     pub bridge_flow: f64,
     pub only_one_wall_top: bool,
+    pub walls: Walls,
+    pub bridges: Bridges,
+    pub seams: Seams,
+    /// Overhangs steeper than this (degrees from vertical) are filled out into cones.
+    pub printable_overhang: Option<f64>,
     pub ironing: bool,
     pub z_offset: f64,
     pub max_print_height: f64,
@@ -77,6 +82,101 @@ pub struct Speeds {
     pub support_interface: f64,
     pub skirt: f64,
     pub travel_z: f64,
+}
+
+/// A speed that may be a percentage of another; `Off` keeps the other.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RelSpeed {
+    Off,
+    Mm(f64),
+    Percent(f64),
+}
+
+impl RelSpeed {
+    pub fn of(self, base: f64) -> f64 {
+        match self {
+            RelSpeed::Off => base,
+            RelSpeed::Mm(v) => v,
+            RelSpeed::Percent(p) => (base * p / 100.0).clamp(1.0, 2000.0),
+        }
+    }
+}
+
+/// Where gap fill goes in solid infill (OrcaSlicer's `gap_fill_target`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GapFill {
+    Everywhere,
+    TopBottom,
+    Nowhere,
+}
+
+/// Wall generation (OrcaSlicer's Quality → Walls and Overhangs).
+#[derive(Clone, Copy, Debug)]
+pub struct Walls {
+    /// Arachne: thin parts and the gaps between walls get variable-width lines.
+    pub arachne: bool,
+    /// Parts too thin for a wall get one line down the middle.
+    pub thin_walls: bool,
+    /// mm.
+    pub min_bead: f64,
+    pub min_feature: f64,
+    pub gap_fill: GapFill,
+    /// Narrow internal solid infill is printed concentric.
+    pub narrow_solid: bool,
+    /// Gap fill lines shorter than this are left out, mm.
+    pub filter_gap: f64,
+    pub gap_flow: f64,
+    pub detect_overhang: bool,
+    pub overhang_speed: bool,
+    /// For overhangs of 10–25 %, 25–50 %, 50–75 % and 75–100 % of the line width.
+    pub overhang_speeds: [RelSpeed; 4],
+    pub overhang_flow: f64,
+    /// Outer loops counter-clockwise (holes the other way).
+    pub ccw: bool,
+    pub precise_outer: bool,
+    pub one_wall_first_layer: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Bridges {
+    /// Degrees; `None` finds the best direction.
+    pub angle: Option<f64>,
+    pub internal_angle: Option<f64>,
+    pub density: f64,
+    pub internal_density: f64,
+    pub thick: bool,
+    pub thick_internal: bool,
+    pub internal_speed: f64,
+    pub internal_flow: f64,
+}
+
+/// Which loops get a scarf seam.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scarf {
+    None,
+    /// Outer contours only.
+    External,
+    /// Every outer wall loop, holes too.
+    All,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Seams {
+    /// mm the loop stops short of its start.
+    pub gap: f64,
+    pub staggered_inner: bool,
+    pub scarf: Scarf,
+    /// Only where the seam is on a smooth stretch (corner angle over `scarf_angle`).
+    pub scarf_conditional: bool,
+    pub scarf_angle: f64,
+    /// mm above the layer below where the scarf starts.
+    pub scarf_start_height: f64,
+    pub scarf_entire_loop: bool,
+    pub scarf_length: f64,
+    pub scarf_steps: usize,
+    pub scarf_inner: bool,
+    pub scarf_speed: RelSpeed,
+    pub scarf_flow: f64,
 }
 
 /// mm/s².
@@ -172,6 +272,12 @@ pub struct Motion {
     pub wipe_distance: f64,
     /// Share of the retraction done while wiping (0 to 1).
     pub retract_before_wipe: f64,
+    /// Wipes at the speed of what was just printed, else at `wipe_speed`.
+    pub role_based_wipe: bool,
+    /// Of the travel speed.
+    pub wipe_speed: RelSpeed,
+    /// After an outer loop, a small move inwards hides the seam.
+    pub wipe_on_loops: bool,
     pub restart_extra: f64,
     pub avoid_crossing_walls: bool,
     /// Longest detour avoiding walls may add (mm); 0 for no limit.
@@ -243,6 +349,11 @@ pub struct Filament {
     pub fan_off_layers: usize,
     pub full_fan_layer: usize,
     pub overhang_fan: f64,
+    /// Walls overhanging by this degree (0 = every outer wall, 1–5 for 10 %…95 %) or more get
+    /// the overhang fan; `None` when the filament turns it off.
+    pub overhang_fan_from: Option<u8>,
+    /// Internal bridges' fan; `None` keeps the overhang fan.
+    pub internal_bridge_fan: Option<f64>,
     pub slow_down_layer_time: f64,
     pub slow_down_min_speed: f64,
     pub max_volumetric: f64,
@@ -295,6 +406,26 @@ impl Reader<'_> {
             raw.parse::<f64>().ok()?
         };
         (v.is_finite() && v > 0.0).then_some(v)
+    }
+
+    /// A speed in mm/s or a percentage of another; 0 or unreadable is `Off`.
+    pub fn rel_speed(&self, key: &str) -> RelSpeed {
+        let raw = self.first(key);
+        let (v, pct) = match raw.strip_suffix('%') {
+            Some(p) => (p.trim().parse::<f64>().ok(), true),
+            None => (raw.parse::<f64>().ok(), false),
+        };
+        match v {
+            Some(v) if v.is_finite() && v > 0.0 && pct => RelSpeed::Percent(v.min(1000.0)),
+            Some(v) if v.is_finite() && v > 0.0 => RelSpeed::Mm(v.clamp(1.0, 2000.0)),
+            _ => RelSpeed::Off,
+        }
+    }
+
+    /// An angle in degrees where 0 means automatic.
+    pub fn angle_or_auto(&self, key: &str) -> Option<f64> {
+        let v = self.num(key, 0.0);
+        (v.is_finite() && v.abs() > 1e-6).then(|| v.rem_euclid(360.0))
     }
 
     /// A speed in mm/s; 0 or unreadable takes `fallback`.
@@ -352,6 +483,70 @@ impl Settings {
         };
         let default_accel = accel("default_acceleration", 500.0);
         let support_type = r.text("support_type");
+        let bridge_speed = speeds.bridge;
+        let walls = Walls {
+            arachne: r.text("wall_generator") != "classic",
+            thin_walls: r.flag("detect_thin_wall") || r.text("wall_generator") != "classic",
+            min_bead: r
+                .mm_or_percent("min_bead_width", nozzle)
+                .unwrap_or(nozzle * 0.85)
+                .clamp(nozzle * 0.1, nozzle * 2.0),
+            min_feature: r
+                .mm_or_percent("min_feature_size", nozzle)
+                .unwrap_or(nozzle * 0.25)
+                .clamp(nozzle * 0.05, nozzle * 2.0),
+            gap_fill: match r.text("gap_fill_target").as_str() {
+                "everywhere" => GapFill::Everywhere,
+                "topbottom" => GapFill::TopBottom,
+                _ => GapFill::Nowhere,
+            },
+            narrow_solid: r.flag("detect_narrow_internal_solid_infill"),
+            filter_gap: r.range("filter_out_gap_fill", 0.0, 0.0, 100.0),
+            gap_flow: r.range("gap_fill_flow_ratio", 1.0, 0.1, 2.0),
+            detect_overhang: r.flag("detect_overhang_wall"),
+            overhang_speed: r.flag("enable_overhang_speed"),
+            overhang_speeds: [
+                r.rel_speed("overhang_1_4_speed"),
+                r.rel_speed("overhang_2_4_speed"),
+                r.rel_speed("overhang_3_4_speed"),
+                r.rel_speed("overhang_4_4_speed"),
+            ],
+            overhang_flow: r.range("overhang_flow_ratio", 1.0, 0.1, 2.0),
+            ccw: r.text("wall_direction") != "cw",
+            precise_outer: r.flag("precise_outer_wall"),
+            one_wall_first_layer: r.flag("only_one_wall_first_layer"),
+        };
+        let bridges = Bridges {
+            angle: r.angle_or_auto("bridge_angle"),
+            internal_angle: r.angle_or_auto("internal_bridge_angle"),
+            density: r.range("bridge_density", 100.0, 10.0, 100.0) / 100.0,
+            internal_density: r.range("internal_bridge_density", 100.0, 10.0, 100.0) / 100.0,
+            thick: r.flag("thick_bridges"),
+            thick_internal: r.flag("thick_internal_bridges"),
+            internal_speed: r.rel_speed("internal_bridge_speed").of(bridge_speed),
+            internal_flow: r.range("internal_bridge_flow", 1.0, 0.1, 2.0),
+        };
+        let seams = Seams {
+            gap: r.mm_or_percent("seam_gap", nozzle).unwrap_or(0.0).min(nozzle * 5.0),
+            staggered_inner: r.flag("staggered_inner_seams"),
+            scarf: match r.text("seam_slope_type").as_str() {
+                "external" => Scarf::External,
+                "all" => Scarf::All,
+                _ => Scarf::None,
+            },
+            scarf_conditional: r.flag("seam_slope_conditional"),
+            scarf_angle: r.range("scarf_angle_threshold", 155.0, 0.0, 180.0),
+            scarf_start_height: r
+                .mm_or_percent("seam_slope_start_height", layer_height)
+                .unwrap_or(0.0)
+                .min(layer_height),
+            scarf_entire_loop: r.flag("seam_slope_entire_loop"),
+            scarf_length: r.range("seam_slope_min_length", 20.0, 0.0, 1000.0),
+            scarf_steps: r.count("seam_slope_steps", 10, 100).max(1),
+            scarf_inner: r.flag("seam_slope_inner_walls"),
+            scarf_speed: r.rel_speed("scarf_joint_speed"),
+            scarf_flow: r.range("scarf_joint_flow_ratio", 1.0, 0.1, 2.0),
+        };
         Settings {
             nozzle,
             layer_height,
@@ -435,6 +630,9 @@ impl Settings {
                     travel_slope: r.range("travel_slope", 3.0, 0.5, 90.0),
                     wipe_distance: r.range("wipe_distance", 1.0, 0.0, 50.0),
                     retract_before_wipe: r.range("retract_before_wipe", 100.0, 0.0, 100.0) / 100.0,
+                    role_based_wipe: r.flag("role_based_wipe_speed"),
+                    wipe_speed: r.rel_speed("wipe_speed"),
+                    wipe_on_loops: r.flag("wipe_on_loops"),
                     restart_extra: r.range("retract_restart_extra", 0.0, -10.0, 10.0),
                     avoid_crossing_walls: r.flag("reduce_crossing_wall"),
                     max_detour: r.mm_or_percent("max_travel_detour_distance", 100.0).unwrap_or(0.0),
@@ -494,6 +692,13 @@ impl Settings {
             spiral: r.flag("spiral_mode"),
             bridge_flow: r.range("bridge_flow", 1.0, 0.1, 2.0),
             only_one_wall_top: r.flag("only_one_wall_top"),
+            walls,
+            bridges,
+            seams,
+            printable_overhang: r
+                .flag("make_overhang_printable")
+                .then(|| r.range("make_overhang_printable_angle", 55.0, 0.0, 90.0))
+                .filter(|a| *a < 89.9),
             ironing: !r.text("ironing_type").starts_with("no"),
             z_offset: r.range("z_offset", 0.0, -5.0, 5.0),
             max_print_height: r.range("printable_height", 250.0, 1.0, 10_000.0),
@@ -527,6 +732,20 @@ impl Filament {
             fan_off_layers: r.count("close_fan_the_first_x_layers", 1, 10_000),
             full_fan_layer: r.count("full_fan_speed_layer", 0, 10_000),
             overhang_fan: r.range("overhang_fan_speed", 100.0, 0.0, 100.0),
+            overhang_fan_from: r.flag("enable_overhang_bridge_fan").then(|| {
+                match r.first("overhang_fan_threshold").trim_end_matches('%') {
+                    "0" => 0,
+                    "10" => 1,
+                    "25" => 2,
+                    "50" => 3,
+                    "75" => 4,
+                    _ => 5,
+                }
+            }),
+            internal_bridge_fan: {
+                let v = r.num("internal_bridge_fan_speed", -1.0);
+                (v >= 0.0).then(|| v.min(100.0))
+            },
             slow_down_layer_time: r.range("slow_down_layer_time", 5.0, 0.0, 1000.0),
             slow_down_min_speed: r.range("slow_down_min_speed", 10.0, 1.0, 1000.0),
             max_volumetric: {

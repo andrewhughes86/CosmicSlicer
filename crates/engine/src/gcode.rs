@@ -12,7 +12,7 @@ use glam::{DVec2, DVec3};
 use crate::arcs::{self, Piece};
 use crate::geom;
 use crate::motion::{self, Block, BlockKind};
-use crate::settings::{ArcFitting, Filament, Flavor, Settings, ZHop, bead_area};
+use crate::settings::{ArcFitting, Filament, Flavor, Scarf, Settings, ZHop, bead_area};
 use crate::toolpath::{Island, LayerPlan, Path, Role};
 use crate::travel::Region;
 use CosmicSlicer_config::expr::Value;
@@ -65,7 +65,7 @@ pub struct Preview {
 pub struct Stats {
     /// Seconds.
     pub total_time: f64,
-    pub time_by_role: [f64; 17],
+    pub time_by_role: [f64; Role::COUNT],
     pub travel_time: f64,
     /// Per extruder: mm of filament, mm³, grams, cost.
     pub filament_mm: Vec<f64>,
@@ -145,7 +145,10 @@ struct Writer<'a> {
     role: Option<Role>,
     width: f64,
     extruder: usize,
+    /// The layer's fan, %.
     fan: f64,
+    /// The fan as last commanded (the overhang fan may have it above the layer's).
+    out_fan: f64,
     temp: f64,
     layer: usize,
     print_z: f64,
@@ -168,6 +171,8 @@ struct Writer<'a> {
     xy_known: bool,
     /// The end of the last extrusion, for wiping back along it.
     last_path: Vec<DVec2>,
+    /// The speed it was printed at, for role-based wipes.
+    last_speed: f64,
     warnings: Vec<String>,
 }
 
@@ -220,7 +225,7 @@ impl<'a> Writer<'a> {
                 Some(Role::SparseInfill) => a.sparse,
                 Some(Role::SolidInfill | Role::BottomSurface | Role::GapFill) => a.solid,
                 Some(Role::TopSurface | Role::Ironing) => a.top,
-                Some(Role::Bridge) => a.bridge,
+                Some(Role::Bridge | Role::InternalBridge) => a.bridge,
                 Some(_) => a.default,
             }
         };
@@ -232,9 +237,14 @@ impl<'a> Writer<'a> {
                 Some(Role::OuterWall | Role::OverhangWall) => m.jerk_outer,
                 Some(Role::InnerWall) => m.jerk_inner,
                 Some(Role::TopSurface | Role::Ironing) => m.jerk_top,
-                Some(Role::SparseInfill | Role::SolidInfill | Role::BottomSurface | Role::Bridge | Role::GapFill) => {
-                    m.jerk_infill
-                }
+                Some(
+                    Role::SparseInfill
+                    | Role::SolidInfill
+                    | Role::BottomSurface
+                    | Role::Bridge
+                    | Role::InternalBridge
+                    | Role::GapFill,
+                ) => m.jerk_infill,
                 Some(_) => m.jerk_default,
             }
         };
@@ -292,13 +302,19 @@ impl<'a> Writer<'a> {
                 wipe.push(p);
                 at = p;
             }
+            let m = &self.s().motion;
+            let wipe_speed = if m.role_based_wipe && self.last_speed > 0.0 {
+                self.last_speed
+            } else {
+                m.wipe_speed.of(self.s().speeds.travel)
+            };
             if travelled > 0.0 {
                 let during = r.length * share;
                 let mut from = self.pos.truncate();
                 for p in wipe {
                     let e = -during * from.distance(p) / travelled;
                     let z = self.pos.z;
-                    self.mv(p.extend(z), e, self.s().speeds.travel * 0.8, MoveKind::Wipe);
+                    self.mv(p.extend(z), e, wipe_speed, MoveKind::Wipe);
                     from = p;
                 }
                 left -= during;
@@ -414,6 +430,81 @@ impl<'a> Writer<'a> {
         }
     }
 
+    /// Whether `path` gets a scarf seam, by the seam settings.
+    fn wants_scarf(&self, path: &Path) -> bool {
+        let sm = &self.s().seams;
+        let kind_ok = match path.role {
+            Role::OuterWall => true,
+            Role::InnerWall => sm.scarf_inner,
+            _ => false,
+        };
+        if sm.scarf == Scarf::None || !kind_ok || !path.closed || path.points.len() < 3 || self.layer == 0 {
+            return false;
+        }
+        if self.s().spiral {
+            return false;
+        }
+        // "External": outer contours only, which run the wall direction's way round.
+        let contour = (geom::signed_area2(&path.points) > 0.0) == self.s().walls.ccw;
+        if sm.scarf == Scarf::External && !contour {
+            return false;
+        }
+        // "Conditional": only where the seam is on a smooth stretch, not hidden in a corner.
+        !sm.scarf_conditional || corner_angle(&path.points, 0) >= sm.scarf_angle
+    }
+
+    /// The moves that print `path` from its start: each segment with its overhang mark; loops
+    /// close short of the start by the seam gap, or ramp in and out as a scarf seam.
+    fn steps(&self, path: &Path, scarf: bool) -> Vec<Step> {
+        let n = path.points.len();
+        let plain = |to: DVec2, deg: u8| Step { to, deg, dz: 0.0, flow: 1.0, scarf: false };
+        let mut steps: Vec<Step> =
+            (1..n).filter_map(|k| path.points.get(k).map(|&p| plain(p, path.overhang_at(k - 1)))).collect();
+        let Some(start) = path.start() else { return steps };
+        if !path.closed {
+            return steps;
+        }
+        steps.push(plain(start, path.overhang_at(n - 1)));
+        let sm = &self.s().seams;
+        if !scarf {
+            // Stop a little short of the start, so the seam does not blob.
+            trim_end(start, &mut steps, sm.gap);
+            return steps;
+        }
+        let total = path.length();
+        let ramp = if sm.scarf_entire_loop { total } else { sm.scarf_length.min(total) };
+        let n_steps = sm.scarf_steps.max(1);
+        if ramp < 1e-3 {
+            return steps;
+        }
+        let h = self.height.max(1e-3);
+        let rise = (h - sm.scarf_start_height).max(0.0);
+        let piece = ramp / n_steps as f64;
+        let cuts: Vec<f64> = (1..=n_steps).map(|q| q as f64 * piece).collect();
+        let at = |d: f64| ((d / piece - 1e-6).ceil().max(1.0) as usize).min(n_steps);
+        // Up the ramp: from the start height to the layer, the flow growing with the height.
+        let frac = |q: usize| (q as f64 - 0.5) / n_steps as f64;
+        let mut out: Vec<Step> = split_steps(start, &steps, &cuts)
+            .into_iter()
+            .map(|(st, d)| {
+                if d <= ramp + 1e-6 {
+                    let f = frac(at(d));
+                    Step { dz: -rise * (1.0 - f), flow: (h - rise * (1.0 - f)) / h, scarf: true, ..st }
+                } else {
+                    st
+                }
+            })
+            .collect();
+        // Round again over the ramp at the layer height, laying what the ramp left out.
+        out.extend(split_steps(start, &steps, &cuts).into_iter().take_while(|(_, d)| *d <= ramp + 1e-6).map(
+            |(st, d)| {
+                let f = frac(at(d));
+                Step { dz: 0.0, flow: 1.0 - (h - rise * (1.0 - f)) / h, scarf: true, ..st }
+            },
+        ));
+        out
+    }
+
     /// Prints `path` from its first point (loops all the way round).
     fn extrude(&mut self, path: &Path) {
         let Some(start) = path.start() else { return };
@@ -422,31 +513,128 @@ impl<'a> Writer<'a> {
             self.region = Some(r);
         }
         self.unretract();
+        if self.filament().is_none() {
+            return;
+        }
+        let scarf = self.wants_scarf(path);
+        let steps = self.steps(path, scarf);
+        let z = self.pos.z;
+        // A scarf starts low: down to its first height before extruding.
+        if let Some(first) = steps.first().filter(|st| st.dz < 0.0) {
+            let to = start.extend(z + first.dz);
+            self.mv(to, 0.0, self.s().speeds.travel_z.max(5.0), MoveKind::Travel);
+        }
+        self.set_dynamics(Some(path.role));
+        let mut all: Vec<DVec2> = Vec::with_capacity(steps.len() + 1);
+        all.push(self.pos.truncate());
+        // Runs of steps printed alike.
+        let mut i = 0;
+        while i < steps.len() {
+            let Some(first) = steps.get(i) else { break };
+            let key = (first.deg, first.scarf);
+            let j = (i..steps.len())
+                .find(|&j| steps.get(j).is_some_and(|st| (st.deg, st.scarf) != key))
+                .unwrap_or(steps.len());
+            if let Some(run) = steps.get(i..j) {
+                all.extend(run.iter().map(|st| st.to));
+                self.run(path, run, z);
+            }
+            i = j;
+        }
+        // Back to the layer's height and the layer's fan.
+        if (self.pos.z - z).abs() > 1e-9 {
+            let to = self.pos.truncate().extend(z);
+            self.mv(to, 0.0, self.s().speeds.travel_z.max(5.0), MoveKind::Travel);
+        }
+        if (self.out_fan - self.fan).abs() > 0.5 {
+            self.out_fan = self.fan;
+            let f = self.fan;
+            self.line(fan_command(f));
+        }
+        if path.closed && path.role == Role::OuterWall {
+            self.preview.seams.push([start.x as f32, start.y as f32, z as f32]);
+        }
+        self.last_path = all;
+        if path.closed && path.role == Role::OuterWall && self.s().motion.wipe_on_loops {
+            self.wipe_inwards(path);
+        }
+    }
+
+    /// "Wipe on loops": from the end of a loop, a short move into the part along its first
+    /// edge, so the nozzle leaves the seam off the surface.
+    fn wipe_inwards(&mut self, path: &Path) {
+        let (Some(&p0), Some(&p1)) = (path.points.first(), path.points.get(1)) else { return };
+        let v = (p1 - p0).normalize_or_zero();
+        // Loops run with the part on their left (counter-clockwise walls), else their right.
+        let side = if self.s().walls.ccw { 1.0 } else { -1.0 };
+        let target = p0 + (v + v.perp() * side).normalize_or_zero() * (self.s().nozzle * 2.0);
+        let here = self.pos.truncate();
+        if v == DVec2::ZERO || !self.region.as_ref().is_some_and(|r| r.segment_inside(here, target)) {
+            return;
+        }
+        let z = self.pos.z;
+        let speed = if self.last_speed > 0.0 { self.last_speed } else { self.travel_speed() };
+        self.mv(target.extend(z), 0.0, speed, MoveKind::Travel);
+    }
+
+    /// Prints a run of `path`'s steps that share an overhang degree (and scarf or not).
+    fn run(&mut self, path: &Path, run: &[Step], z: f64) {
         let Some(fil) = self.filament() else { return };
-        if self.role != Some(path.role) {
-            self.role = Some(path.role);
-            self.line(format!(";TYPE:{}", path.role.name()));
+        let Some(first) = run.first() else { return };
+        let s = self.s();
+        let deg = if path.role.is_wall() { first.deg } else { 0 };
+        // Half or more of the line over air: an overhang wall in the Preview and G-code.
+        let role = if deg >= 3 { Role::OverhangWall } else { path.role };
+        if self.role != Some(role) {
+            self.role = Some(role);
+            self.line(format!(";TYPE:{}", role.name()));
         }
         if (self.width - path.width).abs() > 1.0e-4 {
             self.width = path.width;
             self.line(format!(";WIDTH:{}", f3(path.width)));
         }
-        self.set_dynamics(Some(path.role));
-        // Bridges get the overhang fan.
-        let fan = if path.role == Role::Bridge && self.layer >= fil.fan_off_layers {
-            fil.overhang_fan.max(self.fan)
-        } else {
-            self.fan
+        let mut base = path.speed;
+        let mut flow = path.flow;
+        if deg > 0 && s.walls.overhang_speed {
+            base = match s.walls.overhang_speeds.get(usize::from(deg) - 1) {
+                Some(sp) => sp.of(base),
+                // Hanging (almost) entirely: bridge speed.
+                None => s.speeds.bridge,
+            };
+        }
+        if deg == 5 {
+            flow *= s.walls.overhang_flow;
+        }
+        if first.scarf {
+            base = s.seams.scarf_speed.of(base);
+            flow *= s.seams.scarf_flow;
+        }
+        // The fan: bridges and overhangs past the filament's threshold get the overhang fan.
+        let fan_on = self.layer >= fil.fan_off_layers;
+        let fan = match (fil.overhang_fan_from, role) {
+            (Some(_), Role::InternalBridge) if fan_on => {
+                fil.internal_bridge_fan.unwrap_or(fil.overhang_fan).max(self.fan)
+            }
+            (Some(_), Role::Bridge) if fan_on => fil.overhang_fan.max(self.fan),
+            (Some(t), _)
+                if fan_on
+                    && path.role.is_wall()
+                    && ((t == 0 && path.role == Role::OuterWall) || (t > 0 && deg >= t)) =>
+            {
+                fil.overhang_fan.max(self.fan)
+            }
+            _ => self.fan,
         };
-        let bridge_fan = (fan - self.fan).abs() > 0.5;
-        if bridge_fan {
+        if (fan - self.out_fan).abs() > 0.5 {
+            self.out_fan = fan;
             self.line(fan_command(fan));
         }
         let h = self.height;
-        let area = bead_area(path.width, h) * path.flow;
-        let mut speed = path.speed * self.slow;
-        if !matches!(path.role, Role::Skirt | Role::Brim | Role::Bridge) {
-            speed = speed.max(fil.slow_down_min_speed.min(path.speed));
+        let area = bead_area(path.width, h) * flow;
+        let mut speed = base * self.slow;
+        let bridging = role.is_bridge() || deg == 5;
+        if !matches!(role, Role::Skirt | Role::Brim) && !bridging {
+            speed = speed.max(fil.slow_down_min_speed.min(base));
         }
         // The hot end can only melt so much per second.
         if area > 0.0 {
@@ -454,72 +642,66 @@ impl<'a> Writer<'a> {
         }
         let speed = speed.max(1.0);
         let e_per_mm = area / fil.area() * fil.flow_ratio;
-        let mut points: Vec<DVec2> = path.points.iter().skip(1).copied().collect();
-        if path.closed {
-            // Stop a little short of the start, so the seam does not blob.
-            let gap = self.s().nozzle * 0.1;
-            points.push(start);
-            if let (Some(&last), Some(&before)) = (points.last(), points.iter().rev().nth(1)) {
-                let seg = last.distance(before);
-                if seg > gap * 2.0 {
-                    let end = before + (last - before) * ((seg - gap) / seg);
-                    if let Some(l) = points.last_mut() {
-                        *l = end;
-                    }
-                }
-            }
-            if path.role == Role::OuterWall {
-                self.preview.seams.push([start.x as f32, start.y as f32, self.pos.z as f32]);
-            }
-        }
-        let mut all: Vec<DVec2> = Vec::with_capacity(points.len() + 1);
-        all.push(self.pos.truncate());
-        all.extend(points.iter().copied());
-        let fit = match self.s().motion.arc_fitting {
-            ArcFitting::All => true,
-            ArcFitting::SparseInfill => path.role == Role::SparseInfill,
-            ArcFitting::Off => false,
-        };
-        let pieces: Vec<Piece> =
-            if fit { arcs::fit(&all, 0.02) } else { points.iter().map(|p| Piece::Line(*p)).collect() };
-        let z = self.pos.z;
-        let mut length = 0.0;
-        for piece in pieces {
-            let from = self.pos.truncate();
-            let (end, arc, d) = match piece {
-                Piece::Line(p) => (p, None, from.distance(p)),
-                Piece::Arc { end, center, ccw } => (end, Some((center, ccw)), arcs::arc_length(from, end, center, ccw)),
+        self.last_speed = speed;
+        let fit = !first.scarf
+            && match s.motion.arc_fitting {
+                ArcFitting::All => true,
+                ArcFitting::SparseInfill => path.role == Role::SparseInfill,
+                ArcFitting::Off => false,
             };
-            if d < 1.0e-4 {
+        let from = self.pos.truncate();
+        let mut pts: Vec<DVec2> = Vec::with_capacity(run.len() + 1);
+        pts.push(from);
+        pts.extend(run.iter().map(|st| st.to));
+        // Each step's own height and flow (a scarf's), else straight or fitted arcs.
+        let pieces: Vec<(Piece, f64, f64)> = if fit {
+            arcs::fit(&pts, 0.02).into_iter().map(|p| (p, 0.0, 1.0)).collect()
+        } else {
+            run.iter().map(|st| (Piece::Line(st.to), st.dz, st.flow)).collect()
+        };
+        let mut length = 0.0;
+        let mut volume = 0.0;
+        for (piece, dz, f) in pieces {
+            let at = self.pos.truncate();
+            let (end, arc, d) = match piece {
+                Piece::Line(p) => (p, None, at.distance(p)),
+                Piece::Arc { end, center, ccw } => (end, Some((center, ccw)), arcs::arc_length(at, end, center, ccw)),
+            };
+            if d < 1.0e-4 || f <= 0.0 {
+                if d >= 1.0e-4 {
+                    // Nothing to lay here: move on without extruding.
+                    self.mv(end.extend(z + dz), 0.0, speed, MoveKind::Travel);
+                }
                 continue;
             }
-            length += d;
+            length += d * f;
+            volume += d * area * f;
             self.ops.push(Op::Move {
-                to: end.extend(z),
-                e: d * e_per_mm,
+                to: end.extend(z + dz),
+                e: d * e_per_mm * f,
                 feed: speed,
-                kind: MoveKind::Extrude(path.role),
+                kind: MoveKind::Extrude(role),
                 arc,
                 xy: true,
             });
-            self.pos = end.extend(z);
+            self.pos = end.extend(z + dz);
         }
         if let Some(mm) = self.stats.filament_mm.get_mut(self.extruder) {
             *mm += length * e_per_mm;
         }
         if let Some(v) = self.stats.volume_mm3.get_mut(self.extruder) {
-            *v += length * area;
+            *v += volume;
         }
         // The Preview draws a simplified copy, so huge prints stay within memory.
         let shown =
-            if self.preview_tolerance > 0.0 { geom::simplify(&all, self.preview_tolerance) } else { all.clone() };
-        let pz = z as f32;
+            if self.preview_tolerance > 0.0 { geom::simplify(&pts, self.preview_tolerance) } else { pts.clone() };
+        let pz = (z + first.dz) as f32;
         for pair in shown.windows(2) {
             let (a, b) = (pair[0], pair[1]);
             self.preview.segments.push(Segment {
                 a: [a.x as f32, a.y as f32, pz],
                 b: [b.x as f32, b.y as f32, pz],
-                role: path.role,
+                role,
                 width: path.width as f32,
                 height: h as f32,
                 speed: speed as f32,
@@ -529,15 +711,11 @@ impl<'a> Writer<'a> {
                 flow: (area * speed) as f32,
             });
         }
-        self.last_path = all;
-        if bridge_fan {
-            let f = self.fan;
-            self.line(fan_command(f));
-        }
     }
 
-    /// Picks where a loop starts, by the seam setting, and rotates it to start there.
-    fn place_seam(&mut self, path: &mut Path, object: Option<usize>) {
+    /// Picks where a loop starts, by the seam setting, and rotates it to start there. `depth`
+    /// is the wall's depth (0 outer), for staggered inner seams.
+    fn place_seam(&mut self, path: &mut Path, object: Option<usize>, depth: Option<usize>) {
         if !path.closed || path.points.len() < 3 {
             return;
         }
@@ -545,20 +723,23 @@ impl<'a> Writer<'a> {
         let seam = self.s().seam.clone();
         let hint = object.and_then(|o| self.seams.get(o).copied().flatten());
         let index = match seam.as_str() {
-            "nearest" => nearest_index(&path.points, here),
+            "nearest" => best_seam(path, here),
             "back" => rear_index(&path.points),
             "random" => {
                 let n = path.points.len();
                 ((self.layer as u64).wrapping_mul(2_654_435_761).wrapping_add(n as u64 * 40503) % n as u64) as usize
             }
-            // Aligned: under the seam of the layer below, starting from the back.
-            _ => match hint {
-                Some(p) => nearest_index(&path.points, p),
-                None => rear_index(&path.points),
-            },
+            // Aligned: in a corner near the seam of the layer below, starting from the back.
+            _ => {
+                let target = hint.unwrap_or_else(|| path.points.get(rear_index(&path.points)).copied().unwrap_or(here));
+                best_seam(path, target)
+            }
         };
-        let last = path.points.len() - 1;
-        path.points.rotate_left(index.min(last));
+        path.rotate(index);
+        // Staggered inner seams: each wall in starts a little further back.
+        if let Some(d) = depth.filter(|d| *d > 0 && self.s().seams.staggered_inner && path.role == Role::InnerWall) {
+            stagger(path, d as f64 * path.width);
+        }
         if path.role == Role::OuterWall
             && let (Some(o), Some(&p)) = (object, path.points.first())
             && let Some(slot) = self.seams.get_mut(o)
@@ -568,7 +749,7 @@ impl<'a> Writer<'a> {
     }
 
     /// Prints paths nearest first, reversing open lines when their far end is nearer.
-    fn print_nearest(&mut self, mut paths: Vec<Path>, object: Option<usize>) {
+    fn print_nearest(&mut self, mut paths: Vec<Path>, object: Option<usize>, depth: Option<usize>) {
         while !paths.is_empty() {
             let here = self.pos.truncate();
             let mut best = (f64::INFINITY, 0usize, false);
@@ -588,9 +769,9 @@ impl<'a> Writer<'a> {
             }
             let mut p = paths.swap_remove(best.1);
             if best.2 {
-                p.points.reverse();
+                p.reverse();
             }
-            self.place_seam(&mut p, object);
+            self.place_seam(&mut p, object, depth);
             self.extrude(&p);
         }
     }
@@ -604,17 +785,18 @@ impl<'a> Writer<'a> {
         let order: Vec<usize> = if self.s().outer_first { (0..depth).collect() } else { (0..depth).rev().collect() };
         for k in order {
             if let Some(ws) = island.walls.get(k) {
-                self.print_nearest(ws.clone(), Some(object));
+                self.print_nearest(ws.clone(), Some(object), Some(k));
             }
         }
-        self.print_nearest(island.fills.clone(), Some(object));
+        self.print_nearest(island.fills.clone(), Some(object), None);
         self.region = None;
         self.pending_region = None;
     }
 
     fn set_fan(&mut self, fan: f64) {
-        if (fan - self.fan).abs() > 0.5 {
+        if (fan - self.fan).abs() > 0.5 || (fan - self.out_fan).abs() > 0.5 {
             self.fan = fan;
+            self.out_fan = fan;
             self.line(fan_command(fan));
         }
     }
@@ -655,12 +837,133 @@ impl<'a> Writer<'a> {
     }
 }
 
-fn nearest_index(points: &[DVec2], to: DVec2) -> usize {
-    points
-        .iter()
-        .enumerate()
-        .min_by(|a, b| a.1.distance_squared(to).total_cmp(&b.1.distance_squared(to)))
-        .map_or(0, |(i, _)| i)
+/// One move of a path as printed: to `to`, `dz` below the layer, at `flow` of the full bead.
+#[derive(Clone, Copy, Debug)]
+struct Step {
+    to: DVec2,
+    deg: u8,
+    dz: f64,
+    flow: f64,
+    scarf: bool,
+}
+
+/// Splits steps starting at `from` where they pass the distances `cuts` (ascending), giving
+/// each step with the distance along at its end.
+fn split_steps(from: DVec2, steps: &[Step], cuts: &[f64]) -> Vec<(Step, f64)> {
+    let mut out = Vec::with_capacity(steps.len() + cuts.len());
+    let (mut at, mut dist, mut c) = (from, 0.0, 0usize);
+    for st in steps {
+        let len = at.distance(st.to);
+        while let Some(&cut) = cuts.get(c) {
+            if cut <= dist + 1e-9 {
+                c += 1;
+            } else if cut < dist + len - 1e-9 {
+                out.push((Step { to: at + (st.to - at) * ((cut - dist) / len), ..*st }, cut));
+                c += 1;
+            } else {
+                break;
+            }
+        }
+        dist += len;
+        out.push((*st, dist));
+        at = st.to;
+    }
+    out
+}
+
+/// Takes `gap` mm off the end of the steps that start at `from`.
+fn trim_end(from: DVec2, steps: &mut Vec<Step>, gap: f64) {
+    let mut left = gap;
+    while left > 1e-9 && steps.len() > 1 {
+        let n = steps.len();
+        let (Some(last), Some(before)) = (steps.get(n - 1).copied(), steps.get(n - 2).map(|s| s.to)) else { return };
+        let seg = before.distance(last.to);
+        if seg > left {
+            if let Some(l) = steps.last_mut() {
+                l.to = last.to + (before - last.to) * (left / seg);
+            }
+            return;
+        }
+        left -= seg;
+        steps.pop();
+    }
+    // A single step: shorten it unless that would leave nothing.
+    if left > 1e-9
+        && let Some(l) = steps.first_mut()
+    {
+        let seg = from.distance(l.to);
+        if seg > left * 2.0 {
+            l.to = l.to + (from - l.to) * (left / seg);
+        }
+    }
+}
+
+/// The angle at point `i` of a loop between its two edges, degrees: 180 on a straight.
+fn corner_angle(points: &[DVec2], i: usize) -> f64 {
+    let n = points.len();
+    let (Some(&p), Some(&prev), Some(&next)) = (points.get(i), points.get((i + n - 1) % n), points.get((i + 1) % n))
+    else {
+        return 180.0;
+    };
+    let (a, b) = ((prev - p).normalize_or_zero(), (next - p).normalize_or_zero());
+    if a == DVec2::ZERO || b == DVec2::ZERO {
+        return 180.0;
+    }
+    a.angle_to(b).abs().to_degrees()
+}
+
+/// Where a loop's seam hides best near `target`: concave corners most, sharp convex corners
+/// less, never on an overhang (OrcaSlicer's seam placer scores points the same way).
+fn best_seam(path: &Path, target: DVec2) -> usize {
+    let pts = &path.points;
+    let n = pts.len();
+    let orient = if geom::signed_area2(pts) >= 0.0 { 1.0 } else { -1.0 };
+    let mut best = (f64::INFINITY, 0usize);
+    for i in 0..n {
+        let (Some(&p), Some(&prev), Some(&next)) = (pts.get(i), pts.get((i + n - 1) % n), pts.get((i + 1) % n)) else {
+            continue;
+        };
+        let (a, b) = ((p - prev).normalize_or_zero(), (next - p).normalize_or_zero());
+        // Positive turning into the part (convex), negative away from it (concave).
+        let turn = a.perp_dot(b).atan2(a.dot(b)) * orient;
+        let hidden = if turn < 0.0 { -turn * 3.0 } else { turn * 1.2 };
+        let hanging = path.overhang_at(i).max(path.overhang_at((i + n - 1) % n));
+        let cost = p.distance(target) - hidden + if hanging >= 2 { 20.0 } else { 0.0 };
+        if cost < best.0 {
+            best = (cost, i);
+        }
+    }
+    best.1
+}
+
+/// Moves a loop's start `back` mm backwards along it.
+fn stagger(path: &mut Path, back: f64) {
+    let n = path.points.len();
+    let mut left = back.min(path.length() * 0.5);
+    let mut k = 0usize;
+    while left > 1e-9 {
+        // Segment from point k-1 (backwards) to point k.
+        let prev = (k + n - 1) % n;
+        let (Some(&p), Some(&q)) = (path.points.get(k), path.points.get(prev)) else { return };
+        let seg = p.distance(q);
+        if seg > left {
+            let cut = p + (q - p) * (left / seg);
+            // A new point on segment `prev`, which keeps its overhang mark.
+            path.points.insert(prev + 1, cut);
+            if path.overhang.len() == n {
+                let d = path.overhang_at(prev);
+                path.overhang.insert(prev + 1, d);
+            }
+            path.rotate(prev + 1);
+            return;
+        }
+        left -= seg;
+        k = prev;
+        if k == 0 {
+            return;
+        }
+    }
+    path.rotate(k);
 }
 
 /// The rear-most point, leftmost among equals.
@@ -803,6 +1106,7 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         width: 0.0,
         extruder: cx.object_extruder.first().copied().unwrap_or(0).min(n_ext - 1),
         fan: 0.0,
+        out_fan: 0.0,
         temp: 0.0,
         layer: 0,
         print_z: 0.0,
@@ -825,6 +1129,7 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         pending_region: None,
         xy_known: false,
         last_path: Vec::new(),
+        last_speed: 0.0,
         warnings: Vec::new(),
     };
     let first_fil = cx.filaments.get(w.extruder).cloned();
@@ -969,10 +1274,10 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
 
         // Skirt and brim, support, then the objects, grouped by extruder.
         if !plan.skirt.is_empty() {
-            w.print_nearest(plan.skirt.clone(), None);
+            w.print_nearest(plan.skirt.clone(), None, None);
         }
         if !plan.support.is_empty() {
-            w.print_nearest(plan.support.clone(), None);
+            w.print_nearest(plan.support.clone(), None, None);
         }
         let mut objects: Vec<&(usize, Vec<Island>)> = plan.objects.iter().collect();
         // The current extruder's objects first, to save a tool change.
@@ -1269,5 +1574,63 @@ mod tests {
     #[test]
     fn object_labels_are_firmware_safe() {
         assert_eq!(label("my part (1).stl", 3), "my_part__1_.stl_id_3_copy_0");
+    }
+
+    fn l_shape() -> Path {
+        // Counter-clockwise L: the corner at (5, 5) is concave.
+        let pts = vec![
+            DVec2::new(0.0, 0.0),
+            DVec2::new(10.0, 0.0),
+            DVec2::new(10.0, 5.0),
+            DVec2::new(5.0, 5.0),
+            DVec2::new(5.0, 10.0),
+            DVec2::new(0.0, 10.0),
+        ];
+        Path::new(Role::OuterWall, pts, true, 0.4, 60.0, 1.0)
+    }
+
+    #[test]
+    fn seams_hide_in_concave_corners_but_not_on_overhangs() {
+        let mut p = l_shape();
+        // Near the top-right of the L, the concave corner wins over the convex ones nearby.
+        assert_eq!(best_seam(&p, DVec2::new(8.0, 8.0)), 3);
+        // Overhanging there: the seam goes elsewhere.
+        p.overhang = vec![0, 0, 3, 3, 0, 0];
+        assert_ne!(best_seam(&p, DVec2::new(8.0, 8.0)), 3);
+        assert!((corner_angle(&p.points, 3) - 90.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn loops_stop_short_by_the_seam_gap() {
+        let p = l_shape();
+        let plain = |to: DVec2| Step { to, deg: 0, dz: 0.0, flow: 1.0, scarf: false };
+        let mut steps: Vec<Step> = p.points.iter().skip(1).chain(p.points.first()).map(|q| plain(*q)).collect();
+        trim_end(DVec2::ZERO, &mut steps, 0.04);
+        assert_eq!(steps.len(), 6);
+        assert!((steps[5].to - DVec2::new(0.0, 0.04)).length() < 1e-9);
+        // A gap longer than the last segment eats into the one before.
+        trim_end(DVec2::ZERO, &mut steps, 10.0);
+        assert_eq!(steps.len(), 5);
+        assert!((steps[4].to - DVec2::new(0.04, 10.0)).length() < 1e-9, "{:?}", steps[4].to);
+    }
+
+    #[test]
+    fn steps_split_at_distances() {
+        let plain = |to: DVec2| Step { to, deg: 0, dz: 0.0, flow: 1.0, scarf: false };
+        let steps = vec![plain(DVec2::new(10.0, 0.0)), plain(DVec2::new(10.0, 10.0))];
+        let split = split_steps(DVec2::ZERO, &steps, &[2.5, 5.0, 10.0, 12.0]);
+        let ds: Vec<f64> = split.iter().map(|(_, d)| *d).collect();
+        assert_eq!(ds, vec![2.5, 5.0, 10.0, 12.0, 20.0]);
+        assert!((split[3].0.to - DVec2::new(10.0, 2.0)).length() < 1e-9);
+    }
+
+    #[test]
+    fn staggered_seams_start_further_back() {
+        let mut p = l_shape();
+        stagger(&mut p, 2.0);
+        // Two millimetres back from (0, 0) along the closing edge.
+        assert_eq!(p.points[0], DVec2::new(0.0, 2.0));
+        assert_eq!(p.points.len(), 7);
+        assert!((p.length() - l_shape().length()).abs() < 1e-9);
     }
 }

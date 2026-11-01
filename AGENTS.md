@@ -42,6 +42,12 @@ OrcaSlicer's crashes are the reason this exists.
   estimate; the engine tests check that our own G-code reads back with the same time and
   filament. Travel inside an island uses `travel::Region` (no retraction needed inside;
   routed round walls with "Avoid crossing walls").
+- Walls: `walls` makes the loops; narrow parts and gaps go through `medial` (centre lines with
+  widths, split into constant-width `Path`s). `overhang` marks each wall segment's overhang
+  degree in `Path::overhang` (kept through `Path::rotate` / `Path::reverse`); the G-code writer
+  splits loops into runs by degree for speed, fan, flow and the Overhang wall type, and builds
+  scarf seams there. `plan` runs in two passes so solid infill can see the sparse infill below
+  (internal bridges).
 - `crates/model` — meshes, objects, plates, STL/OBJ readers, primitives, arrange.
 - `crates/engine` — the slicer: `slicing` (mesh → layer shapes), `walls`, `plan` (top /
   bottom / solid / sparse regions per island), `infill`, `skirt`, `support`, `gcode` (order,

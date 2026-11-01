@@ -14,6 +14,7 @@ pub const FEATURES: &[(&str, [u8; 3])] = &[
     ("Top surface", [240, 64, 64]),
     ("Bottom surface", [102, 92, 199]),
     ("Bridge", [77, 128, 186]),
+    ("Internal Bridge", [118, 170, 222]),
     ("Gap infill", [255, 255, 255]),
     ("Ironing", [255, 140, 105]),
     ("Skirt", [0, 135, 110]),

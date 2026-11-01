@@ -17,7 +17,9 @@ pub mod gcodeview;
 pub mod geom;
 pub mod infill;
 pub mod macros;
+pub mod medial;
 pub mod motion;
+pub mod overhang;
 pub mod plan;
 pub mod settings;
 pub mod skirt;
@@ -230,6 +232,11 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
             cfg.set(k.clone(), v.clone());
         }
         let os = Settings::read(schema, &cfg);
+        let mut slices = slices;
+        if let Some(angle) = os.printable_overhang {
+            let heights: Vec<f64> = layers.iter().map(|l| l.height).collect();
+            overhang::make_printable(&mut slices, &heights, angle);
+        }
         let islands = plan::object(&slices, &layers, &os, &cancelled);
         if cancelled() {
             return Err(SliceError::Cancelled);
@@ -471,6 +478,77 @@ mod tests {
     }
 
     #[test]
+    fn overhangs_get_their_speed_type_and_fan() {
+        // A slab on a post, as one object: the slab's first layer hangs over air.
+        let mut j = job(vec![cube(Vec3::new(100.0, 100.0, 0.0), 6.0), cube(Vec3::new(100.0, 100.0, 6.0), 20.0)]);
+        j.filaments[0].set("overhang_fan_speed", "77");
+        j.filaments[0].set("fan_max_speed", "40");
+        j.filaments[0].set("fan_min_speed", "40");
+        let out = slice(&j, &Progress::default());
+        assert!(out.is_ok(), "{:?}", out.as_ref().err());
+        let Ok(out) = out else { return };
+        assert!(out.gcode.contains(";TYPE:Overhang wall"));
+        // 77 % is S196; the layer fan comes back after.
+        if let Ok(p) = std::env::var("OVERHANG_GCODE") {
+            let _ = std::fs::write(p, &out.gcode);
+        }
+        let at = out.gcode.find("M106 S196");
+        assert!(at.is_some());
+        assert!(out.gcode[at.unwrap_or(0)..].contains("M106 S102"));
+        // Bridge speed (25 mm/s) on the overhanging walls.
+        let overhang = out.gcode.split(";TYPE:").find(|b| b.starts_with("Overhang wall")).unwrap_or("");
+        assert!(overhang.lines().any(|l| l.starts_with("G1") && l.ends_with("F1500")), "{overhang:.400}");
+    }
+
+    #[test]
+    fn scarf_seams_ramp_up_and_read_back() {
+        let mut j = job(vec![cube(Vec3::new(100.0, 100.0, 0.0), 10.0)]);
+        j.process.set("seam_slope_type", "all");
+        j.process.set("seam_slope_steps", "4");
+        let out = slice(&j, &Progress::default());
+        assert!(out.is_ok(), "{:?}", out.as_ref().err());
+        let Ok(out) = out else { return };
+        if let Ok(p) = std::env::var("SCARF_GCODE") {
+            let _ = std::fs::write(p, &out.gcode);
+        }
+        // Layer 10 is at 2.0 mm: its outer wall goes down to 1.825 and extrudes up the ramp.
+        assert!(out.gcode.contains("G1 Z1.825"));
+        assert!(out.gcode.lines().any(|l| l.starts_with("G1") && l.contains(" Z1.875") && l.contains(" E")), "no ramp");
+        let back = view_gcode(out.gcode.clone(), &Config::default(), &[Config::default()]);
+        assert_eq!(back.preview.layers.len(), out.preview.layers.len());
+        let (a, b) = (back.stats.filament_mm[0], out.stats.filament_mm[0]);
+        assert!((a - b).abs() / b < 0.01, "{a} vs {b}");
+    }
+
+    #[test]
+    fn wipes_follow_the_settings() {
+        let wipes = |role_based: &str| {
+            let mut j = job(vec![torus(Vec3::new(100.0, 100.0, 0.0))]);
+            j.printer.set("wipe", "1");
+            j.printer.set("travel_speed", "200");
+            j.process.set("travel_speed", "200");
+            j.process.set("wipe_speed", "50%");
+            j.process.set("role_based_wipe_speed", role_based);
+            j.process.set("wipe_on_loops", "1");
+            let out = slice(&j, &Progress::default());
+            assert!(out.is_ok(), "{:?}", out.as_ref().err());
+            let gcode = out.map(|o| o.gcode).unwrap_or_default();
+            let speeds: Vec<String> = gcode
+                .lines()
+                .filter(|l| l.starts_with("G1 X") && l.contains(" E-"))
+                .filter_map(|l| l.split_whitespace().find(|w| w.starts_with('F')).map(str::to_owned))
+                .collect();
+            speeds
+        };
+        // Half of 200 mm/s: F6000.
+        let fixed = wipes("0");
+        assert!(!fixed.is_empty() && fixed.iter().all(|f| f == "F6000"), "{fixed:?}");
+        // Role-based: the speeds of what was printed, not the travel's.
+        let by_role = wipes("1");
+        assert!(!by_role.is_empty() && by_role.iter().any(|f| f != "F6000"), "{by_role:?}");
+    }
+
+    #[test]
     fn errors_not_panics() {
         assert!(matches!(slice(&job(vec![]), &Progress::default()), Err(SliceError::Nothing)));
         let tall = cube(Vec3::new(100.0, 100.0, 0.0), 400.0);
@@ -572,6 +650,13 @@ mod tests {
             out.preview.segments.len(),
             out.stats.total_time,
             out.stats.filament_mm.iter().sum::<f64>() / 1000.0
+        );
+        let back = view_gcode(out.gcode.clone(), &j.printer, &j.filaments);
+        println!(
+            "read back: {} layers, {:.0} s print, {:.1} m filament",
+            back.preview.layers.len(),
+            back.stats.total_time,
+            back.stats.filament_mm.iter().sum::<f64>() / 1000.0
         );
         if let Ok(o) = std::env::var("SLICE_OUT") {
             let _ = std::fs::write(o, &out.gcode);

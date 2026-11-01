@@ -12,6 +12,7 @@ end of every session (no crashes, tests and clippy clean, smoke tests cover new 
 | 3 | CI, autosave, crash recovery | GitHub Actions on Linux/Windows/macOS (+ real app run on a software GPU), autosave with OS-lock crash detection and restore prompt, crash reports, atomic settings files, shader validation test |
 | 4 | Profiles | OrcaSlicer's library (72 vendors, 1,192 printers) embedded, setup wizard, compatibility filtering, printer defaults, the custom G-code macro language (all 4,768 library templates render), user presets as Orca-style files, import/export |
 | 5 | Motion and G-code | Firmware-style motion planner (estimate and M73), machine limits, per-feature accel/jerk, pressure advance, firmware retraction, wipe, sloped z-hop, travel inside parts and avoid-crossing-walls routing, arc fitting, object labels / exclude-object, thumbnails, G-code viewer with travel/retraction/seam marks |
+| 6 | Walls | Variable-width thin walls and gap fill (medial axis), precise outer wall, wall direction, overhang degrees with Orca's speeds/fan/flow, make overhangs printable, bridge direction detection, internal and thick bridges, corner-aware seams, scarf seams, seam gap, staggered inner seams, role-based wipe, wipe on loops |
 
 ## Order, and why
 Get a user's own printer printing well and safely first (profiles, correct motion G-code,
@@ -84,18 +85,36 @@ and an Orca user preset file imports and slices identically.
 **Done when:** a test print on your printer runs at the expected time, and G-code from Orca and
 from CosmicSlicer for the same model load into the viewer with matching statistics.
 
-## 6 · Walls
-- Arachne variable-width walls (Orca's default) beside the classic generator.
-- Gap fill, thin walls, "detect narrow internal solid infill", precise outer wall.
-- Overhang detection: overhang walls by degree with Orca's overhang speeds and fan, extra
-  perimeters on overhangs, "make overhangs printable".
-- Bridge detection with the best bridge direction, internal bridges, thick bridges.
-- Seams: aligned scoring like Orca (concave corners, overhangs), scarf joint seams, seam gap,
-  staggered inner seams, role-based wipe.
+## 6 · Walls — done
+- Thin walls and gap fill: narrow parts and gaps between walls are found by opening the region
+  and filled with variable-width centre lines (distance transform + thinning), split into
+  constant-width runs. Arachne prints these as inner walls, classic as gap fill; thin walls
+  follow `detect_thin_wall` (always on with Arachne), `min_bead_width`, `min_feature_size`,
+  `filter_out_gap_fill`, `gap_fill_flow_ratio`. Gap fill in solid surfaces by `gap_fill_target`.
+- Precise outer wall, wall direction (holes the other way), only one wall on the first layer,
+  "detect narrow internal solid infill" (concentric).
+- Overhangs: each wall segment's degree (10/25/50/75/95 % of the line over air) picks
+  `overhang_1_4_speed`…`overhang_4_4_speed` or the bridge speed, `overhang_flow_ratio`, and the
+  overhang fan by `overhang_fan_threshold`; 50 %+ prints as "Overhang wall". "Make overhangs
+  printable" fills steep overhangs out into cones.
+- Bridges: the direction best anchored at both ends (or `bridge_angle`), bridge density, thick
+  bridges; solid infill over sparse infill becomes an "Internal Bridge" with its own angle,
+  density, speed, flow, thickness and fan.
+- Seams: aligned and nearest seams prefer concave corners, then convex ones, and avoid
+  overhangs; seam gap; staggered inner seams; scarf joint seams (external / all, conditional on
+  the corner angle, start height, steps, length or entire loop, inner walls, speed and flow);
+  role-based wipe speed and `wipe_speed`; wipe on loops.
+- The G-code viewer splits layers at `;LAYER_CHANGE` when a file has them, so scarf ramps and
+  z-hops stay in their layer (Orca's G-code too).
+- Checked on Orca's KSR FDM test and 3DBenchy (decoded from its `handy_models`): both slice and
+  read back with the same layers, time and filament.
 
-**Done when:** Orca's thin-wall and overhang test models slice without gaps or dangling walls.
+Moved on: extra perimeters on overhangs (session 7), Arachne's wall-count transitions in parts
+that are wide enough for walls (session 19; thin parts and gaps already get variable widths),
+`make_overhang_printable_hole_size` and `scarf_overhang_threshold` (session 19).
 
 ## 7 · Infill and surfaces
+- Extra perimeters on overhangs (from session 6).
 - The remaining patterns natively: honeycomb, 3D honeycomb, lightning, adaptive cubic, support
   cubic, quarter cubic, cross hatch, Hilbert curve, Archimedean chords, octagram spiral, TPMS,
   lateral lattice / honeycomb, zig-zag variants, monotonic line.
@@ -217,6 +236,8 @@ and the Device page follows both prints.
 - Compare time, filament, layer count, per-feature totals and toolpath maps; explain or fix every
   difference over a few percent; keep the set as a regression test.
 - Test prints on your printers.
+- From session 6: Arachne's wall-count transitions where a part narrows but still has room for
+  walls; `make_overhang_printable_hole_size`; `scarf_overhang_threshold`.
 
 ## 20 · Packaging and release
 - Windows installer (MSI) with file associations; macOS `.app` (universal) as a DMG; Linux
