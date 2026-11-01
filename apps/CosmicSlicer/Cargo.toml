@@ -1,0 +1,14 @@
+[package]
+name = "CosmicSlicer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FFF 3D-printer slicer, a Rust rebuild of OrcaSlicer"
+
+[lints]
+workspace = true
+
+[dependencies]
+CosmicSlicer-ui-egui = { workspace = true }
+env_logger = { workspace = true }

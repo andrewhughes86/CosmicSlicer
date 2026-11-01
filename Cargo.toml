@@ -1,0 +1,69 @@
+[workspace]
+resolver = "3"
+members = [
+    "apps/CosmicSlicer",
+    "crates/config",
+    "crates/engine",
+    "crates/model",
+    "crates/ui-egui",
+]
+default-members = ["apps/CosmicSlicer"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "AGPL-3.0-or-later"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unimplemented = "deny"
+todo = "deny"
+unreachable = "deny"
+
+[workspace.dependencies]
+CosmicSlicer-config = { path = "crates/config" }
+CosmicSlicer-engine = { path = "crates/engine" }
+CosmicSlicer-model = { path = "crates/model" }
+CosmicSlicer-ui-egui = { path = "crates/ui-egui" }
+
+bytemuck = { version = "1.25", features = ["derive"] }
+eframe = { version = "0.36.2", default-features = false }
+egui = "0.36.2"
+egui-wgpu = "0.36.2"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+glam = "0.30"
+i_overlay = { version = "9.1", default-features = false }
+log = "0.4"
+png = "0.18"
+rayon = "1.10"
+resvg = { version = "=0.48.1", default-features = false }
+rfd = "0.17.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+wgpu = { version = "30", default-features = false }
+
+[profile.release]
+debug = "line-tables-only"
+
+# Mesh loading, picking and slicing crawl unoptimised.
+[profile.dev.package.CosmicSlicer-model]
+opt-level = 2
+
+[profile.dev.package.CosmicSlicer-engine]
+opt-level = 2
+
+[profile.dev.package.i_overlay]
+opt-level = 3
+
+[profile.dev.package.resvg]
+opt-level = 2
+
+[profile.dev.package.tiny-skia]
+opt-level = 2

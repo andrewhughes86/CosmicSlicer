@@ -1,0 +1,19 @@
+[package]
+name = "CosmicSlicer-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The slicing engine: layers, walls, infill, supports, toolpaths and G-code"
+
+[lints]
+workspace = true
+
+[dependencies]
+CosmicSlicer-config = { workspace = true }
+CosmicSlicer-model = { workspace = true }
+glam = { workspace = true }
+i_overlay = { workspace = true }
+log = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }

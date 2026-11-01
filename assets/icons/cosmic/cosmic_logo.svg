@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+  <!-- CosmicSlicer mark for the top bar: stacked layers under a nozzle. Original artwork. -->
+  <g stroke-linecap="round" stroke-width="3">
+    <line x1="7" y1="26" x2="25" y2="26" stroke="#3b82f6"/>
+    <line x1="9" y1="21" x2="23" y2="21" stroke="#3b82f6"/>
+    <line x1="11" y1="16" x2="21" y2="16" stroke="#22d3ee"/>
+  </g>
+  <polygon points="12,3 20,3 20,7 18,7 16,11 14,7 12,7" fill="#22d3ee"/>
+</svg>

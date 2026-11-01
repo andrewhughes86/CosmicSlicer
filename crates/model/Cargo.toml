@@ -1,0 +1,15 @@
+[package]
+name = "CosmicSlicer-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Meshes, objects and plates; model file readers"
+
+[lints]
+workspace = true
+
+[dependencies]
+glam = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+thiserror = { workspace = true }

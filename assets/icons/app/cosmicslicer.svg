@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- CosmicSlicer application icon: a print rising layer by layer from a build plate in deep
+       space, a cyan nozzle laying the top layer. Original artwork. -->
+  <defs>
+    <linearGradient id="space" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#1D2D52"/>
+      <stop offset="1" stop-color="#090F1F"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#22D3EE" stop-opacity="0.6"/>
+      <stop offset="1" stop-color="#22D3EE" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="tile">
+      <rect x="12" y="12" width="232" height="232" rx="52"/>
+    </clipPath>
+  </defs>
+  <rect x="12" y="12" width="232" height="232" rx="52" fill="url(#space)"/>
+  <g clip-path="url(#tile)">
+    <g fill="#FFFFFF">
+      <circle cx="50" cy="52" r="2.6"/>
+      <circle cx="206" cy="46" r="2"/>
+      <circle cx="218" cy="132" r="1.8"/>
+      <circle cx="38" cy="140" r="1.8"/>
+      <circle cx="118" cy="30" r="1.6"/>
+    </g>
+    <!-- Build plate. -->
+    <polygon points="28,196 128,226 228,196 128,166" fill="#22304A" stroke="#55657F" stroke-width="4" stroke-linejoin="round"/>
+    <!-- Layers of the print, narrowing as they rise. -->
+    <g stroke-linecap="round" stroke-width="13">
+      <line x1="72" y1="182" x2="184" y2="182" stroke="#3B82F6"/>
+      <line x1="80" y1="164" x2="176" y2="164" stroke="#3B82F6"/>
+      <line x1="88" y1="146" x2="168" y2="146" stroke="#4C8DFF"/>
+      <line x1="98" y1="128" x2="158" y2="128" stroke="#4C8DFF"/>
+      <line x1="108" y1="110" x2="140" y2="110" stroke="#22D3EE"/>
+    </g>
+    <circle cx="148" cy="98" r="30" fill="url(#glow)"/>
+    <!-- The nozzle. -->
+    <polygon points="134,50 170,50 170,72 160,72 152,90 144,72 134,72" fill="#9FB0C8" stroke="#E6ECF5" stroke-width="3" stroke-linejoin="round"/>
+    <circle cx="152" cy="94" r="5" fill="#22D3EE"/>
+  </g>
+</svg>

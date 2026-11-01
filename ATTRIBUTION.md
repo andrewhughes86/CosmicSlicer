@@ -1,0 +1,17 @@
+# Attribution
+
+## OrcaSlicer
+CosmicSlicer rebuilds OrcaSlicer (https://github.com/SoftFever/OrcaSlicer), © SoftFever and
+contributors, itself based on Bambu Studio, PrusaSlicer and Slic3r. Licensed under the GNU
+Affero General Public License v3.
+
+Taken from OrcaSlicer (commit 95a27321456e73cf6c6270d37dccfe819a96b130, 2026-11-01):
+- `assets/icons/orca/*.svg` — icons from `resources/images/`.
+- `assets/settings/orca_settings.json` — option labels, tooltips, units, ranges, defaults and
+  the settings page / group layout, extracted from `src/libslic3r/PrintConfig.cpp` and
+  `src/slic3r/GUI/Tab.cpp`.
+- The preview legend's feature colours, from `src/libvgcode/src/ViewerImpl.cpp`.
+
+## CosmicSlicer's own
+- `assets/icons/app/cosmicslicer.svg` and `assets/icons/cosmic/cosmic_logo.svg` — original.
+- The theme palettes and UI kit follow CosmicDMS / CosmicCut by the same author.
