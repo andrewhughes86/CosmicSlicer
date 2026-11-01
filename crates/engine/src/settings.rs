@@ -38,6 +38,7 @@ pub struct Settings {
     pub brim_gap: f64,
     pub support: Support,
     pub gcode: GcodeSettings,
+    pub motion: Motion,
     pub seam: String,
     pub outer_first: bool,
     pub spiral: bool,
@@ -83,8 +84,106 @@ pub struct Speeds {
 pub struct Accel {
     pub default: f64,
     pub outer: f64,
+    pub inner: f64,
+    pub sparse: f64,
+    pub solid: f64,
+    pub top: f64,
+    pub bridge: f64,
     pub travel: f64,
     pub first_layer: f64,
+}
+
+/// The firmware the G-code is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flavor {
+    Marlin,
+    Marlin2,
+    Klipper,
+    RepRap,
+    Repetier,
+}
+
+impl Flavor {
+    pub fn from_name(s: &str) -> Flavor {
+        match s {
+            "klipper" => Flavor::Klipper,
+            "marlin2" => Flavor::Marlin2,
+            "reprapfirmware" | "reprap" => Flavor::RepRap,
+            "repetier" => Flavor::Repetier,
+            _ => Flavor::Marlin,
+        }
+    }
+}
+
+/// The printer's motion limits (OrcaSlicer's "Motion ability"), for the G-code and the
+/// time estimate. Axes are X, Y, Z, E.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Limits {
+    pub max_speed: [f64; 4],
+    pub max_accel: [f64; 4],
+    pub accel_extruding: f64,
+    pub accel_retracting: f64,
+    pub accel_travel: f64,
+    pub jerk: [f64; 4],
+    /// Marlin 2 junction deviation (mm); 0 uses the jerk.
+    pub junction_deviation: f64,
+    pub min_extruding_rate: f64,
+    pub min_travel_rate: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZHop {
+    Normal,
+    /// Rising along the start of the travel.
+    Slope,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArcFitting {
+    Off,
+    All,
+    SparseInfill,
+}
+
+/// How the head moves, and what the G-code says about it.
+#[derive(Clone, Debug)]
+pub struct Motion {
+    pub flavor: Flavor,
+    pub limits: Limits,
+    pub emit_limits: bool,
+    /// Accelerations are set per feature (OrcaSlicer: default acceleration above 0).
+    pub accel_control: bool,
+    pub accel_to_decel: Option<f64>,
+    /// Jerk per feature (mm/s); 0 leaves the firmware's.
+    pub jerk_default: f64,
+    pub jerk_outer: f64,
+    pub jerk_inner: f64,
+    pub jerk_infill: f64,
+    pub jerk_top: f64,
+    pub jerk_first_layer: f64,
+    pub jerk_travel: f64,
+    pub firmware_retraction: bool,
+    pub z_hop: ZHop,
+    /// Lift only between these heights (0 for "no limit" above).
+    pub lift_above: f64,
+    pub lift_below: f64,
+    /// Degrees, for sloped lifts.
+    pub travel_slope: f64,
+    pub wipe_distance: f64,
+    /// Share of the retraction done while wiping (0 to 1).
+    pub retract_before_wipe: f64,
+    pub restart_extra: f64,
+    pub avoid_crossing_walls: bool,
+    /// Longest detour avoiding walls may add (mm); 0 for no limit.
+    pub max_detour: f64,
+    /// Skip retraction on travels that stay inside the part.
+    pub reduce_infill_retraction: bool,
+    pub arc_fitting: ArcFitting,
+    pub exclude_object: bool,
+    pub label_objects: bool,
+    /// e.g. "48x48/PNG,300x300/PNG".
+    pub thumbnails: String,
+    pub first_layer_travel_speed: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -149,6 +248,8 @@ pub struct Filament {
     pub max_volumetric: f64,
     pub kind: String,
     pub colour: String,
+    /// Pressure advance (K) when the filament turns it on.
+    pub pressure_advance: Option<f64>,
 }
 
 /// Reads one value with the schema default behind it.
@@ -269,11 +370,88 @@ impl Settings {
             infill_wall_overlap: r.range("infill_wall_overlap", 15.0, 0.0, 100.0) / 100.0,
             solid_wall_overlap: r.range("top_bottom_infill_wall_overlap", 25.0, 0.0, 100.0) / 100.0,
             speeds,
-            accel: Accel {
-                default: default_accel,
-                outer: accel("outer_wall_acceleration", default_accel),
-                travel: accel("travel_acceleration", default_accel),
-                first_layer: accel("initial_layer_acceleration", default_accel),
+            accel: {
+                // Some accelerations are a share of another (OrcaSlicer's "%" values).
+                let pct = |key: &str, of: f64| r.mm_or_percent(key, of).map_or(of, |v| v.clamp(10.0, 100_000.0));
+                let outer = accel("outer_wall_acceleration", default_accel);
+                Accel {
+                    default: default_accel,
+                    outer,
+                    inner: accel("inner_wall_acceleration", default_accel),
+                    sparse: pct("sparse_infill_acceleration", default_accel),
+                    solid: pct("internal_solid_infill_acceleration", default_accel),
+                    top: accel("top_surface_acceleration", default_accel),
+                    bridge: pct("bridge_acceleration", outer),
+                    travel: accel("travel_acceleration", default_accel),
+                    first_layer: accel("initial_layer_acceleration", default_accel),
+                }
+            },
+            motion: {
+                let axis = |prefix: &str, fallback: [f64; 4], hi: f64| -> [f64; 4] {
+                    let mut out = fallback;
+                    for (i, a) in ["x", "y", "z", "e"].iter().enumerate() {
+                        let v = r.num(&format!("{prefix}_{a}"), fallback[i]);
+                        out[i] = if v.is_finite() && v > 0.0 { v.min(hi) } else { fallback[i] };
+                    }
+                    out
+                };
+                let positive = |key: &str, fallback: f64| {
+                    let v = r.num(key, fallback);
+                    if v.is_finite() && v > 0.0 { v } else { fallback }
+                };
+                let accel_extruding = positive("machine_max_acceleration_extruding", 1500.0);
+                let limits = Limits {
+                    max_speed: axis("machine_max_speed", [500.0, 500.0, 12.0, 120.0], 10_000.0),
+                    max_accel: axis("machine_max_acceleration", [10_000.0, 10_000.0, 500.0, 5000.0], 1.0e6),
+                    accel_extruding,
+                    accel_retracting: positive("machine_max_acceleration_retracting", accel_extruding),
+                    accel_travel: positive("machine_max_acceleration_travel", accel_extruding),
+                    jerk: axis("machine_max_jerk", [9.0, 9.0, 0.4, 2.5], 1000.0),
+                    junction_deviation: r.range("machine_max_junction_deviation", 0.0, 0.0, 1.0),
+                    min_extruding_rate: r.range("machine_min_extruding_rate", 0.0, 0.0, 1000.0),
+                    min_travel_rate: r.range("machine_min_travel_rate", 0.0, 0.0, 1000.0),
+                };
+                let jerk = |key: &str| r.range(key, 0.0, 0.0, 1000.0);
+                let travel = r.speed("travel_speed", 120.0);
+                Motion {
+                    flavor: Flavor::from_name(&r.text("gcode_flavor")),
+                    limits,
+                    emit_limits: r.flag("emit_machine_limits_to_gcode"),
+                    accel_control: r.num("default_acceleration", 0.0) > 0.0,
+                    accel_to_decel: r
+                        .flag("accel_to_decel_enable")
+                        .then(|| r.range("accel_to_decel_factor", 50.0, 1.0, 100.0) / 100.0),
+                    jerk_default: jerk("default_jerk"),
+                    jerk_outer: jerk("outer_wall_jerk"),
+                    jerk_inner: jerk("inner_wall_jerk"),
+                    jerk_infill: jerk("infill_jerk"),
+                    jerk_top: jerk("top_surface_jerk"),
+                    jerk_first_layer: jerk("initial_layer_jerk"),
+                    jerk_travel: jerk("travel_jerk"),
+                    firmware_retraction: r.flag("use_firmware_retraction"),
+                    z_hop: if r.first("z_hop_types") == "Normal Lift" { ZHop::Normal } else { ZHop::Slope },
+                    lift_above: r.range("retract_lift_above", 0.0, 0.0, 10_000.0),
+                    lift_below: r.range("retract_lift_below", 0.0, 0.0, 10_000.0),
+                    travel_slope: r.range("travel_slope", 3.0, 0.5, 90.0),
+                    wipe_distance: r.range("wipe_distance", 1.0, 0.0, 50.0),
+                    retract_before_wipe: r.range("retract_before_wipe", 100.0, 0.0, 100.0) / 100.0,
+                    restart_extra: r.range("retract_restart_extra", 0.0, -10.0, 10.0),
+                    avoid_crossing_walls: r.flag("reduce_crossing_wall"),
+                    max_detour: r.mm_or_percent("max_travel_detour_distance", 100.0).unwrap_or(0.0),
+                    reduce_infill_retraction: r.flag("reduce_infill_retraction"),
+                    arc_fitting: match r.text("enable_arc_fitting").as_str() {
+                        "enabled" | "1" => ArcFitting::All,
+                        "sparse_infill" => ArcFitting::SparseInfill,
+                        _ => ArcFitting::Off,
+                    },
+                    exclude_object: r.flag("exclude_object"),
+                    label_objects: r.flag("gcode_label_objects"),
+                    thumbnails: r.text("thumbnails"),
+                    first_layer_travel_speed: r
+                        .mm_or_percent("initial_layer_travel_speed", travel)
+                        .unwrap_or(travel)
+                        .clamp(1.0, 2000.0),
+                }
             },
             retract: Retract {
                 length: r.range("retraction_length", 0.8, 0.0, 50.0),
@@ -357,6 +535,7 @@ impl Filament {
             },
             kind: r.first("filament_type"),
             colour: r.first("filament_colour"),
+            pressure_advance: r.flag("enable_pressure_advance").then(|| r.range("pressure_advance", 0.0, 0.0, 2.0)),
         }
     }
 

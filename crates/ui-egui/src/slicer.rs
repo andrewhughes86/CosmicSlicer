@@ -89,6 +89,54 @@ pub fn job(session: &Session, plate: usize) -> Job {
     }
 }
 
+/// A G-code file being read for the Preview.
+pub struct GcodeLoad {
+    pub name: String,
+    rx: Receiver<Result<Sliced, String>>,
+}
+
+/// Largest G-code file opened.
+const MAX_GCODE_BYTES: u64 = 2 << 30;
+
+impl GcodeLoad {
+    pub fn start(session: &Session, path: &std::path::Path) -> GcodeLoad {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("G-code").to_owned();
+        let printer =
+            session.presets.effective(TabKind::Printer, 0).overlaid(&session.presets.effective(TabKind::Process, 0));
+        let filaments: Vec<_> = (0..session.presets.project_filaments.len())
+            .map(|i| session.presets.effective(TabKind::Filament, i))
+            .collect();
+        let path = path.to_owned();
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new().name("gcode reader".into()).spawn(move || {
+            let result = (|| {
+                let len = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+                if len > MAX_GCODE_BYTES {
+                    return Err(format!("{} is larger than 2 GB", path.display()));
+                }
+                let bytes = std::fs::read(&path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                Ok(CosmicSlicer_engine::view_gcode(text, &printer, &filaments))
+            })();
+            let _ = tx.send(result);
+        });
+        if let Err(e) = spawned {
+            let (tx, rx2) = mpsc::channel();
+            let _ = tx.send(Err(format!("could not start reading: {e}")));
+            return GcodeLoad { name, rx: rx2 };
+        }
+        GcodeLoad { name, rx }
+    }
+
+    pub fn poll(&self) -> Option<Result<Sliced, String>> {
+        match self.rx.try_recv() {
+            Ok(r) => Some(r),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err("reading stopped unexpectedly".into())),
+        }
+    }
+}
+
 /// A slice in progress.
 pub struct Runner {
     pub progress: Arc<Progress>,

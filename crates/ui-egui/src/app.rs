@@ -80,6 +80,8 @@ pub struct CosmicSlicerApp {
     export_when_sliced: bool,
     /// Write the G-code here when the slice finishes, without asking (automation).
     export_to: Option<PathBuf>,
+    /// A G-code file being read for the Preview.
+    gcode_load: Option<crate::slicer::GcodeLoad>,
     /// Where settings, autosaves and crash reports live; `None` in test runs.
     data_dir: Option<PathBuf>,
     autosaver: Option<crate::recovery::Autosaver>,
@@ -188,6 +190,7 @@ impl CosmicSlicerApp {
             last_failed: None,
             export_when_sliced: false,
             export_to: None,
+            gcode_load: None,
             data_dir: None,
             autosaver: None,
             saved_settings: String::new(),
@@ -260,8 +263,33 @@ impl CosmicSlicerApp {
     /// Checks on the running slice; picks up its result.
     fn poll_slice(&mut self, ctx: &egui::Context) {
         let s = &mut self.session;
-        // In Preview, a stale or missing slice is redone, as OrcaSlicer's background slicing does.
+        if let Some(load) = &self.gcode_load {
+            s.slicing = Some((0.0, format!("Reading {}", load.name)));
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            if let Some(result) = load.poll() {
+                let name = load.name.clone();
+                self.gcode_load = None;
+                s.slicing = None;
+                match result {
+                    Ok(v) => {
+                        for w in &v.warnings {
+                            s.notify(Level::Warning, w.clone());
+                        }
+                        s.viewer = Some((name, Arc::new(v)));
+                        self.viewport.fit_pending = true;
+                    }
+                    Err(e) => s.notify(Level::Error, e),
+                }
+            }
+            return;
+        }
+        if std::mem::take(&mut self.viewport.close_viewer) {
+            s.viewer = None;
+        }
+        // In Preview, a stale or missing slice is redone, as OrcaSlicer's background slicing does
+        // (not while a G-code file is open).
         if s.page == Page::Preview
+            && s.viewer.is_none()
             && self.runner.is_none()
             && !s.sliced.as_ref().is_some_and(|st| st.is_current(s))
             && s.model.objects.iter().any(|o| o.plate == s.plate && o.visible)
@@ -314,8 +342,7 @@ impl CosmicSlicerApp {
 
     fn export_gcode(&mut self) {
         let s = &mut self.session;
-        let Some(st) = s.sliced.as_ref().filter(|st| st.is_current(s)) else { return };
-        let result = Arc::clone(&st.result);
+        let Some(result) = s.shown_result() else { return };
         let name = format!("{}_plate_{}.gcode", s.project.name.replace(['/', '\\', ':'], "_"), s.plate + 1);
         let Some(path) = rfd::FileDialog::new()
             .set_title("Export G-code")
@@ -388,6 +415,12 @@ impl CosmicSlicerApp {
                 actions.push(Action::Slice);
             }
             Step::Layer(n) => self.viewport.pending_top = Some(n),
+            Step::OpenGcode(path) => actions.push(Action::OpenGcode(Some(path))),
+            Step::PreviewOptions => {
+                self.viewport.show_travel = true;
+                self.viewport.show_retractions = true;
+                self.viewport.show_seams = true;
+            }
             Step::Autosave => {
                 if let Some(saver) = self.autosaver.as_mut()
                     && let Err(e) = saver.save(&self.session)
@@ -532,6 +565,7 @@ impl CosmicSlicerApp {
             }
             Action::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
             Action::Slice => {
+                s.viewer = None;
                 s.page = Page::Preview;
                 self.last_failed = None;
                 self.start_slice();
@@ -571,6 +605,18 @@ impl CosmicSlicerApp {
                 self.dialogs.wizard = Some(crate::wizard::Wizard::new(&s.prefs, page));
             }
             Action::ImportConfig => self.import_config(),
+            Action::OpenGcode(path) => {
+                let path = path.or_else(|| {
+                    rfd::FileDialog::new()
+                        .set_title("Open G-code")
+                        .add_filter("G-code", &["gcode", "gco", "g", "bgcode"])
+                        .pick_file()
+                });
+                if let Some(path) = path {
+                    self.gcode_load = Some(crate::slicer::GcodeLoad::start(s, &path));
+                    s.page = Page::Preview;
+                }
+            }
             Action::ExportPreset(kind, filament) => self.export_preset(kind, filament),
             Action::Unavailable(what) => s.notify(Level::Warning, format!("{what} arrives in a later step.")),
         }
@@ -770,7 +816,7 @@ impl CosmicSlicerApp {
         let Some(path) = self.capture.clone() else { return };
         ctx.request_repaint();
         // A screenshot of a slice waits for it to finish.
-        if self.runner.is_some() {
+        if self.runner.is_some() || self.gcode_load.is_some() {
             return;
         }
         if !self.capture_requested {
@@ -901,8 +947,19 @@ impl CosmicSlicerApp {
             i.raw.dropped_files.iter().map(|f| f.path().to_owned()).filter(|p| !p.as_os_str().is_empty()).collect()
         });
         if !dropped.is_empty() {
-            self.session.page = Page::Prepare;
-            actions.extend(dropped.into_iter().map(Action::ImportPath));
+            // G-code opens in the Preview; models go on the plate.
+            let (gcode, models): (Vec<PathBuf>, Vec<PathBuf>) = dropped.into_iter().partition(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "gcode" | "gco" | "g"))
+            });
+            if !models.is_empty() {
+                self.session.page = Page::Prepare;
+                actions.extend(models.into_iter().map(Action::ImportPath));
+            }
+            if let Some(g) = gcode.into_iter().next() {
+                actions.push(Action::OpenGcode(Some(g)));
+            }
         }
         self.shortcuts(&ctx, &mut actions);
         self.poll_slice(&ctx);
@@ -1039,6 +1096,10 @@ mod smoke {
                 app.session.page = page;
                 frames(&mut app, &ctx, 3);
             }
+            // A project name too long for the title bar.
+            app.session.project.name = "A very long project name ".repeat(12);
+            app.session.page = Page::Prepare;
+            frames(&mut app, &ctx, 2);
             app.session.prefs.recent = vec![PathBuf::from("/tmp/a.stl"), PathBuf::from("/tmp/b.obj")];
             app.session.page = Page::Home;
             frames(&mut app, &ctx, 2);
@@ -1139,6 +1200,17 @@ mod smoke {
         app.session.toggle_lock(1);
         app.session.page = Page::Preview;
         frames(&mut app, &ctx, 2);
+        // A G-code file in the Preview, with every mark on.
+        let text = "G90\nM83\nG1 Z0.2\nG1 X10 Y10\n;TYPE:Outer wall\nG1 X20 Y10 E1\nG1 E-0.8\nG1 X30 Y30\n".to_owned();
+        let viewed = CosmicSlicer_engine::view_gcode(text, &CosmicSlicer_config::Config::default(), &[]);
+        app.session.viewer = Some(("test.gcode".into(), Arc::new(viewed)));
+        app.viewport.show_travel = true;
+        app.viewport.show_retractions = true;
+        app.viewport.show_seams = true;
+        frames(&mut app, &ctx, 2);
+        app.viewport.close_viewer = true;
+        frames(&mut app, &ctx, 2);
+        assert!(app.session.viewer.is_none());
         app.session.page = Page::Prepare;
         frames(&mut app, &ctx, 2);
     }

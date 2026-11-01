@@ -11,6 +11,7 @@ end of every session (no crashes, tests and clippy clean, smoke tests cover new 
 | 2 | Slicing engine core | Layers, walls, top/bottom/solid/sparse, 7 infill generators, skirt/brim, normal supports, cooling, G-code, estimates, real toolpath Preview, export |
 | 3 | CI, autosave, crash recovery | GitHub Actions on Linux/Windows/macOS (+ real app run on a software GPU), autosave with OS-lock crash detection and restore prompt, crash reports, atomic settings files, shader validation test |
 | 4 | Profiles | OrcaSlicer's library (72 vendors, 1,192 printers) embedded, setup wizard, compatibility filtering, printer defaults, the custom G-code macro language (all 4,768 library templates render), user presets as Orca-style files, import/export |
+| 5 | Motion and G-code | Firmware-style motion planner (estimate and M73), machine limits, per-feature accel/jerk, pressure advance, firmware retraction, wipe, sloped z-hop, travel inside parts and avoid-crossing-walls routing, arc fitting, object labels / exclude-object, thumbnails, G-code viewer with travel/retraction/seam marks |
 
 ## Order, and why
 Get a user's own printer printing well and safely first (profiles, correct motion G-code,
@@ -67,7 +68,7 @@ CI comes early because the Windows and macOS builds are not yet checked by anyth
 **Done when:** your own printers come up with their real start/end G-code, bed shape and limits,
 and an Orca user preset file imports and slices identically.
 
-## 5 · Motion and G-code
+## 5 · Motion and G-code — done
 - Machine limits (`machine_max_*`) emitted as M201/M203/M204/M205 or Klipper `SET_VELOCITY_LIMIT`;
   per-feature acceleration and jerk commands; pressure advance / adaptive PA.
 - Time estimate rebuilt on Orca's GCodeProcessor model (trapezoids with look-ahead, junction

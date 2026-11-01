@@ -117,6 +117,8 @@ impl Path {
 /// One connected part of one object on one layer: its walls (outermost first) and fill.
 #[derive(Clone, Debug, Default)]
 pub struct Island {
+    /// The island's outline, for routing travel inside it.
+    pub outline: crate::geom::Shape,
     /// Walls by depth: `walls[0]` are the outer walls.
     pub walls: Vec<Vec<Path>>,
     pub fills: Vec<Path>,

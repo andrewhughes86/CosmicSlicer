@@ -9,6 +9,9 @@ OrcaSlicer's crashes are the reason this exists.
 - No `unwrap`, `expect`, `panic!`, `unreachable!`, `todo!` or `unsafe` in non-test code (the
   workspace lints deny them). Input-derived numbers are hostile: `get()` not `[i]`, finite
   checks, caps on sizes and counts (see `model::stl`, `state::Session::bed`).
+- `f32::clamp` / `f64::clamp` / `Ord::clamp` panic when the bounds cross or are NaN: only
+  clamp with bounds that cannot cross; with computed bounds, use `min` / `max` (see the
+  layer slider and the title bar for the two times this bit).
 - egui asserts on some layout misuse (e.g. `add_space` inside a `Grid`). Every page, dialog,
   settings page and canvas tool is drawn headlessly by `app::smoke` tests; add new UI there.
 - `CosmicSlicerApp::ui` catches a panic in a frame, closes dialogs and keeps the project.
@@ -33,6 +36,12 @@ OrcaSlicer's crashes are the reason this exists.
   JSON diffs). Custom G-code that cannot be evaluated fails the slice — never pass template text
   to a printer. The engine test `every_library_printer_renders_its_gcode` renders every
   printer's templates; keep it at zero failures when changing either.
+- The engine's G-code is a program of `gcode::Op`s first: `motion::plan` times it as the
+  firmware will (trapezoids, look-ahead, axis limits, jerk or junction deviation), then it is
+  rendered with M73 progress. `gcodeview` reads any G-code back into the same Preview and
+  estimate; the engine tests check that our own G-code reads back with the same time and
+  filament. Travel inside an island uses `travel::Region` (no retraction needed inside;
+  routed round walls with "Avoid crossing walls").
 - `crates/model` — meshes, objects, plates, STL/OBJ readers, primitives, arrange.
 - `crates/engine` — the slicer: `slicing` (mesh → layer shapes), `walls`, `plan` (top /
   bottom / solid / sparse regions per island), `infill`, `skirt`, `support`, `gcode` (order,

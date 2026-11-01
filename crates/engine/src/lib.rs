@@ -11,16 +11,21 @@
 
 #![allow(non_snake_case)]
 
+pub mod arcs;
 pub mod gcode;
+pub mod gcodeview;
 pub mod geom;
 pub mod infill;
 pub mod macros;
+pub mod motion;
 pub mod plan;
 pub mod settings;
 pub mod skirt;
 pub mod slicing;
 pub mod support;
+pub mod thumbnail;
 pub mod toolpath;
+pub mod travel;
 pub mod walls;
 
 use std::sync::Arc;
@@ -125,6 +130,29 @@ pub enum SliceError {
     Gcode(String),
     #[error("the slicing engine hit a bug ({0}); nothing was printed or changed")]
     Bug(String),
+}
+
+/// Reads a G-code file for the Preview, timed with the printer settings of `printer` and the
+/// filaments of `filaments`. Never panics.
+pub fn view_gcode(text: String, printer: &Config, filaments: &[Config]) -> Sliced {
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let schema = Schema::get();
+        let s = Settings::read(schema, printer);
+        let fil: Vec<Filament> = filaments.iter().map(|f| Filament::read(schema, f, "textured_plate_temp")).collect();
+        let v = gcodeview::read(&text, &s, &fil);
+        let colours = filaments.iter().map(|f| f.get(schema, "filament_colour").to_owned()).collect();
+        (v, colours)
+    }));
+    match run {
+        Ok((v, colours)) => Sliced { gcode: text, preview: v.preview, stats: v.stats, warnings: v.warnings, colours },
+        Err(_) => Sliced {
+            gcode: text,
+            preview: Preview::default(),
+            stats: Stats::default(),
+            warnings: vec!["The G-code could not be read.".into()],
+            colours: Vec::new(),
+        },
+    }
 }
 
 /// Slices `job`, reporting to `progress`. Never panics.
@@ -302,13 +330,39 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
     let macros = macros::Macros::new(schema, &table, &s, &filaments, &facts);
     let names: Vec<String> = job.objects.iter().map(|o| o.name.clone()).collect();
     let extruders: Vec<usize> = job.objects.iter().map(|o| o.extruder.min(filaments.len().saturating_sub(1))).collect();
+    // Each object's footprint, for the firmware's object labels (Klipper's exclude-object).
+    let outlines: Vec<Vec<glam::DVec2>> = object_slices
+        .iter()
+        .map(|layers| {
+            let step = (layers.len() / 50).max(1);
+            let pts: Vec<glam::DVec2> =
+                layers.iter().step_by(step).flatten().filter_map(|sh| sh.first()).flatten().copied().collect();
+            geom::convex_hull(&pts)
+        })
+        .collect();
+    let thumbnails = {
+        let specs = thumbnail::parse(&s.motion.thumbnails, base.get(schema, "thumbnails_format"), &mut warnings);
+        let colour = |e: usize| -> [u8; 3] {
+            let hex = filaments.get(e).map_or("", |f| f.colour.as_str()).trim_start_matches('#');
+            let v = hex.get(..6).and_then(|h| u32::from_str_radix(h, 16).ok()).unwrap_or(0xF2_75_4E);
+            [(v >> 16) as u8, (v >> 8) as u8, v as u8]
+        };
+        let items: Vec<thumbnail::Item<'_>> = job
+            .objects
+            .iter()
+            .map(|o| thumbnail::Item { mesh: &o.mesh, matrix: o.matrix, colour: colour(o.extruder) })
+            .collect();
+        thumbnail::blocks(&items, &specs)
+    };
     let cx = gcode::Context {
         settings: &s,
         filaments: &filaments,
         object_extruder: &extruders,
         object_names: &names,
+        object_outlines: &outlines,
         macros: &macros,
         plate_name: job.plate_name.clone(),
+        thumbnails,
     };
     let out = gcode::emit(&plans, &cx);
     if let Some(e) = out.error {
@@ -366,6 +420,12 @@ mod tests {
         if let Ok(path) = std::env::var("CUBE_GCODE") {
             let _ = std::fs::write(path, &out.gcode);
         }
+        // Reading our own G-code back gives the same picture and estimate.
+        let back = view_gcode(out.gcode.clone(), &Config::default(), &[Config::default()]);
+        assert_eq!(back.preview.layers.len(), out.preview.layers.len());
+        let (a, b) = (back.stats.total_time, out.stats.total_time);
+        assert!((a - b).abs() / b < 0.02, "read back {a} vs sliced {b}");
+        assert!((back.stats.filament_mm[0] - out.stats.filament_mm[0]).abs() / out.stats.filament_mm[0] < 0.01);
         assert_eq!(out.stats.layers, 100);
         assert_eq!(out.preview.layers.len(), 100);
         assert!(out.gcode.contains(";TYPE:Outer wall"));
@@ -418,6 +478,68 @@ mod tests {
         let p = Progress::default();
         p.cancel();
         assert!(matches!(slice(&job(vec![cube(Vec3::new(100.0, 100.0, 0.0), 20.0)]), &p), Err(SliceError::Cancelled)));
+    }
+
+    fn torus(at: Vec3) -> JobObject {
+        JobObject {
+            name: "torus".into(),
+            mesh: Arc::new(primitives::torus(15.0, 5.0, 96, 32)),
+            matrix: Mat4::from_translation(at),
+            extruder: 0,
+            overrides: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn arcs_read_back_the_same() {
+        let mut j = job(vec![torus(Vec3::new(100.0, 100.0, 0.0))]);
+        j.process.set("enable_arc_fitting", "enabled");
+        let out = slice(&j, &Progress::default());
+        assert!(out.is_ok(), "{:?}", out.as_ref().err());
+        let Ok(out) = out else { return };
+        let arcs = out.gcode.lines().filter(|l| l.starts_with("G2 ") || l.starts_with("G3 ")).count();
+        assert!(arcs > 100, "{arcs}");
+        let back = view_gcode(out.gcode.clone(), &Config::default(), &[Config::default()]);
+        let (a, b) = (back.stats.filament_mm[0], out.stats.filament_mm[0]);
+        assert!((a - b).abs() / b < 0.01, "{a} vs {b}");
+        let (a, b) = (back.stats.total_time, out.stats.total_time);
+        assert!((a - b).abs() / b < 0.05, "{a} vs {b}");
+    }
+
+    #[test]
+    fn avoiding_walls_saves_retractions() {
+        let count = |avoid: bool| {
+            let mut j = job(vec![torus(Vec3::new(100.0, 100.0, 0.0))]);
+            j.process.set("reduce_crossing_wall", if avoid { "1" } else { "0" });
+            j.process.set("reduce_infill_retraction", "1");
+            slice(&j, &Progress::default())
+                .map(|o| o.gcode.lines().filter(|l| l.starts_with("G1 E-")).count())
+                .unwrap_or(0)
+        };
+        let (plain, avoided) = (count(false), count(true));
+        assert!(avoided < plain, "{avoided} retractions avoiding walls vs {plain}");
+    }
+
+    #[test]
+    fn klipper_gets_its_own_commands() {
+        let mut j = job(vec![cube(Vec3::new(100.0, 100.0, 0.0), 10.0)]);
+        j.printer.set("gcode_flavor", "klipper");
+        j.process.set("exclude_object", "1");
+        j.filaments[0].set("enable_pressure_advance", "1");
+        j.filaments[0].set("pressure_advance", "0.04");
+        let out = slice(&j, &Progress::default());
+        assert!(out.is_ok(), "{:?}", out.as_ref().err());
+        let Ok(out) = out else { return };
+        for expect in [
+            "SET_VELOCITY_LIMIT ACCEL=",
+            "EXCLUDE_OBJECT_DEFINE NAME=cube_id_0_copy_0",
+            "EXCLUDE_OBJECT_START",
+            "SET_PRESSURE_ADVANCE ADVANCE=0.04",
+            "; thumbnail begin 300x300",
+        ] {
+            assert!(out.gcode.contains(expect), "missing {expect}");
+        }
+        assert!(!out.gcode.contains("M204"));
     }
 
     /// `SLICE_FILE=model.stl SLICE_OUT=out.gcode cargo test --release -p CosmicSlicer-engine

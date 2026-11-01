@@ -15,5 +15,6 @@ CosmicSlicer-model = { workspace = true }
 glam = { workspace = true }
 i_overlay = { workspace = true }
 log = { workspace = true }
+png = { workspace = true }
 rayon = { workspace = true }
 thiserror = { workspace = true }

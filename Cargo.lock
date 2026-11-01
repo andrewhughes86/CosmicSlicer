@@ -29,6 +29,7 @@ dependencies = [
  "glam",
  "i_overlay",
  "log",
+ "png",
  "rayon",
  "thiserror 2.0.21",
 ]

@@ -103,7 +103,7 @@ pub fn object(
                 .iter()
                 .map(|island| {
                     let walled = walls::walls(island, s, h, first, loops, 1.0);
-                    let mut out = Island { walls: walled.walls, fills: Vec::new() };
+                    let mut out = Island { outline: island.clone(), walls: walled.walls, fills: Vec::new() };
                     if walled.infill_area.is_empty() {
                         return out;
                     }

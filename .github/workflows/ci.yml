@@ -94,6 +94,8 @@ jobs:
           xvfb-run -a -s "-screen 0 1600x1000x24" $app --restore --screenshot "$out/restored.png"
           xvfb-run -a -s "-screen 0 1600x1000x24" $app --simulate-panic --screenshot "$out/panic.png"
           ls "$COSMICSLICER_DATA_DIR/crashes" | grep -q crash-
+          xvfb-run -a -s "-screen 0 1600x1000x24" $app "$out/plate.gcode" --preview-options --screenshot "$out/viewer.png"
+          test -s "$out/viewer.png"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

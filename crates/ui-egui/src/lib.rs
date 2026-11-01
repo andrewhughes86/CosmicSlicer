@@ -74,6 +74,8 @@ pub enum Action {
     /// Open the setup wizard (on its filament page when true).
     Wizard(bool),
     ImportConfig,
+    /// Open a G-code file in the Preview (asks for it when `None`).
+    OpenGcode(Option<PathBuf>),
     ExportPreset(TabKind, usize),
     /// A feature not built yet, by name.
     Unavailable(&'static str),

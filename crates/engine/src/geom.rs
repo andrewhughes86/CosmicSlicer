@@ -243,6 +243,35 @@ pub fn hatch_lines(shapes: &[Shape], spacing: f64, angle: f64, phase: f64, max_l
         .collect()
 }
 
+/// The convex hull of `points`, counter-clockwise (Andrew's monotone chain).
+pub fn convex_hull(points: &[DVec2]) -> Contour {
+    let mut pts: Vec<DVec2> = points.iter().copied().filter(|p| p.is_finite()).collect();
+    pts.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+    pts.dedup();
+    if pts.len() < 3 {
+        return pts;
+    }
+    let cross = |o: DVec2, a: DVec2, b: DVec2| (a - o).perp_dot(b - o);
+    let mut lower: Vec<DVec2> = Vec::new();
+    for &p in &pts {
+        while lower.len() >= 2 && cross(lower[lower.len() - 2], lower[lower.len() - 1], p) <= 0.0 {
+            lower.pop();
+        }
+        lower.push(p);
+    }
+    let mut upper: Vec<DVec2> = Vec::new();
+    for &p in pts.iter().rev() {
+        while upper.len() >= 2 && cross(upper[upper.len() - 2], upper[upper.len() - 1], p) <= 0.0 {
+            upper.pop();
+        }
+        upper.push(p);
+    }
+    lower.pop();
+    upper.pop();
+    lower.extend(upper);
+    lower
+}
+
 /// Length of an open line.
 pub fn length(line: &[DVec2]) -> f64 {
     line.windows(2)

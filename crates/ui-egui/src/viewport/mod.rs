@@ -113,6 +113,12 @@ pub struct Viewport {
     pub legend_range: Option<crate::preview::Range>,
     /// Toolpath segments the GPU holds (may be fewer than the result has).
     segments_loaded: usize,
+    /// Preview options, as OrcaSlicer's legend has them.
+    pub show_travel: bool,
+    pub show_retractions: bool,
+    pub show_seams: bool,
+    /// The legend's "Close" on an opened G-code file was clicked.
+    pub close_viewer: bool,
     /// A top layer to show once the plate is sliced (automation).
     pub pending_top: Option<usize>,
 }
@@ -139,6 +145,10 @@ impl Default for Viewport {
             colours_key: None,
             legend_range: None,
             segments_loaded: 0,
+            show_travel: false,
+            show_retractions: false,
+            show_seams: false,
+            close_viewer: false,
             pending_top: None,
         }
     }
@@ -212,11 +222,11 @@ impl Viewport {
 
     /// Recomputes the layer range Preview shows.
     fn update_layers(&mut self, session: &Session) {
-        if let Some(st) = session.sliced.as_ref().filter(|s| s.is_current(session)) {
-            let zs: Vec<f32> = st.result.preview.layers.iter().map(|l| l.z).collect();
+        if let Some(result) = session.shown_result() {
+            let zs: Vec<f32> = result.preview.layers.iter().map(|l| l.z).collect();
             if zs != self.layers.zs {
                 let count = zs.len();
-                let height = st.result.preview.layers.last().map_or(0.2, |l| l.height);
+                let height = result.preview.layers.last().map_or(0.2, |l| l.height);
                 let first = zs.first().copied().unwrap_or(0.2);
                 self.layers = Layers { count, height, first, top: count, bottom: 1.min(count), zs };
                 if let Some(n) = self.pending_top.take() {
@@ -246,8 +256,9 @@ impl Viewport {
         if count != self.layers.count || h != self.layers.height || first != self.layers.first {
             self.layers = Layers { count, height: h, first, top: count, bottom: 1.min(count), zs: Vec::new() };
         }
-        self.layers.top = self.layers.top.clamp(self.layers.bottom, count);
-        self.layers.bottom = self.layers.bottom.clamp(1.min(count), self.layers.top.max(1.min(count)));
+        // Not `clamp`: its bounds may cross here (no layers), and it panics when they do.
+        self.layers.top = self.layers.top.min(count).max(self.layers.bottom.min(count));
+        self.layers.bottom = self.layers.bottom.min(self.layers.top).max(1.min(count));
     }
 
     pub fn show(
@@ -300,11 +311,7 @@ impl Viewport {
             self.bed_key = Some(bed_key);
         }
         // A sliced plate shows its toolpaths instead of the models.
-        let result = session
-            .sliced
-            .as_ref()
-            .filter(|s| page == Page::Preview && s.is_current(session))
-            .map(|s| Arc::clone(&s.result));
+        let result = if page == Page::Preview { session.shown_result() } else { None };
         match &result {
             Some(r) => self.upload_toolpaths(&mut gpu, r),
             None => {
@@ -344,6 +351,9 @@ impl Viewport {
             .collect();
         gpu.set_draws(draws);
         let mut overlay_geometry = FlatGeometry::default();
+        if let Some(r) = &result {
+            self.preview_marks(r, t, &mut overlay_geometry);
+        }
         if page == Page::Prepare
             && let Some(b) = Self::selection_bounds(session)
         {
@@ -390,6 +400,55 @@ impl Viewport {
         }
         self.gpu = Some(gpu);
         overlay::show(self, ui, rect, session, t, actions);
+    }
+
+    /// Travel, retraction and seam marks for the shown layers, and the tool at the end of the
+    /// shown moves.
+    fn preview_marks(&self, r: &CosmicSlicer_engine::Sliced, t: &Tokens, g: &mut FlatGeometry) {
+        const MAX_MARKS: usize = 200_000;
+        let layers = &r.preview.layers;
+        let (lo, hi) = (self.layers.bottom.saturating_sub(1), self.layers.top.saturating_sub(1));
+        let shown = layers.get(lo..=hi.min(layers.len().saturating_sub(1))).unwrap_or_default();
+        let v = |p: [f32; 3]| Vec3::new(p[0], p[1], p[2]);
+        let mut budget = MAX_MARKS;
+        let cross = |g: &mut FlatGeometry, p: Vec3, size: f32, colour: [f32; 4]| {
+            g.line(p - Vec3::X * size, p + Vec3::X * size, colour);
+            g.line(p - Vec3::Y * size, p + Vec3::Y * size, colour);
+            g.line(p, p + Vec3::Z * size * 1.5, colour);
+        };
+        for l in shown {
+            if self.show_travel {
+                for (a, b) in r.preview.travels.get(l.travels.clone()).unwrap_or_default().iter().take(budget) {
+                    g.line(v(*a), v(*b), linear(t.accent_strong));
+                    budget = budget.saturating_sub(1);
+                }
+            }
+            if self.show_retractions {
+                for p in r.preview.retractions.get(l.retractions.clone()).unwrap_or_default().iter().take(budget) {
+                    cross(g, v(*p), 0.4, linear(egui::Color32::from_rgb(205, 34, 214)));
+                    budget = budget.saturating_sub(1);
+                }
+            }
+            if self.show_seams {
+                for p in r.preview.seams.get(l.seams.clone()).unwrap_or_default().iter().take(budget) {
+                    cross(g, v(*p), 0.4, linear(egui::Color32::from_rgb(230, 230, 230)));
+                    budget = budget.saturating_sub(1);
+                }
+            }
+        }
+        // The nozzle where the shown moves end.
+        let cap = self.segments_loaded;
+        let end = layers
+            .get(hi)
+            .map_or(0, |x| x.segments.start + (x.segments.len() as f32 * self.moves.clamp(0.0, 1.0)).round() as usize);
+        if let Some(s) = end.checked_sub(1).filter(|e| *e < cap).and_then(|e| r.preview.segments.get(e)) {
+            let tip = v(s.b);
+            let c = linear(t.warning);
+            for k in 0..8 {
+                let a = k as f32 / 8.0 * std::f32::consts::TAU;
+                g.line(tip, tip + Vec3::new(a.cos() * 1.2, a.sin() * 1.2, 4.0), c);
+            }
+        }
     }
 
     /// Puts `r`'s toolpaths on the GPU (once), colours them for the legend, and sets the

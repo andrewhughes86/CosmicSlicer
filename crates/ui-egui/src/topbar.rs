@@ -145,10 +145,11 @@ fn title_bar(ui: &mut Ui, session: &mut Session, t: &Tokens, actions: &mut Vec<A
     // The project name in the middle.
     let title = format!("{} — CosmicSlicer", session.title());
     let galley = ui.painter().layout_no_wrap(title, FontId::proportional(13.0), t.text_muted);
-    let centre = strip
-        .center()
-        .x
-        .clamp(calib.right() + galley.size().x / 2.0 + 20.0, (right - galley.size().x / 2.0 - 20.0).max(calib.right()));
+    // Centred when there is room, else just right of the menus (`clamp` would panic when a
+    // long name leaves no room).
+    let lo = calib.right() + galley.size().x / 2.0 + 20.0;
+    let hi = right - galley.size().x / 2.0 - 20.0;
+    let centre = if hi >= lo { strip.center().x.clamp(lo, hi) } else { lo };
     ui.painter().galley(
         pos2(centre - galley.size().x / 2.0, strip.center().y - galley.size().y / 2.0),
         galley,

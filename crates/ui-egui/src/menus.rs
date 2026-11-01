@@ -40,6 +40,9 @@ pub fn file_menu(ui: &mut Ui, session: &mut Session, actions: &mut Vec<Action>) 
             ui.close();
         }
     });
+    if menu_item(ui, "Open G-code…", "", true) {
+        actions.push(Action::OpenGcode(None));
+    }
     if menu_item(ui, "Save Project", &ctrl("S"), true) {
         actions.push(Action::SaveProject);
     }

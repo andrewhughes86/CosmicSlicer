@@ -151,6 +151,8 @@ pub struct Session {
     pub revision: u64,
     /// The last finished slice; it shows only while it matches the plate and settings.
     pub sliced: Option<crate::slicer::SliceState>,
+    /// A G-code file open in the Preview (OrcaSlicer's G-code viewer): its name and contents.
+    pub viewer: Option<(String, std::sync::Arc<CosmicSlicer_engine::Sliced>)>,
     /// A slice running: progress (0 to 1) and stage, for the progress card.
     pub slicing: Option<(f32, String)>,
     /// Set by the progress card's Cancel.
@@ -201,6 +203,7 @@ impl Session {
             now: 0.0,
             revision: 1,
             sliced: None,
+            viewer: None,
             slicing: None,
             cancel_slice: false,
             undo: Vec::new(),
@@ -739,6 +742,14 @@ impl Session {
         for o in &mut self.model.objects {
             o.filament = o.filament.clamp(1, n);
         }
+    }
+
+    /// What the Preview shows: an opened G-code file, else the current plate's slice.
+    pub fn shown_result(&self) -> Option<std::sync::Arc<CosmicSlicer_engine::Sliced>> {
+        if let Some((_, v)) = &self.viewer {
+            return Some(std::sync::Arc::clone(v));
+        }
+        self.sliced.as_ref().filter(|s| s.is_current(self)).map(|s| std::sync::Arc::clone(&s.result))
     }
 
     pub fn title(&self) -> String {

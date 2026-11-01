@@ -41,6 +41,10 @@ pub enum Step {
     Set(String),
     /// Show the Preview up to this layer.
     Layer(usize),
+    /// Open a G-code file in the Preview.
+    OpenGcode(PathBuf),
+    /// Turn on the Preview's travel, retraction and seam marks.
+    PreviewOptions,
     /// Autosave now.
     Autosave,
     /// Abort the process without cleaning up, as a crash would (recovery tests).

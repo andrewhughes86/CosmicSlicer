@@ -30,6 +30,8 @@ const USAGE: &str = "usage: CosmicSlicer [model.stl ...] [options]
   --slice                 slice the plate and show the Preview
   --export <file.gcode>   slice the plate and write its G-code
   --layer <n>             show the Preview up to layer n
+  --gcode <file.gcode>    open a G-code file in the Preview
+  --preview-options       show travel, retraction and seam marks in the Preview
   --screenshot <file>     save a PNG of the window once the steps have run, then quit
                           (a screenshot run saves nothing, unless COSMICSLICER_DATA_DIR
                           points it at a folder of its own)
@@ -56,6 +58,8 @@ fn main() -> ExitCode {
             "--tool" => value("--tool").map(Step::Tool),
             "--page" => value("--page").map(Step::Page),
             "--set" => value("--set").map(Step::Set),
+            "--gcode" => value("--gcode").map(|p| Step::OpenGcode(PathBuf::from(p))),
+            "--preview-options" => Ok(Step::PreviewOptions),
             "--autosave" => Ok(Step::Autosave),
             "--simulate-crash" => Ok(Step::SimulateCrash),
             "--restore" => Ok(Step::Restore),
@@ -96,7 +100,17 @@ fn main() -> ExitCode {
     // given a data folder of its own.
     let ephemeral = screenshot.is_some() && std::env::var_os("COSMICSLICER_DATA_DIR").is_none_or(|d| d.is_empty());
     // Files named on the command line load before the steps run.
-    let steps: Vec<Step> = files.drain(..).map(Step::Open).chain(steps).collect();
+    let steps: Vec<Step> = files
+        .drain(..)
+        .map(|f| {
+            let gcode = f
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "gcode" | "gco" | "g"));
+            if gcode { Step::OpenGcode(f) } else { Step::Open(f) }
+        })
+        .chain(steps)
+        .collect();
     let options = LaunchOptions { automation: Automation::new(steps, screenshot), ephemeral, files };
     match CosmicSlicer_ui_egui::run(options) {
         Ok(()) => ExitCode::SUCCESS,

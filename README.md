@@ -29,6 +29,13 @@ process) with the setup wizard; filaments and processes filtered to what suits t
 printer; each printer's own start/end G-code, run through OrcaSlicer's macro language; user
 presets saved as OrcaSlicer-style files, with import and export.
 
+Step 5 — motion and G-code: a firmware-style motion planner for the time estimate and M73
+progress; machine limits, per-feature acceleration and jerk, pressure advance, firmware
+retraction, wipe, normal and sloped z-hop, travel kept inside the part (and routed round walls
+on request), arc fitting (G2/G3), Klipper exclude-object and Marlin object labels, PNG/QOI
+thumbnails; G-code files open in the Preview (File → Open G-code, or drop one on the window),
+with travel, retraction and seam marks and a tool marker.
+
 ## Your work is safe
 CosmicSlicer autosaves the open project a minute after each change and before slicing. If it
 ever closes unexpectedly, the next start offers the project back. Crash reports, settings and

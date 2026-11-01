@@ -350,7 +350,8 @@ fn legend(vp: &mut Viewport, ui: &mut Ui, rect: Rect, session: &Session, t: &Tok
     if vp.hidden_features.len() != FEATURES.len() {
         vp.hidden_features = vec![false; FEATURES.len()];
     }
-    let result = session.sliced.as_ref().filter(|s| s.is_current(session)).map(|s| std::sync::Arc::clone(&s.result));
+    let result = session.shown_result();
+    let viewing = session.viewer.as_ref().map(|(name, _)| name.clone());
     egui::Area::new(egui::Id::new("preview-legend"))
         .fixed_pos(pos2(rect.left() + 10.0, rect.top() + 10.0))
         .constrain_to(rect)
@@ -358,6 +359,17 @@ fn legend(vp: &mut Viewport, ui: &mut Ui, rect: Rect, session: &Session, t: &Tok
             ui_kit::frame(Surface::Overlay, t).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
                 ui.set_width(330.0);
                 ui.set_max_height(rect.height() - 40.0);
+                if let Some(name) = &viewing {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("G-code: {name}")).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Close").on_hover_text("Back to the plate's own slice").clicked() {
+                                vp.close_viewer = true;
+                            }
+                        });
+                    });
+                    ui.separator();
+                }
                 let current = VIEW_TYPES.get(vp.view_type).copied().unwrap_or("Line Type");
                 egui::ComboBox::from_id_salt("legend-view-type").selected_text(current).width(200.0).show_ui(
                     ui,
@@ -387,6 +399,13 @@ fn legend(vp: &mut Viewport, ui: &mut Ui, rect: Rect, session: &Session, t: &Tok
                     } else {
                         ui.label(RichText::new("Shown once the plate is sliced.").color(t.text_muted));
                     }
+                });
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Options").strong());
+                    ui.checkbox(&mut vp.show_travel, "Travel");
+                    ui.checkbox(&mut vp.show_retractions, "Retractions");
+                    ui.checkbox(&mut vp.show_seams, "Seams");
                 });
                 ui.separator();
                 ui.label(RichText::new("Estimation").strong());
