@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux, os: ubuntu-24.04, artifact: CosmicSlicer-linux-x86_64, binary: CosmicSlicer }
+          - { name: Windows, os: windows-2022, artifact: CosmicSlicer-windows-x86_64, binary: CosmicSlicer.exe }
+          - { name: macOS, os: macos-14, artifact: CosmicSlicer-macos-arm64, binary: CosmicSlicer }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libvulkan-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: Release build
+        run: cargo build --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/release/${{ matrix.binary }}
+          if-no-files-found: error
+
+  # Runs the real app on a software GPU (Mesa lavapipe under Xvfb): it slices a plate,
+  # exports G-code, crashes on purpose and restores the autosave.
+  app-linux:
+    name: App run (Linux, software GPU)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libvulkan-dev mesa-vulkan-drivers xvfb
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Slice, export, crash and restore
+        env:
+          COSMICSLICER_DATA_DIR: ${{ runner.temp }}/cosmicslicer
+          WAYLAND_DISPLAY: ""
+        run: |
+          set -x
+          app=target/release/CosmicSlicer
+          out=${{ runner.temp }}/out
+          mkdir -p "$out"
+          xvfb-run -a -s "-screen 0 1600x1000x24" $app --add Cube --add Torus --arrange \
+            --export "$out/plate.gcode" --screenshot "$out/preview.png"
+          grep -q ";TYPE:Outer wall" "$out/plate.gcode"
+          xvfb-run -a -s "-screen 0 1600x1000x24" $app --add Cone --autosave --simulate-crash || true
+          ls "$COSMICSLICER_DATA_DIR/autosave" | grep -q cosmicsave
+          xvfb-run -a -s "-screen 0 1600x1000x24" $app --restore --screenshot "$out/restored.png"
+          xvfb-run -a -s "-screen 0 1600x1000x24" $app --simulate-panic --screenshot "$out/panic.png"
+          ls "$COSMICSLICER_DATA_DIR/crashes" | grep -q crash-
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: app-run-linux
+          path: |
+            ${{ runner.temp }}/out
+            ${{ runner.temp }}/cosmicslicer/crashes

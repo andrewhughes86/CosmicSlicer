@@ -50,6 +50,9 @@ pub struct Dialogs {
     pub print: bool,
     /// The Print dialog's "Export G-code" was clicked.
     pub export_requested: bool,
+    /// A project left by a session that did not exit cleanly, and the answer to restoring it.
+    pub restore: Option<crate::recovery::Orphan>,
+    pub restore_choice: Option<bool>,
 }
 
 impl Dialogs {
@@ -87,6 +90,7 @@ impl Dialogs {
         self.bed_shape_window(ctx, session, t);
         self.printer_window(ctx, session, t, device);
         self.small_windows(ctx, session, t);
+        self.restore_window(ctx, t);
     }
 
     fn editor_window(&mut self, ctx: &egui::Context, session: &mut Session, t: &Tokens) {
@@ -567,6 +571,46 @@ impl Dialogs {
         });
         if !open {
             self.physical_printer = false;
+        }
+    }
+
+    fn restore_window(&mut self, ctx: &egui::Context, t: &Tokens) {
+        let Some(o) = self.restore.clone() else { return };
+        if self.restore_choice.is_some() {
+            return;
+        }
+        let mut open = true;
+        Window::dialog("Restore project").show(ctx, t, &mut open, |ui| {
+            ui.set_width(460.0);
+            ui.label(RichText::new("CosmicSlicer closed unexpectedly last time.").strong());
+            ui.add_space(4.0);
+            ui.label(format!(
+                "\"{}\" ({} object(s)) was autosaved {}. Restore it?",
+                o.name,
+                o.objects,
+                crate::recovery::ago(o.age)
+            ));
+            if let Some(report) = &o.report {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!("A crash report was saved to {}", report.display()))
+                        .small()
+                        .color(t.text_muted),
+                );
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui_kit::primary_button(ui, t, "Restore").clicked() {
+                    self.restore_choice = Some(true);
+                }
+                if ui.button("Discard").clicked() {
+                    self.restore_choice = Some(false);
+                }
+            });
+        });
+        if !open {
+            // Closing the prompt keeps the autosave for next time.
+            self.restore = None;
         }
     }
 

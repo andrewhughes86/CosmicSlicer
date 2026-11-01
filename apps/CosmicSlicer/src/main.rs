@@ -31,7 +31,14 @@ const USAGE: &str = "usage: CosmicSlicer [model.stl ...] [options]
   --export <file.gcode>   slice the plate and write its G-code
   --layer <n>             show the Preview up to layer n
   --screenshot <file>     save a PNG of the window once the steps have run, then quit
-                          (a screenshot run saves no preferences)";
+                          (a screenshot run saves nothing, unless COSMICSLICER_DATA_DIR
+                          points it at a folder of its own)
+
+Recovery testing (with COSMICSLICER_DATA_DIR set to a scratch folder):
+  --autosave              autosave now
+  --simulate-crash        stop at once, as a crash would, leaving the autosave behind
+  --restore               answer Restore to the restore prompt
+  --simulate-panic        fail inside a frame: the app recovers and writes a crash report";
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
@@ -49,6 +56,10 @@ fn main() -> ExitCode {
             "--tool" => value("--tool").map(Step::Tool),
             "--page" => value("--page").map(Step::Page),
             "--set" => value("--set").map(Step::Set),
+            "--autosave" => Ok(Step::Autosave),
+            "--simulate-crash" => Ok(Step::SimulateCrash),
+            "--restore" => Ok(Step::Restore),
+            "--simulate-panic" => Ok(Step::SimulatePanic),
             "--layer" => value("--layer")
                 .and_then(|v| v.parse().map(Step::Layer).map_err(|_| format!("--layer needs a number, not {v}"))),
             "--export" => value("--export").map(|p| Step::Export(PathBuf::from(p))),
@@ -81,8 +92,9 @@ fn main() -> ExitCode {
             }
         }
     }
-    // A screenshot run is a test: it must not change the user's saved settings.
-    let ephemeral = screenshot.is_some();
+    // A screenshot run is a test: it must not change the user's saved settings, unless it was
+    // given a data folder of its own.
+    let ephemeral = screenshot.is_some() && std::env::var_os("COSMICSLICER_DATA_DIR").is_none_or(|d| d.is_empty());
     // Files named on the command line load before the steps run.
     let steps: Vec<Step> = files.drain(..).map(Step::Open).chain(steps).collect();
     let options = LaunchOptions { automation: Automation::new(steps, screenshot), ephemeral, files };

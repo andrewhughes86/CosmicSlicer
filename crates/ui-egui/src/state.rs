@@ -102,7 +102,8 @@ pub struct Notice {
 }
 
 /// Project details shown on the Project page.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ProjectInfo {
     pub name: String,
     pub path: Option<PathBuf>,
@@ -156,7 +157,8 @@ pub struct Session {
 }
 
 /// OrcaSlicer's "Customize current plate" settings.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct PlateSettings {
     pub name: String,
     /// `None` follows the project's plate type.

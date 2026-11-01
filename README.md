@@ -24,6 +24,12 @@ variable layer height, painting tools, 3MF projects and printer connections.
 
 Script it: `CosmicSlicer model.stl --set sparse_infill_density=30% --export out.gcode`.
 
+## Your work is safe
+CosmicSlicer autosaves the open project a minute after each change and before slicing. If it
+ever closes unexpectedly, the next start offers the project back. Crash reports, settings and
+autosaves live in `~/.local/share/cosmicslicer` (Linux), `~/Library/Application
+Support/CosmicSlicer` (macOS) or `%APPDATA%\CosmicSlicer\data` (Windows).
+
 ## Build and run
 ```
 cargo run --release

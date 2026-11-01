@@ -33,6 +33,14 @@ pub struct LaunchOptions {
     pub files: Vec<PathBuf>,
 }
 
+/// Preferences and presets as saved in `settings.json`.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Persisted {
+    prefs: Prefs,
+    presets: SavedPresets,
+}
+
 /// The user's presets and selections, as saved between runs.
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -72,26 +80,71 @@ pub struct CosmicSlicerApp {
     export_when_sliced: bool,
     /// Write the G-code here when the slice finishes, without asking (automation).
     export_to: Option<PathBuf>,
+    /// Where settings, autosaves and crash reports live; `None` in test runs.
+    data_dir: Option<PathBuf>,
+    autosaver: Option<crate::recovery::Autosaver>,
+    /// The settings file as last written, so unchanged settings are not rewritten.
+    saved_settings: String,
 }
 
 impl CosmicSlicerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, options: LaunchOptions) -> Self {
         let mut app = Self::headless(options);
         app.render_state = cc.wgpu_render_state.clone();
-        if !app.ephemeral
-            && let Some(storage) = cc.storage
-        {
-            let session = &mut app.session;
-            if let Some(prefs) = storage.get_string(PREFS_KEY).and_then(|s| serde_json::from_str::<Prefs>(&s).ok()) {
-                session.prefs = prefs;
+        if app.ephemeral {
+            return app;
+        }
+        app.data_dir = crate::store::data_dir();
+        let Some(dir) = app.data_dir.clone() else {
+            app.session.notify(Level::Warning, "No folder for settings was found; settings and autosaves are off.");
+            return app;
+        };
+        crate::recovery::install_crash_reports(&dir);
+        // Settings: our own file, else what older versions kept in eframe's storage.
+        match crate::store::read_json::<Persisted>(&dir.join("settings.json")) {
+            Ok(Some(p)) => {
+                app.session.prefs = p.prefs;
+                restore_presets(&mut app.session, p.presets);
             }
-            if let Some(saved) =
-                storage.get_string(PRESETS_KEY).and_then(|s| serde_json::from_str::<SavedPresets>(&s).ok())
-            {
-                restore_presets(session, saved);
+            Ok(None) => {
+                if let Some(storage) = cc.storage {
+                    let session = &mut app.session;
+                    if let Some(prefs) =
+                        storage.get_string(PREFS_KEY).and_then(|s| serde_json::from_str::<Prefs>(&s).ok())
+                    {
+                        session.prefs = prefs;
+                    }
+                    if let Some(saved) =
+                        storage.get_string(PRESETS_KEY).and_then(|s| serde_json::from_str::<SavedPresets>(&s).ok())
+                    {
+                        restore_presets(session, saved);
+                    }
+                }
             }
+            Err(e) => app.session.notify(Level::Warning, e),
+        }
+        match crate::recovery::Autosaver::start(&dir) {
+            Ok((saver, orphans)) => {
+                app.autosaver = Some(saver);
+                app.dialogs.restore = orphans.into_iter().next();
+            }
+            Err(e) => app.session.notify(Level::Warning, format!("Autosave is off: {e}")),
         }
         app
+    }
+
+    /// Writes preferences and presets if they changed.
+    fn save_settings(&mut self) {
+        let Some(dir) = &self.data_dir else { return };
+        let persisted = Persisted { prefs: self.session.prefs.clone(), presets: saved_presets(&self.session) };
+        let Ok(json) = serde_json::to_string_pretty(&persisted) else { return };
+        if json == self.saved_settings {
+            return;
+        }
+        match crate::store::write_atomic(&dir.join("settings.json"), json.as_bytes()) {
+            Ok(()) => self.saved_settings = json,
+            Err(e) => self.session.notify(Level::Warning, format!("Could not save settings: {e}")),
+        }
     }
 
     /// The app without a window: no GPU, nothing loaded from storage (tests).
@@ -118,6 +171,33 @@ impl CosmicSlicerApp {
             last_failed: None,
             export_when_sliced: false,
             export_to: None,
+            data_dir: None,
+            autosaver: None,
+            saved_settings: String::new(),
+        }
+    }
+
+    /// The answer to "restore the project from last time?".
+    fn answer_restore(&mut self, restore: bool) {
+        let Some(orphan) = self.dialogs.restore.take() else { return };
+        if restore {
+            match orphan.read() {
+                Ok(r) => {
+                    crate::recovery::apply(&mut self.session, r);
+                    self.session.page = Page::Prepare;
+                    self.viewport.fit_pending = true;
+                    self.session.notify(Level::Info, format!("Restored \"{}\" from the autosave.", orphan.name));
+                }
+                Err(e) => {
+                    self.session.notify(Level::Error, format!("The autosave could not be restored: {e}"));
+                    return;
+                }
+            }
+        }
+        orphan.discard();
+        // Save the restored project under this session at once.
+        if restore && let Some(saver) = self.autosaver.as_mut() {
+            let _ = saver.save(&self.session);
         }
     }
 
@@ -141,6 +221,13 @@ impl CosmicSlicerApp {
                 return;
             }
             r.progress.cancel();
+        }
+        // Slicing is when a weak driver or a huge model is most likely to bring things down.
+        if let Some(saver) = self.autosaver.as_mut()
+            && s.dirty
+            && let Err(e) = saver.save(s)
+        {
+            s.notify(Level::Warning, e);
         }
         match crate::slicer::Runner::start(s) {
             Ok(r) => {
@@ -280,6 +367,20 @@ impl CosmicSlicerApp {
                 actions.push(Action::Slice);
             }
             Step::Layer(n) => self.viewport.pending_top = Some(n),
+            Step::Autosave => {
+                if let Some(saver) = self.autosaver.as_mut()
+                    && let Err(e) = saver.save(&self.session)
+                {
+                    eprintln!("{e}");
+                }
+            }
+            Step::SimulateCrash => {
+                // Dies like a driver fault would: no unwinding, no clean-up.
+                eprintln!("simulating a crash");
+                std::process::abort();
+            }
+            Step::Restore => self.dialogs.restore_choice = Some(true),
+            Step::SimulatePanic => simulated_panic(),
             Step::Set(kv) => match kv.split_once('=') {
                 Some((k, v)) => {
                     let schema = self.session.schema;
@@ -620,6 +721,13 @@ impl CosmicSlicerApp {
     }
 }
 
+/// Fails on purpose (`--simulate-panic`), to check that a bug in a frame is recovered from and
+/// reported: the one place a panic is wanted.
+#[allow(clippy::panic)]
+fn simulated_panic() -> ! {
+    std::panic::panic_any("simulated failure (--simulate-panic)")
+}
+
 fn saved_presets(session: &Session) -> SavedPresets {
     let b = &session.presets;
     let user = |list: &[Preset]| list.iter().filter(|p| !p.system).cloned().collect::<Vec<_>>();
@@ -669,15 +777,17 @@ impl eframe::App for CosmicSlicerApp {
         !self.ephemeral
     }
 
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        if self.ephemeral {
-            return;
+    /// eframe calls this every 30 s and on exit; settings go to our own file, written safely.
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        if !self.ephemeral {
+            self.save_settings();
         }
-        if let Ok(prefs) = serde_json::to_string(&self.session.prefs) {
-            storage.set_string(PREFS_KEY, prefs);
-        }
-        if let Ok(presets) = serde_json::to_string(&saved_presets(&self.session)) {
-            storage.set_string(PRESETS_KEY, presets);
+    }
+
+    /// A clean exit leaves nothing to recover.
+    fn on_exit(&mut self) {
+        if let Some(saver) = self.autosaver.take() {
+            saver.finish();
         }
     }
 
@@ -721,6 +831,11 @@ impl CosmicSlicerApp {
         }
         self.shortcuts(&ctx, &mut actions);
         self.poll_slice(&ctx);
+        if let Some(saver) = self.autosaver.as_mut()
+            && let Some(e) = saver.tick(&self.session, self.session.now)
+        {
+            self.session.notify(Level::Warning, e);
+        }
         topbar::resize_edges(&ctx);
         topbar::show(ui, &mut self.session, tokens, &mut self.choices, &mut actions);
 
@@ -767,6 +882,9 @@ impl CosmicSlicerApp {
         self.dialogs.show(&ctx, &mut self.session, tokens, &mut self.device);
         if std::mem::take(&mut self.dialogs.export_requested) {
             actions.push(Action::ExportGcode);
+        }
+        if let Some(restore) = self.dialogs.restore_choice.take() {
+            self.answer_restore(restore);
         }
         for action in actions {
             self.handle(&ctx, action);
@@ -881,7 +999,19 @@ mod smoke {
         d.save_preset = Some((TabKind::Process, 0, "Mine".into()));
         d.switch = Some(PendingSwitch { kind: TabKind::Process, filament: 0, index: 1 });
         d.compare = Some((TabKind::Process, 0, 3));
+        d.restore = Some(crate::recovery::Orphan {
+            snapshot: PathBuf::from("/nonexistent/a.cosmicsave"),
+            lock: PathBuf::from("/nonexistent/a.lock"),
+            name: "Bracket".into(),
+            objects: 3,
+            age: 125,
+            report: Some(PathBuf::from("/nonexistent/crash.txt")),
+        });
         frames(&mut app, &ctx, 3);
+        // Restoring a snapshot that is gone is an error notice, not a crash.
+        app.dialogs.restore_choice = Some(true);
+        frames(&mut app, &ctx, 2);
+        assert!(app.dialogs.restore.is_none());
         for (tool, ..) in Tool::GIZMOS {
             app.viewport.tool = Some(tool);
             frames(&mut app, &ctx, 2);

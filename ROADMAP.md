@@ -9,6 +9,7 @@ end of every session (no crashes, tests and clippy clean, smoke tests cover new 
 |---|---------|--------|
 | 1 | User interface | Every Orca page, sidebar, all 580 settings in Orca's layout, 3D plates, Move/Rotate/Scale/Lay on face, STL/OBJ import |
 | 2 | Slicing engine core | Layers, walls, top/bottom/solid/sparse, 7 infill generators, skirt/brim, normal supports, cooling, G-code, estimates, real toolpath Preview, export |
+| 3 | CI, autosave, crash recovery | GitHub Actions on Linux/Windows/macOS (+ real app run on a software GPU), autosave with OS-lock crash detection and restore prompt, crash reports, atomic settings files, shader validation test |
 
 ## Order, and why
 Get a user's own printer printing well and safely first (profiles, correct motion G-code,
@@ -41,7 +42,7 @@ CI comes early because the Windows and macOS builds are not yet checked by anyth
 
 ---
 
-## 3 · Repository, CI, autosave and crash recovery
+## 3 · Repository, CI, autosave and crash recovery — done
 - CI on GitHub Actions for Linux, Windows and macOS: fmt, clippy, tests, release build;
   artefacts per platform.
 - Headless smoke tests run on all three (egui without a GPU), plus a wgpu software-adapter test

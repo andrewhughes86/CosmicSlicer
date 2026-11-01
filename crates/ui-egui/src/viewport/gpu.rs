@@ -669,3 +669,26 @@ impl Drop for Gpu {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// The shader parses and validates without a GPU, so a mistake fails CI on every platform
+    /// rather than the first time the 3D view opens.
+    #[test]
+    fn the_scene_shader_is_valid() {
+        use wgpu::naga;
+        let source = include_str!("scene.wgsl");
+        let module = naga::front::wgsl::parse_str(source);
+        assert!(module.is_ok(), "{}", module.as_ref().err().map(|e| e.emit_to_string(source)).unwrap_or_default());
+        let Ok(module) = module else { return };
+        let mut validator =
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty());
+        let info = validator.validate(&module);
+        assert!(info.is_ok(), "{:?}", info.err());
+        for entry in
+            ["vs_mesh", "fs_mesh", "vs_flat", "fs_flat", "vs_background", "fs_background", "vs_segment", "fs_segment"]
+        {
+            assert!(module.entry_points.iter().any(|e| e.name == entry), "{entry}");
+        }
+    }
+}

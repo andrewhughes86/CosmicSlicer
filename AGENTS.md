@@ -12,7 +12,14 @@ OrcaSlicer's crashes are the reason this exists.
 - egui asserts on some layout misuse (e.g. `add_space` inside a `Grid`). Every page, dialog,
   settings page and canvas tool is drawn headlessly by `app::smoke` tests; add new UI there.
 - `CosmicSlicerApp::ui` catches a panic in a frame, closes dialogs and keeps the project.
-  That is a last resort, not an error path: fix the bug.
+  That is a last resort, not an error path: fix the bug. Every panic also writes a report to
+  `<data>/crashes/` (`recovery::install_crash_reports`).
+- Work is never lost: `recovery::Autosaver` saves the session a minute after each change and
+  before slicing, holding an OS file lock while the app runs; a free lock at start-up means a
+  crashed session, whose project is offered back. Files the app writes go through
+  `store::write_atomic` (temp file, sync, rename) and damaged JSON is set aside, not fatal.
+- Data folder: `store::data_dir()` (`COSMICSLICER_DATA_DIR` overrides it). Screenshot runs write
+  nothing there unless that variable points them at a scratch folder.
 
 ## Layout
 - `crates/config` — OrcaSlicer's option definitions and Tab layout
@@ -42,6 +49,7 @@ OrcaSlicer's crashes are the reason this exists.
   `python3 tools/extract_orca_settings.py <OrcaSlicer>/src assets/settings/orca_settings.json`.
 
 ## Before finishing
-`cargo fmt --all`, `cargo clippy --workspace --all-targets` (no warnings),
-`cargo test --workspace`. Check UI changes with screenshot runs, which save nothing:
+`cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace`. CI (`.github/workflows/ci.yml`) runs the same on Linux, Windows and
+macOS, plus the real app on a software GPU (slice, export, crash, restore, panic report). Check UI changes with screenshot runs, which save nothing:
 `cargo run -- --add Cube --tab preview --screenshot out.png` (see `--help`).

@@ -41,6 +41,14 @@ pub enum Step {
     Set(String),
     /// Show the Preview up to this layer.
     Layer(usize),
+    /// Autosave now.
+    Autosave,
+    /// Abort the process without cleaning up, as a crash would (recovery tests).
+    SimulateCrash,
+    /// Answer "Restore" to the restore prompt.
+    Restore,
+    /// Fail inside a frame, to check the app recovers and writes a crash report.
+    SimulatePanic,
 }
 
 #[derive(Default)]
