@@ -282,6 +282,9 @@ pub fn object_menu(ui: &mut Ui, session: &mut Session, id: u64, actions: &mut Ve
             }
         }
     });
+    if menu_item(ui, "Fix model", "", true) {
+        session.fix_selected();
+    }
     if menu_item(ui, "Split to objects", "", true) {
         session.split_selected();
     }
@@ -291,6 +294,18 @@ pub fn object_menu(ui: &mut Ui, session: &mut Session, id: u64, actions: &mut Ve
     if menu_item(ui, "Assemble", "", session.selection.len() > 1) {
         session.assemble();
     }
+    ui.add_enabled_ui(session.selection.len() > 1, |ui| {
+        ui.menu_button(crate::i18n::tr("Mesh boolean"), |ui| {
+            use CosmicSlicer_model::boolean::BoolOp;
+            for (label, op) in
+                [("Union", BoolOp::Union), ("Difference", BoolOp::Difference), ("Intersection", BoolOp::Intersection)]
+            {
+                if menu_item(ui, label, "", true) {
+                    session.mesh_boolean(op);
+                }
+            }
+        });
+    });
     ui.menu_button(crate::i18n::tr("Change filament"), |ui| {
         let n = session.presets.project_filaments.len();
         for f in 1..=n {

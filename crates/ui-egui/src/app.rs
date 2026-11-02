@@ -1877,8 +1877,8 @@ mod smoke {
 #[cfg(test)]
 mod soak {
     //! A long session of random use through the session's own methods, with frames drawn
-    //! between: add, select, move, scale, mirror, cut, split, copy, delete, undo and redo,
-    //! plates, pages, any setting, arrange and slice. Nothing may panic, and memory must level
+    //! between: add, select, move, scale, mirror, cut, split, mesh booleans, copy, delete, undo
+    //! and redo, plates, pages, any setting, arrange and slice. Nothing may panic, and memory must level
     //! off once the undo history is full. Run with `--ignored`; `COSMICSLICER_SOAK_STEPS` (default
     //! 600) and `COSMICSLICER_SOAK_SEED` set its length and seed. A failure names the step, the
     //! seed and the actions before it.
@@ -2035,6 +2035,15 @@ mod soak {
                     "add instance".into()
                 }
             },
+            19 if rng.chance(3) => {
+                use CosmicSlicer_model::boolean::BoolOp;
+                let op = [BoolOp::Union, BoolOp::Difference, BoolOp::Intersection][rng.below(3)];
+                if s.selection.len() < 2 {
+                    s.select_all();
+                }
+                s.mesh_boolean(op);
+                format!("mesh boolean {op:?}")
+            }
             19 => {
                 if rng.chance(20) {
                     s.new_project();

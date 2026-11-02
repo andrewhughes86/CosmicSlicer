@@ -819,6 +819,81 @@ impl Session {
         }
     }
 
+    /// "Fix model": the selected objects' meshes repaired (degenerate faces, orientation,
+    /// small holes) and their crossing shells merged into one solid.
+    pub fn fix_selected(&mut self) {
+        let ids = self.targets();
+        if ids.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        let (mut merged, mut mended) = (0, 0);
+        let mut errors = Vec::new();
+        for id in ids {
+            let Some(mut mesh) = self.model.get(id).map(|o| (*o.mesh).clone()) else { continue };
+            let r = CosmicSlicer_model::repair::repair(&mut mesh);
+            mended += r.degenerate + r.flipped + r.holes_closed;
+            match CosmicSlicer_model::boolean::merge_shells(&mesh) {
+                Ok((m, n)) => {
+                    mesh = m;
+                    merged += n;
+                }
+                Err(e) => errors.push(format!("Fix model: {e}")),
+            }
+            if let Some(o) = self.model.get_mut(id) {
+                if mended + merged > 0 {
+                    o.paint = None;
+                }
+                o.mesh = std::sync::Arc::new(mesh);
+            }
+        }
+        for e in errors {
+            self.notify(Level::Warning, e);
+        }
+        let text = match (mended, merged) {
+            (0, 0) => "Fix model: nothing needed fixing.".to_owned(),
+            (m, 0) => format!("Fix model: {m} faces mended."),
+            (m, s) => format!("Fix model: {m} faces mended, {s} crossing shells merged."),
+        };
+        self.notify(Level::Info, text);
+    }
+
+    /// OrcaSlicer's Mesh boolean: the selected objects combined in the order they were picked
+    /// (the first with each of the others) into one new object in their place, with the
+    /// first one's name, filament and settings. Paint goes with the old triangles.
+    pub fn mesh_boolean(&mut self, op: CosmicSlicer_model::boolean::BoolOp) {
+        use CosmicSlicer_model::boolean::{boolean, object_solid};
+        if self.selection.len() < 2 {
+            return;
+        }
+        let objects: Vec<CosmicSlicer_model::Object> =
+            self.selection.iter().filter_map(|id| self.model.get(*id).cloned()).collect();
+        let Some((first, rest)) = objects.split_first() else { return };
+        let mut solid = match object_solid(first) {
+            Ok(m) => m,
+            Err(e) => return self.notify(Level::Error, format!("Mesh boolean: {e}")),
+        };
+        for o in rest {
+            match object_solid(o).and_then(|m| boolean(&solid, &m, op)) {
+                Ok(m) => solid = m,
+                Err(e) => return self.notify(Level::Error, format!("Mesh boolean: {e}")),
+            }
+        }
+        if solid.triangles.is_empty() {
+            return self.notify(Level::Warning, "Mesh boolean: nothing is left of the objects.");
+        }
+        self.checkpoint();
+        let c = solid.bounds().centre();
+        let ids: Vec<u64> = objects.iter().map(|o| o.id).collect();
+        self.model.remove(&ids);
+        let id = self.model.add(first.name.clone(), solid, Vec3::new(c.x, c.y, 0.0), first.plate);
+        if let Some(o) = self.model.get_mut(id) {
+            o.filament = first.filament;
+            o.overrides = first.overrides.clone();
+        }
+        self.selection = vec![id];
+    }
+
     /// Scales object `id` evenly to the largest size its plate and the printer's height allow,
     /// in the middle of the plate.
     pub fn scale_to_fit(&mut self, id: u64) {
@@ -1922,6 +1997,36 @@ mod tests {
         let size = s.model.get(id).map(|o| o.size()).unwrap_or(Vec3::ZERO);
         let (_, bed) = s.bed();
         assert!(size.x > bed.x * 0.9 || size.z > s.printable_height() * 0.9, "{size:?}");
+    }
+
+    #[test]
+    fn mesh_boolean_replaces_the_objects() {
+        use CosmicSlicer_model::boolean::BoolOp;
+        // Two 20 mm cubes overlapping by half along X.
+        let (mut s, id) = cube_session();
+        s.add_primitive("Cube");
+        let other = s.model.objects.last().map_or(0, |o| o.id);
+        let at = s.model.get(id).map_or(Vec3::ZERO, |o| o.transform.offset);
+        if let Some(o) = s.model.get_mut(other) {
+            o.transform.offset = at + Vec3::new(10.0, 0.0, 0.0);
+        }
+        s.selection = vec![id, other];
+        s.mesh_boolean(BoolOp::Union);
+        assert_eq!(s.model.objects.len(), 1);
+        let v = s.model.objects.first().map_or(0.0, |o| o.mesh.volume());
+        assert!((v - 12_000.0).abs() < 20.0, "{v}");
+        // In place: the union spans both cubes.
+        let b = s.model.objects.first().map(|o| o.bounds()).unwrap_or(Aabb::EMPTY);
+        assert!((b.size().x - 30.0).abs() < 0.01 && (b.min.x - (at.x - 10.0)).abs() < 0.01, "{b:?}");
+        s.undo();
+        assert_eq!(s.model.objects.len(), 2);
+        // Apart, intersected: nothing left, and nothing changed.
+        if let Some(o) = s.model.get_mut(other) {
+            o.transform.offset = at + Vec3::new(50.0, 0.0, 0.0);
+        }
+        s.selection = vec![id, other];
+        s.mesh_boolean(BoolOp::Intersection);
+        assert_eq!(s.model.objects.len(), 2);
     }
 
     #[test]

@@ -59,17 +59,43 @@ pub fn cube(size: f32) -> Mesh {
 }
 
 /// A solid of revolution about Z through `profile` points (radius, z), capped at both ends.
+/// Rings of radius 0 (poles, a cone's tip) are one shared vertex, and a profile that ends where
+/// it starts (the torus) closes onto its first ring, so the mesh is closed.
 fn lathe(profile: &[(f32, f32)], segments: u32, capped: bool) -> Mesh {
     let segments = segments.max(3);
     let mut mesh = Mesh::default();
     let rings = profile.len() as u32;
-    for i in 0..segments {
-        let a = TAU * i as f32 / segments as f32;
-        for &(r, z) in profile {
-            mesh.vertices.push(Vec3::new(r * a.cos(), r * a.sin(), z));
+    let closed = rings > 2 && profile.first() == profile.last();
+    // Vertex of each segment and ring, segment by segment.
+    let mut ids = vec![0u32; (segments * rings) as usize];
+    let slot = |seg: u32, ring: u32| ((seg % segments) * rings + ring) as usize;
+    for (ring, &(r, z)) in profile.iter().enumerate() {
+        let ring = ring as u32;
+        if closed && ring == rings - 1 {
+            for seg in 0..segments {
+                let first = ids.get(slot(seg, 0)).copied().unwrap_or(0);
+                if let Some(id) = ids.get_mut(slot(seg, ring)) {
+                    *id = first;
+                }
+            }
+            continue;
+        }
+        let axis = (r == 0.0).then(|| {
+            mesh.vertices.push(Vec3::new(0.0, 0.0, z));
+            (mesh.vertices.len() - 1) as u32
+        });
+        for seg in 0..segments {
+            let id = axis.unwrap_or_else(|| {
+                let a = TAU * seg as f32 / segments as f32;
+                mesh.vertices.push(Vec3::new(r * a.cos(), r * a.sin(), z));
+                (mesh.vertices.len() - 1) as u32
+            });
+            if let Some(slot) = ids.get_mut(slot(seg, ring)) {
+                *slot = id;
+            }
         }
     }
-    let at = |seg: u32, ring: u32| (seg % segments) * rings + ring;
+    let at = |seg: u32, ring: u32| ids.get(slot(seg, ring)).copied().unwrap_or(0);
     for s in 0..segments {
         for r in 0..rings.saturating_sub(1) {
             let (a, b, c, d) = (at(s, r), at(s + 1, r), at(s + 1, r + 1), at(s, r + 1));
@@ -95,7 +121,10 @@ fn lathe(profile: &[(f32, f32)], segments: u32, capped: bool) -> Mesh {
     // Rings of radius 0 collapse to a point; drop the degenerate faces they leave.
     mesh.triangles.retain(|t| {
         let v = |i: u32| mesh.vertices.get(i as usize).copied().unwrap_or(Vec3::ZERO);
-        (v(t[1]) - v(t[0])).cross(v(t[2]) - v(t[0])).length_squared() > 1e-12
+        t[0] != t[1]
+            && t[1] != t[2]
+            && t[0] != t[2]
+            && (v(t[1]) - v(t[0])).cross(v(t[2]) - v(t[0])).length_squared() > 1e-12
     });
     mesh
 }
@@ -113,7 +142,9 @@ pub fn sphere(radius: f32, segments: u32) -> Mesh {
     let profile: Vec<(f32, f32)> = (0..=stacks)
         .map(|i| {
             let a = std::f32::consts::PI * i as f32 / stacks as f32;
-            (radius * a.sin(), radius - radius * a.cos())
+            // Exactly on the axis at the poles (sin π is not 0 in f32).
+            let r = if i == 0 || i == stacks { 0.0 } else { radius * a.sin() };
+            (r, radius - radius * a.cos())
         })
         .collect();
     lathe(&profile, segments, true)
@@ -121,13 +152,16 @@ pub fn sphere(radius: f32, segments: u32) -> Mesh {
 
 pub fn torus(major: f32, minor: f32, segments: u32, sides: u32) -> Mesh {
     let sides = sides.max(3);
-    // The last ring repeats the first, closing the tube.
-    let profile: Vec<(f32, f32)> = (0..=sides)
+    // The last ring repeats the first exactly (cos 2π is not 1 in f32), closing the tube.
+    let mut profile: Vec<(f32, f32)> = (0..sides)
         .map(|i| {
             let a = TAU * i as f32 / sides as f32;
             (major - minor * a.cos(), minor - minor * a.sin())
         })
         .collect();
+    if let Some(&first) = profile.first() {
+        profile.push(first);
+    }
     lathe(&profile, segments, false)
 }
 
@@ -140,6 +174,22 @@ mod tests {
         for (name, _) in ALL {
             let m = by_name(name);
             assert!(m.as_ref().is_some_and(|m| m.triangle_count() > 0), "{name}");
+        }
+    }
+
+    #[test]
+    fn every_primitive_is_closed() {
+        // Each edge once each way: no holes, no seams.
+        for (name, _) in ALL {
+            let Some(m) = by_name(name) else { continue };
+            let mut edges = std::collections::HashMap::new();
+            for t in &m.triangles {
+                for k in 0..3 {
+                    *edges.entry((t[k], t[(k + 1) % 3])).or_insert(0) += 1;
+                }
+            }
+            let open = edges.iter().filter(|((a, b), n)| **n != 1 || edges.get(&(*b, *a)) != Some(&1)).count();
+            assert_eq!(open, 0, "{name}");
         }
     }
 

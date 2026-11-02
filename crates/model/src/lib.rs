@@ -6,6 +6,7 @@
 #![allow(non_snake_case)]
 
 pub mod arrange;
+pub mod boolean;
 pub mod cut;
 pub mod layers;
 pub mod mesh;

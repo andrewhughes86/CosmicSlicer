@@ -462,7 +462,7 @@ Windows and macOS (3Dconnexion's driver interface); STEP import tolerances as pr
 OrcaSlicer's "Speed Dial"; translating CosmicSlicer's own wording (texts Orca does not have stay
 English); attachments in autosaves (they live in the project file).
 
-## 18 · Hardening
+## 18 · Hardening — done (loose ends listed below)
 - Fuzz the STL/OBJ/3MF/STEP/G-code readers and the engine with random meshes and settings
   (cargo-fuzz plus property tests); every input either slices or gives an error.
 - Performance: parallel per-layer everything, memory caps for huge models, Preview level of
@@ -501,8 +501,22 @@ Done so far (2026-11-02):
   plates, pages, any setting, arrange, slice); no panic, and memory levelling off once the
   undo history is full. CI runs 400 steps with the run number as the seed; 600 and 1 500
   steps (seeds 1 and 2, 194 slices) ran clean here.
-- Still open: offsets cost ~1 ms each in i_overlay (the speed test structure's walls); mesh
-  booleans.
+- Mesh booleans (`model::boolean`, OrcaSlicer's Mesh boolean tool in the object menu): union,
+  difference and intersection of the selected objects into one new object in their place.
+  Exact orientation tests (`robust`) decide where an edge of one mesh passes through a
+  triangle of the other; each such point is made once, so neighbouring triangles share it and
+  the result is closed without welding. Cut triangles are retriangulated in their own
+  parameters (points on an edge exactly on it) and patches between the cuts are kept or
+  dropped by their winding number. The second mesh is shifted by 1e-7 of the size so nothing
+  coincides exactly. Fuzzed on 2 000 random pairs of primitives (half on a grid, with shared
+  faces, edges and corners): always closed, and union + intersection = both, difference =
+  first − intersection. Benchy with a cylinder through it: 0.2 s, closed.
+- "Fix model" in the object menu: repair plus crossing shells merged into one solid (cavities,
+  facing inwards, kept). Self-intersections within one shell are not repaired yet.
+- The round primitives (sphere, cone, torus) were open at their poles, tip and seam; `lathe`
+  now shares those vertices, and every primitive is checked closed.
+- Still open: offsets cost ~1 ms each in i_overlay (the speed test structure's walls);
+  self-intersections within a shell; booleans run on the UI thread (Benchy 0.2 s).
 
 ## 19 · Parity with OrcaSlicer
 - A reference set (calibration cube, Benchy, thin walls, overhang test, multi-part, multi-colour,
