@@ -78,7 +78,7 @@ pub fn context_menu<R>(response: &Response, t: &Tokens, add: impl FnOnce(&mut Ui
 
 /// A menu entry with a shortcut hint at the right.
 pub fn menu_item(ui: &mut Ui, label: &str, shortcut: &str, enabled: bool) -> bool {
-    let button = egui::Button::new(label).shortcut_text(shortcut);
+    let button = egui::Button::new(crate::i18n::tr(label)).shortcut_text(shortcut);
     let clicked = ui.add_enabled(enabled, button).clicked();
     if clicked {
         ui.close();
@@ -125,7 +125,7 @@ impl Window {
         open: &mut bool,
         add: impl FnOnce(&mut Ui) -> R,
     ) -> Option<R> {
-        let title = self.title.clone();
+        let title = crate::i18n::tr(&self.title);
         let mut close = false;
         let shown = egui::Window::new(self.title)
             .id(self.id)
@@ -207,7 +207,7 @@ pub fn close_button(ui: &mut Ui, t: &Tokens, tooltip: &str) -> Response {
 /// An accent-filled button (Slice, OK).
 pub fn primary_button(ui: &mut Ui, t: &Tokens, label: &str) -> Response {
     ui.add(
-        egui::Button::new(egui::RichText::new(label).color(t.on_accent).strong())
+        egui::Button::new(egui::RichText::new(crate::i18n::tr(label)).color(t.on_accent).strong())
             .fill(t.accent)
             .stroke(Stroke::NONE)
             .corner_radius(CornerRadius::same(4)),

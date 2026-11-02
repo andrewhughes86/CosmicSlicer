@@ -84,6 +84,10 @@ OrcaSlicer's crashes are the reason this exists.
   `python3 tools/pack_orca_profiles.py <OrcaSlicer>/resources/profiles assets/profiles/orca_profiles.bin`.
 - Regenerate the calibration models with
   `python3 tools/pack_calib_models.py <OrcaSlicer>/resources/calib assets/calib` (needs DracoPy).
+- Regenerate the translations with
+  `python3 tools/pack_translations.py <dir of OrcaSlicer_<lang>.po files> assets/i18n/translations.bin`
+  (run it again when UI texts change, so new texts that Orca has are kept). Show text through
+  `i18n::tr` where it is OrcaSlicer's wording; keyboard shortcuts live in `shortcuts::ALL`.
 - Regenerate the settings JSON with
   `python3 tools/extract_orca_settings.py <OrcaSlicer>/src assets/settings/orca_settings.json`.
 

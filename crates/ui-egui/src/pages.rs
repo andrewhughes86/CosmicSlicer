@@ -78,7 +78,7 @@ pub fn home(ui: &mut Ui, session: &mut Session, t: &Tokens, actions: &mut Vec<Ac
         ui.painter().text(
             r.left_center() + vec2(36.0, 0.0),
             egui::Align2::LEFT_CENTER,
-            label,
+            crate::i18n::tr(label),
             egui::FontId::proportional(14.0),
             t.text,
         );
@@ -100,8 +100,17 @@ pub fn home(ui: &mut Ui, session: &mut Session, t: &Tokens, actions: &mut Vec<Ac
     if item(&mut nav_ui, "custom-gcode_note", "Manuals") {
         actions.push(Action::OpenUrl("https://github.com/SoftFever/OrcaSlicer/wiki"));
     }
-    if item(&mut nav_ui, "open_in_browser", "Online Models") {
-        actions.push(Action::OpenUrl("https://www.printables.com"));
+    nav_ui.add_space(8.0);
+    nav_ui.label(RichText::new(crate::i18n::tr("Online Models")).color(t.text_muted));
+    for (name, url) in [
+        ("Printables", "https://www.printables.com"),
+        ("MakerWorld", "https://makerworld.com"),
+        ("Thingiverse", "https://www.thingiverse.com"),
+        ("Cults", "https://cults3d.com"),
+    ] {
+        if item(&mut nav_ui, "open_in_browser", name) {
+            actions.push(Action::OpenUrl(url));
+        }
     }
 
     let content = egui::Rect::from_min_max(nav.right_top() + vec2(28.0, 24.0), full.max - vec2(28.0, 24.0));
@@ -626,7 +635,99 @@ pub fn multi_device(ui: &mut Ui, session: &mut Session, t: &Tokens, d: &mut Devi
 
 // ---- Project ----
 
-pub fn project(ui: &mut Ui, session: &mut Session, t: &Tokens) {
+/// The project's attachments (OrcaSlicer's Auxiliaries), by kind: pictures shown, the rest
+/// listed; each can be saved out or removed.
+fn attachments(ui: &mut Ui, session: &mut Session, t: &Tokens, actions: &mut Vec<Action>) {
+    for kind in crate::state::ATTACHMENT_KINDS {
+        card(ui, t, kind, |ui| {
+            let mut remove = None;
+            let files: Vec<(usize, String, usize)> = session
+                .project
+                .files
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.0 == kind)
+                .map(|(i, f)| (i, f.1.clone(), f.2.len()))
+                .collect();
+            if kind == "Model Pictures" {
+                ui.horizontal_wrapped(|ui| {
+                    for (i, name, _) in &files {
+                        let tex = session.project.files.get(*i).and_then(|f| picture(ui.ctx(), &f.1, &f.2));
+                        ui.vertical(|ui| {
+                            match tex {
+                                Some(tex) => {
+                                    ui.image((tex.id(), vec2(140.0, 140.0 * tex.aspect_ratio().recip().min(2.0))));
+                                }
+                                None => {
+                                    ui.label(RichText::new(name).small());
+                                }
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.small_button("Save…").clicked() {
+                                    actions.push(Action::SaveAttachment(*i));
+                                }
+                                if ui.small_button("Remove").clicked() {
+                                    remove = Some(*i);
+                                }
+                            });
+                        });
+                    }
+                });
+            } else {
+                for (i, name, size) in &files {
+                    ui.horizontal(|ui| {
+                        ui.label(name);
+                        ui.label(RichText::new(format!("{:.1} kB", *size as f64 / 1024.0)).color(t.text_muted));
+                        if ui.small_button("Save…").clicked() {
+                            actions.push(Action::SaveAttachment(*i));
+                        }
+                        if ui.small_button("Remove").clicked() {
+                            remove = Some(*i);
+                        }
+                    });
+                }
+            }
+            if files.is_empty() {
+                ui.label(
+                    RichText::new("Nothing yet; files added here are saved in the project file.").color(t.text_muted),
+                );
+            }
+            if let Some(i) = remove
+                && i < session.project.files.len()
+            {
+                session.project.files.remove(i);
+                session.dirty = true;
+            }
+            if ui.button(crate::i18n::tr("Add")).clicked() {
+                actions.push(Action::AddAttachment(kind));
+            }
+        });
+        ui.add_space(12.0);
+    }
+}
+
+/// A picture attachment as a texture (PNG or JPEG), cached by name and size.
+fn picture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<egui::TextureHandle> {
+    let id = egui::Id::new(("attachment", name, bytes.len()));
+    if let Some(t) = ctx.data(|d| d.get_temp::<Option<egui::TextureHandle>>(id)) {
+        return t;
+    }
+    let lower = name.to_ascii_lowercase();
+    let image = if lower.ends_with(".png") {
+        decode_png(bytes)
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        CosmicSlicer_connect::link::decode(bytes)
+            .ok()
+            .map(|f| egui::ColorImage::from_rgba_unmultiplied([f.width, f.height], &f.rgba))
+    } else {
+        None
+    };
+    let tex = image.map(|i| ctx.load_texture(format!("attachment-{name}"), i, egui::TextureOptions::LINEAR));
+    ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
+    tex
+}
+
+pub fn project(ui: &mut Ui, session: &mut Session, t: &Tokens, actions: &mut Vec<Action>) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         let w = ui.available_width().min(900.0);
         ui.vertical(|ui| {
@@ -690,13 +791,23 @@ pub fn project(ui: &mut Ui, session: &mut Session, t: &Tokens) {
                 }
             });
             ui.add_space(12.0);
-            card(ui, t, "Pictures and assembly guide", |ui| {
-                ui.label(
-                    RichText::new("Add pictures and an assembly guide to share with the project file.")
-                        .color(t.text_muted),
-                );
-                ui.add_enabled(false, egui::Button::new("Add picture…"));
+            card(ui, t, "Profile", |ui| {
+                egui::Grid::new("profile-info").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
+                    ui.label(crate::i18n::tr("Title"));
+                    ui.add(egui::TextEdit::singleline(&mut session.project.profile_title).desired_width(f32::INFINITY));
+                    ui.end_row();
+                    ui.label(crate::i18n::tr("Description"));
+                    ui.add(
+                        egui::TextEdit::multiline(&mut session.project.profile_description)
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("What the settings are for: material, nozzle, tips for printing it"),
+                    );
+                    ui.end_row();
+                });
             });
+            ui.add_space(12.0);
+            attachments(ui, session, t, actions);
         });
     });
 }

@@ -370,6 +370,8 @@ pub fn to_project(session: &Session) -> Project {
         ("Designer".to_owned(), info.author.clone()),
         ("Description".to_owned(), info.description.clone()),
         ("License".to_owned(), info.license.clone()),
+        ("ProfileTitle".to_owned(), info.profile_title.clone()),
+        ("ProfileDescription".to_owned(), info.profile_description.clone()),
     ];
     metadata.retain(|(_, v)| !v.is_empty());
     Project {
@@ -378,6 +380,7 @@ pub fn to_project(session: &Session) -> Project {
         objects,
         plates,
         settings: Some(settings_json(session)),
+        aux: info.files.iter().map(|(kind, name, bytes)| (format!("{kind}/{name}"), bytes.as_ref().clone())).collect(),
         warnings: Vec::new(),
     }
 }
@@ -598,6 +601,16 @@ pub fn open(session: &Session, path: &Path) -> Result<(Restored, Vec<String>), S
             author: meta("Designer"),
             license: meta("License"),
             description: meta("Description"),
+            profile_title: meta("ProfileTitle"),
+            profile_description: meta("ProfileDescription"),
+            files: project
+                .aux
+                .iter()
+                .map(|(path, bytes)| {
+                    let (kind, name) = path.split_once('/').unwrap_or(("Others", path.as_str()));
+                    (kind.to_owned(), name.to_owned(), Arc::new(bytes.clone()))
+                })
+                .collect(),
         },
         model,
         locked,

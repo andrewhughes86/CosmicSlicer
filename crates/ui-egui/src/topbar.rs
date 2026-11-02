@@ -61,23 +61,23 @@ fn title_bar(ui: &mut Ui, session: &mut Session, t: &Tokens, actions: &mut Vec<A
     let logo = button(ui, &mut x, "cosmic_logo", true, "Menu", "logo");
     ui_kit::menu_below(&logo, t, |ui| {
         ui.set_min_width(200.0);
-        ui.menu_button("Edit", |ui| {
+        ui.menu_button(crate::i18n::tr("Edit"), |ui| {
             ui.set_min_width(240.0);
             menus::edit_menu(ui, session, actions);
         });
-        ui.menu_button("Window", |ui| {
+        ui.menu_button(crate::i18n::tr("Window"), |ui| {
             ui.set_min_width(240.0);
             menus::window_menu(ui, session, actions);
         });
-        ui.menu_button("View", |ui| {
+        ui.menu_button(crate::i18n::tr("View"), |ui| {
             ui.set_min_width(240.0);
             menus::view_menu(ui, session, actions);
         });
-        ui.menu_button("Calibration", |ui| {
+        ui.menu_button(crate::i18n::tr("Calibration"), |ui| {
             ui.set_min_width(220.0);
             menus::calibration_menu(ui, actions);
         });
-        ui.menu_button("Help", |ui| {
+        ui.menu_button(crate::i18n::tr("Help"), |ui| {
             ui.set_min_width(220.0);
             menus::help_menu(ui, actions);
         });
@@ -95,7 +95,7 @@ fn title_bar(ui: &mut Ui, session: &mut Session, t: &Tokens, actions: &mut Vec<A
     ui.painter().text(
         file_rect.left_center() + vec2(10.0, 0.0),
         Align2::LEFT_CENTER,
-        "File",
+        crate::i18n::tr("File"),
         FontId::proportional(13.5),
         t.text,
     );
@@ -133,7 +133,7 @@ fn title_bar(ui: &mut Ui, session: &mut Session, t: &Tokens, actions: &mut Vec<A
     ui.painter().text(
         calib.left_center() + vec2(10.0, 0.0),
         Align2::LEFT_CENTER,
-        "Calibration",
+        crate::i18n::tr("Calibration"),
         FontId::proportional(13.5),
         t.text,
     );
@@ -270,6 +270,8 @@ fn tab_bar(ui: &mut Ui, session: &mut Session, t: &Tokens, choices: &mut SliceCh
     let mut x = strip.left();
     let font = FontId::proportional(14.0);
     for (page, label, icon) in pages {
+        let label = crate::i18n::tr(label);
+        let label = label.as_str();
         let text_w = if label.is_empty() {
             0.0
         } else {
@@ -305,9 +307,16 @@ fn tab_bar(ui: &mut Ui, session: &mut Session, t: &Tokens, choices: &mut SliceCh
     let h = 30.0;
     let y = strip.center().y - h / 2.0;
     let print_label = PRINT_CHOICES.get(choices.print).copied().unwrap_or("Print plate");
-    let print_r = Rect::from_min_size(pos2(right - 150.0, y), vec2(150.0, h));
     let slice_label = if choices.slice_all { "Slice all" } else { "Slice plate" };
-    let slice_r = Rect::from_min_size(pos2(print_r.left() - 160.0, y), vec2(150.0, h));
+    // As wide as the label needs (translations run longer), at least Orca's 150.
+    let fit = |label: &str| {
+        let font = egui::FontId::proportional(14.0);
+        let w = ui.painter().layout_no_wrap(crate::i18n::tr(label), font, t.text).size().x;
+        (w + 56.0).clamp(150.0, 320.0)
+    };
+    let (print_w, slice_w) = (fit(print_label), fit(slice_label));
+    let print_r = Rect::from_min_size(pos2(right - print_w, y), vec2(print_w, h));
+    let slice_r = Rect::from_min_size(pos2(print_r.left() - slice_w - 10.0, y), vec2(slice_w, h));
     let can_slice = !session.model.objects.is_empty();
     let slice_action = if choices.slice_all { Action::SliceAll } else { Action::Slice };
     if let Some(dropdown) = split_button(ui, t, slice_r, slice_label, "slice", true, can_slice, actions, slice_action) {
@@ -382,7 +391,7 @@ fn split_button(
     ui.painter().text(
         main.center(),
         Align2::CENTER_CENTER,
-        label,
+        crate::i18n::tr(label),
         FontId::proportional(14.0),
         if enabled { ink } else { ink.gamma_multiply(0.6) },
     );

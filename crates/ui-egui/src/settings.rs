@@ -132,7 +132,7 @@ fn group_header(ui: &mut Ui, t: &Tokens, icon: &str, title: &str) {
     ui.horizontal(|ui| {
         let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
         icons::paint(ui, r, icon, t, true);
-        ui.label(RichText::new(title).strong().size(13.5).color(t.text));
+        ui.label(RichText::new(crate::i18n::tr(title)).strong().size(13.5).color(t.text));
         let rest = ui.available_rect_before_wrap();
         ui.painter().hline(rest.x_range().shrink(6.0), rest.center().y, egui::Stroke::new(1.0, t.border));
     });
@@ -154,7 +154,7 @@ fn label_width(ui: &Ui) -> f32 {
 }
 
 fn tooltip(def: &OptionDef, key: &str) -> String {
-    let mut s = def.tooltip.clone();
+    let mut s = crate::i18n::tr(&def.tooltip);
     if !s.is_empty() {
         s.push_str("\n\n");
     }
@@ -178,7 +178,7 @@ fn label_cell(ui: &mut Ui, session: &mut Session, t: &Tokens, text: &str, hint: 
             ui.add_space(22.0);
         }
         let colour = if modified { t.modified } else { t.text };
-        ui.add(egui::Label::new(RichText::new(text).color(colour)).truncate()).on_hover_text(hint);
+        ui.add(egui::Label::new(RichText::new(crate::i18n::tr(text)).color(colour)).truncate()).on_hover_text(hint);
     });
 }
 
@@ -210,14 +210,15 @@ fn entry(ui: &mut Ui, session: &mut Session, t: &Tokens, e: &Entry, target: Targ
         Entry::Line { line, keys } => {
             let shown: Vec<&String> =
                 keys.iter().filter(|k| schema.option(k).is_some_and(|d| visible(d, advanced))).collect();
-            let first_tip = shown.first().and_then(|k| schema.option(k)).map(|d| d.tooltip.clone()).unwrap_or_default();
+            let first_tip =
+                shown.first().and_then(|k| schema.option(k)).map(|d| crate::i18n::tr(&d.tooltip)).unwrap_or_default();
             let key_refs: Vec<&str> = shown.iter().map(|k| k.as_str()).collect();
             ui.horizontal(|ui| {
                 label_cell(ui, session, t, line, &first_tip, target, &key_refs);
                 ui.horizontal_wrapped(|ui| {
                     for key in shown {
                         let Some(def) = schema.option(key) else { continue };
-                        ui.label(RichText::new(def.display_label()).color(t.text_muted))
+                        ui.label(RichText::new(crate::i18n::tr(def.display_label())).color(t.text_muted))
                             .on_hover_text(tooltip(def, key));
                         field(ui, session, t, key, def, target);
                         ui.add_space(6.0);
@@ -259,12 +260,12 @@ fn field(ui: &mut Ui, session: &mut Session, t: &Tokens, key: &str, def: &Option
             }
         }
         OptionType::Enum => {
-            let label = def.enum_label(&shown).unwrap_or(&shown).to_owned();
+            let label = crate::i18n::tr(def.enum_label(&shown).unwrap_or(&shown));
             let mut chosen = None;
             let width = 180.0f32.min((ui.available_width() - 8.0).max(60.0));
             egui::ComboBox::from_id_salt(id).selected_text(label).width(width).show_ui(ui, |ui| {
                 for (v, l) in &def.enum_values {
-                    if ui.selectable_label(*v == shown, l.as_str()).clicked() {
+                    if ui.selectable_label(*v == shown, crate::i18n::tr(l)).clicked() {
                         chosen = Some(v.clone());
                     }
                 }
@@ -291,7 +292,7 @@ fn field(ui: &mut Ui, session: &mut Session, t: &Tokens, key: &str, def: &Option
                 }
             }
             if !def.sidetext.is_empty() {
-                ui.label(RichText::new(&def.sidetext).color(t.text_muted).small());
+                ui.label(RichText::new(crate::i18n::tr(&def.sidetext)).color(t.text_muted).small());
             }
             if key == "printable_area" && ui.small_button("Set…").on_hover_text("Bed shape").clicked() {
                 ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("bed-shape-open"), true));

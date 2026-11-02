@@ -18,6 +18,8 @@ use CosmicSlicer_model::PartKind;
 pub struct Sidebar {
     pub process_page: usize,
     pub search: String,
+    /// Ctrl+F: put the cursor in the settings search.
+    pub focus_search: bool,
     /// 0 Global, 1 Objects.
     pub scope: usize,
     pub printer_open: bool,
@@ -60,7 +62,7 @@ fn header(ui: &mut Ui, t: &Tokens, icon: &str, title: &str, open: &mut bool, ext
     );
     let (r, _) = child.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
     icons::paint(&child, r, icon, t, true);
-    child.label(RichText::new(title).strong().size(14.0).color(t.text));
+    child.label(RichText::new(crate::i18n::tr(title)).strong().size(14.0).color(t.text));
     child.with_layout(Layout::right_to_left(Align::Center), |ui| {
         let arrow = if *open { "⏷" } else { "⏵" };
         ui.label(RichText::new(arrow).color(t.text_muted));
@@ -597,7 +599,7 @@ fn process(ui: &mut Ui, sb: &mut Sidebar, session: &mut Session, t: &Tokens, act
                 ui.painter().text(
                     r.center() + vec2(0.0, 12.0),
                     egui::Align2::CENTER_CENTER,
-                    &p.name,
+                    crate::i18n::tr(&p.name),
                     egui::FontId::proportional(11.0),
                     if on { t.accent } else { t.text },
                 );
@@ -611,9 +613,14 @@ fn process(ui: &mut Ui, sb: &mut Sidebar, session: &mut Session, t: &Tokens, act
         ui.horizontal(|ui| {
             let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
             icons::paint(ui, r, "search", t, true);
-            ui.add(
-                egui::TextEdit::singleline(&mut sb.search).hint_text("Search settings").desired_width(f32::INFINITY),
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut sb.search)
+                    .hint_text(crate::i18n::tr("Search settings"))
+                    .desired_width(f32::INFINITY),
             );
+            if std::mem::take(&mut sb.focus_search) {
+                field.request_focus();
+            }
         });
     });
     ui.painter().hline(ui.available_rect_before_wrap().x_range(), ui.cursor().top(), Stroke::new(1.0, t.border));

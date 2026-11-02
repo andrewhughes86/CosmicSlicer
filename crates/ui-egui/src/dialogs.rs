@@ -12,7 +12,7 @@ use CosmicSlicer_connect::{HostType, PhysicalPrinter};
 use crate::pages::DeviceState;
 use crate::settings::{self, Target};
 use crate::sidebar::preset_combo;
-use crate::state::{BED_TYPES, Level, Session};
+use crate::state::{BED_TYPES, Level, Page, Session};
 use crate::theme::{Theme, Tokens, parse_hex};
 use crate::ui_kit::{self, Window};
 use egui::Color32;
@@ -41,6 +41,12 @@ pub struct Dialogs {
     pub switch: Option<PendingSwitch>,
     pub compare: Option<(TabKind, usize, usize)>,
     pub preferences: bool,
+    /// "Jump to layer" (Shift+G in the Preview): the layer number being typed.
+    pub go_to_layer: Option<String>,
+    /// The layer asked for, for the app to show.
+    pub jump_to_layer: Option<usize>,
+    /// The Preferences window's page.
+    pub preferences_page: usize,
     pub about: bool,
     pub shortcuts: bool,
     pub plate: Option<usize>,
@@ -217,7 +223,7 @@ impl Dialogs {
                         ui.painter().text(
                             r.left_center() + vec2(36.0, 0.0),
                             egui::Align2::LEFT_CENTER,
-                            &p.name,
+                            crate::i18n::tr(&p.name),
                             egui::FontId::proportional(13.5),
                             if on { t.accent } else { t.text },
                         );
@@ -432,54 +438,29 @@ impl Dialogs {
             return;
         }
         let mut open = true;
-        Window::sized("Preferences", vec2(560.0, 520.0)).show(ctx, t, &mut open, |ui| {
-            let p = &mut session.prefs;
-            ui.label(RichText::new("General").strong().size(14.0));
-            egui::Grid::new("prefs-general").num_columns(2).spacing([24.0, 10.0]).show(ui, |ui| {
-                ui.label("Theme");
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut p.theme, Theme::Dark, "Dark");
-                    ui.selectable_value(&mut p.theme, Theme::Light, "Light");
+        let mut shortcuts = false;
+        let page = &mut self.preferences_page;
+        Window::sized("Preferences", vec2(680.0, 560.0)).show(ctx, t, &mut open, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(130.0);
+                    for (i, name) in PREFERENCE_PAGES.iter().enumerate() {
+                        if ui.selectable_label(*page == i, crate::i18n::tr(name)).clicked() {
+                            *page = i;
+                        }
+                    }
                 });
-                ui.end_row();
-                ui.label("Units");
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut p.imperial, false, "Metric");
-                    ui.selectable_value(&mut p.imperial, true, "Imperial");
+                ui.separator();
+                ui.vertical(|ui| {
+                    egui::ScrollArea::vertical().id_salt("prefs-scroll").show(ui, |ui| {
+                        preferences_page(ui, session, t, *page, &mut shortcuts);
+                    });
                 });
-                ui.end_row();
-                ui.label("Show the Multi-device tab");
-                ui.checkbox(&mut p.multi_device, "");
-                ui.end_row();
-                ui.label("Show all settings (Advanced)");
-                ui.checkbox(&mut p.advanced, "");
-                ui.end_row();
-            });
-            ui.add_space(12.0);
-            ui.label(RichText::new("3D view").strong().size(14.0));
-            egui::Grid::new("prefs-view").num_columns(2).spacing([24.0, 10.0]).show(ui, |ui| {
-                ui.label("Zoom to mouse position");
-                ui.checkbox(&mut p.zoom_to_mouse, "");
-                ui.end_row();
-                ui.label("Use perspective view");
-                ui.checkbox(&mut p.perspective, "");
-                ui.end_row();
-                ui.label("Show gridlines");
-                ui.checkbox(&mut p.show_grid, "");
-                ui.end_row();
-                ui.label("Show object labels");
-                ui.checkbox(&mut p.show_labels, "");
-                ui.end_row();
-            });
-            ui.add_space(12.0);
-            ui.label(RichText::new("Files").strong().size(14.0));
-            ui.horizontal(|ui| {
-                ui.label(format!("{} recent file(s)", p.recent.len()));
-                if ui.button("Clear").clicked() {
-                    p.recent.clear();
-                }
             });
         });
+        if shortcuts {
+            self.shortcuts = true;
+        }
         self.preferences = open;
     }
 
@@ -919,20 +900,42 @@ impl Dialogs {
             let mut open = true;
             Window::sized("Keyboard Shortcuts", vec2(520.0, 560.0)).show(ctx, t, &mut open, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (section, rows) in SHORTCUTS {
+                    for (section, rows) in crate::shortcuts::sections() {
                         ui.add_space(6.0);
-                        ui.label(RichText::new(*section).strong());
-                        egui::Grid::new(*section).num_columns(2).spacing([30.0, 4.0]).show(ui, |ui| {
-                            for (key, what) in *rows {
-                                ui.label(RichText::new(crate::menus::ctrl_text(key)).monospace().color(t.accent));
-                                ui.label(*what);
+                        ui.label(RichText::new(crate::i18n::tr(section)).strong());
+                        egui::Grid::new(section).num_columns(2).spacing([30.0, 4.0]).show(ui, |ui| {
+                            for (keys, what) in rows {
+                                ui.label(RichText::new(keys).monospace().color(t.accent));
+                                ui.label(crate::i18n::tr(what));
                                 ui.end_row();
                             }
                         });
                     }
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(crate::i18n::tr("Mouse")).strong());
+                    ui.label(crate::i18n::tr("Left mouse: rotate (or as set in Preferences › Camera); right or middle mouse: pan; wheel: zoom; Shift while rotating with the gizmo: 15° steps."));
                 });
             });
             self.shortcuts = open;
+        }
+        if let Some(mut text) = self.go_to_layer.take() {
+            let mut open = true;
+            let mut done = false;
+            Window::dialog("Jump to layer").show(ctx, t, &mut open, |ui| {
+                let edit = ui.add(egui::TextEdit::singleline(&mut text).desired_width(120.0));
+                edit.request_focus();
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    done = true;
+                }
+                if ui.button("OK").clicked() {
+                    done = true;
+                }
+            });
+            if done {
+                self.jump_to_layer = text.trim().parse::<usize>().ok();
+            } else if open {
+                self.go_to_layer = Some(text);
+            }
         }
         if self.flushing {
             let mut open = true;
@@ -1124,48 +1127,6 @@ impl Dialogs {
         }
     }
 }
-
-/// OrcaSlicer's keyboard shortcuts that CosmicSlicer has.
-const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
-    (
-        "Global",
-        &[
-            ("Ctrl+N", "New project"),
-            ("Ctrl+O", "Open project"),
-            ("Ctrl+S", "Save project"),
-            ("Ctrl+I", "Import model"),
-            ("Ctrl+R", "Slice plate"),
-            ("Ctrl+P", "Preferences"),
-            ("Ctrl+1 … 5", "Home, Prepare, Preview, Device, Project"),
-            ("Tab", "Switch between Prepare and Preview"),
-            ("Shift+Tab", "Collapse / expand the sidebar"),
-            ("?", "Show keyboard shortcuts"),
-        ],
-    ),
-    (
-        "Plater",
-        &[
-            ("Ctrl+A", "Select all objects"),
-            ("Esc", "Deselect all / close the tool"),
-            ("Del", "Delete selected"),
-            ("Ctrl+Del", "Delete all"),
-            ("Ctrl+C / Ctrl+V", "Copy / paste"),
-            ("Ctrl+K", "Clone selected"),
-            ("Ctrl+Z / Ctrl+Y", "Undo / redo"),
-            ("A", "Arrange all plates"),
-            ("Shift+A", "Arrange the current plate"),
-            ("+ / -", "Add or remove an instance"),
-            ("Q", "Auto orient"),
-            ("M / R / S / F", "Move / Rotate / Scale / Lay on face"),
-            ("0 … 6", "Default, top, bottom, front, rear, left, right view"),
-            ("Z", "Zoom to fit"),
-            ("K", "Perspective / orthographic view"),
-            ("E", "Show object labels"),
-            ("Arrow keys", "Move the selection 1 mm (Shift: 10 mm)"),
-        ],
-    ),
-    ("Preview", &[("Up / Down", "Show one more / one fewer layer")]),
-];
 
 /// "The object seems to be in inches": convert the imported objects to millimetres, or keep
 /// them as they are.
@@ -1365,4 +1326,235 @@ fn calibration_body(
             *open = false;
         }
     });
+}
+
+/// The Preferences window's pages, as OrcaSlicer groups them.
+const PREFERENCE_PAGES: [&str; 6] = ["General", "Project", "Behavior", "Camera", "Keyboard", "Developer"];
+
+fn pref_title(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(6.0);
+    ui.label(RichText::new(crate::i18n::tr(title)).strong().size(14.0));
+    ui.add_space(2.0);
+}
+
+/// A row: label (with tooltip), then the control.
+fn pref_row(ui: &mut egui::Ui, label: &str, tip: &str, add: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        let r = ui
+            .allocate_ui_with_layout(vec2(230.0, 22.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.set_width(230.0);
+                ui.add(egui::Label::new(crate::i18n::tr(label)).truncate())
+            })
+            .inner;
+        if !tip.is_empty() {
+            r.on_hover_text(crate::i18n::tr(tip));
+        }
+        add(ui);
+    });
+}
+
+fn preferences_page(ui: &mut egui::Ui, session: &mut Session, t: &Tokens, page: usize, shortcuts: &mut bool) {
+    let p = &mut session.prefs;
+    match page {
+        0 => {
+            pref_title(ui, "Settings");
+            pref_row(ui, "Language", "", |ui| {
+                let langs = crate::i18n::languages();
+                let shown = if p.language.is_empty() {
+                    "System".to_owned()
+                } else {
+                    langs.iter().find(|(c, _)| *c == p.language).map_or(p.language.clone(), |(_, n)| n.clone())
+                };
+                egui::ComboBox::from_id_salt("pref-lang").selected_text(shown).width(200.0).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut p.language, String::new(), "System");
+                    for (code, name) in &langs {
+                        ui.selectable_value(&mut p.language, code.clone(), name);
+                    }
+                });
+            });
+            pref_row(ui, "Units", "", |ui| {
+                ui.selectable_value(&mut p.imperial, false, crate::i18n::tr("Metric"));
+                ui.selectable_value(&mut p.imperial, true, crate::i18n::tr("Imperial"));
+            });
+            pref_row(ui, "Default page", "Set the page opened on startup.", |ui| {
+                ui.selectable_value(&mut p.default_page, Page::Home, crate::i18n::tr("Home"));
+                ui.selectable_value(&mut p.default_page, Page::Prepare, crate::i18n::tr("Prepare"));
+            });
+            pref_row(ui, "Enable dark Mode", "", |ui| {
+                let mut dark = p.theme == Theme::Dark;
+                if ui.checkbox(&mut dark, "").changed() {
+                    p.theme = if dark { Theme::Dark } else { Theme::Light };
+                }
+            });
+            pref_row(ui, "Show all settings (Advanced)", "", |ui| {
+                ui.checkbox(&mut p.advanced, "");
+            });
+            pref_title(ui, "Features");
+            pref_row(
+                ui,
+                "Multi device management",
+                "With this option enabled, you can send a task to multiple devices at the same time and manage multiple devices.",
+                |ui| {
+                    ui.checkbox(&mut p.multi_device, "");
+                },
+            );
+        }
+        1 => {
+            pref_title(ui, "Project");
+            pref_row(
+                ui,
+                "Load behavior",
+                "Should printer/filament/process settings be loaded when opening a 3MF file?",
+                |ui| {
+                    let names = ["Load All", "Ask When Relevant", "Always Ask", "Load Geometry Only"];
+                    egui::ComboBox::from_id_salt("pref-load")
+                        .selected_text(crate::i18n::tr(names.get(p.load_behaviour).copied().unwrap_or("Load All")))
+                        .width(200.0)
+                        .show_ui(ui, |ui| {
+                            for (i, n) in names.iter().enumerate() {
+                                ui.selectable_value(&mut p.load_behaviour, i, crate::i18n::tr(n));
+                            }
+                        });
+                },
+            );
+            pref_row(
+                ui,
+                "Auto backup",
+                "Backup your project periodically to help with restoring from an occasional crash.",
+                |ui| {
+                    let mut on = p.backup_seconds > 0;
+                    if ui.checkbox(&mut on, "").changed() {
+                        p.backup_seconds = if on { 60 } else { 0 };
+                    }
+                    if on {
+                        ui.add(egui::DragValue::new(&mut p.backup_seconds).range(10..=3600).suffix(" s"));
+                    }
+                },
+            );
+            pref_row(ui, "Maximum recent files", "Maximum count of recent files", |ui| {
+                ui.add(egui::DragValue::new(&mut p.max_recent).range(1..=100));
+            });
+            pref_row(ui, "Add STL/STEP files to recent files list", "", |ui| {
+                ui.checkbox(&mut p.recent_models, "");
+            });
+            pref_row(ui, "Recent files", "", |ui| {
+                ui.label(format!("{}", p.recent.len()));
+                if ui.button(crate::i18n::tr("Clear")).clicked() {
+                    p.recent.clear();
+                }
+            });
+        }
+        2 => {
+            pref_title(ui, "Behavior");
+            pref_row(ui, "Auto arrange plate after cloning", "", |ui| {
+                ui.checkbox(&mut p.arrange_after_clone, "");
+            });
+            pref_row(ui, "Arrange: spacing", "", |ui| {
+                ui.add(egui::DragValue::new(&mut p.arrange_spacing).range(0.0..=100.0).speed(0.1).suffix(" mm"));
+            });
+            pref_row(ui, "Auto rotate for arrangement", "", |ui| {
+                ui.checkbox(&mut p.arrange_rotate, "");
+            });
+            pref_title(ui, "Slicing");
+            pref_row(
+                ui,
+                "Remember last print action",
+                "If enabled, OrcaSlicer will remember the last selected option in the print button's dropdown (e.g. Print, Export plate sliced file, Export G-code file) and use it as the default on next startup.",
+                |ui| {
+                    ui.checkbox(&mut p.remember_print_action, "");
+                },
+            );
+        }
+        3 => {
+            pref_title(ui, "Camera");
+            pref_row(
+                ui,
+                "Camera style",
+                "Select camera navigation style.\nDefault: LMB+move for rotation, RMB/MMB+move for panning.\nTouchpad: Alt+move for rotation, Shift+move for panning.",
+                |ui| {
+                    ui.selectable_value(&mut p.camera_style, 0, crate::i18n::tr("Default"));
+                    ui.selectable_value(&mut p.camera_style, 1, crate::i18n::tr("Touchpad"));
+                },
+            );
+            pref_row(
+                ui,
+                "Orbit speed multiplier",
+                "Multiplies the orbit speed for finer or coarser camera movement.",
+                |ui| {
+                    ui.add(egui::Slider::new(&mut p.orbit_speed, 0.1..=5.0));
+                },
+            );
+            pref_row(
+                ui,
+                "Zoom to mouse position",
+                "Zoom in towards the mouse pointer's position in the 3D view, rather than the 2D window center.",
+                |ui| {
+                    ui.checkbox(&mut p.zoom_to_mouse, "");
+                },
+            );
+            pref_row(ui, "Reverse mouse zoom", "If enabled, reverses the direction of zoom with mouse wheel.", |ui| {
+                ui.checkbox(&mut p.reverse_zoom, "");
+            });
+            pref_row(ui, "Use perspective view", "", |ui| {
+                ui.checkbox(&mut p.perspective, "");
+            });
+            for (label, value, id) in [
+                ("Left Mouse Drag", &mut p.left_drag, "pref-left"),
+                ("Middle Mouse Drag", &mut p.middle_drag, "pref-mid"),
+                ("Right Mouse Drag", &mut p.right_drag, "pref-right"),
+            ] {
+                pref_row(ui, label, "Set the action that dragging the left mouse button should perform.", |ui| {
+                    let names = ["None", "Pan", "Rotate"];
+                    egui::ComboBox::from_id_salt(id)
+                        .selected_text(crate::i18n::tr(names.get(*value).copied().unwrap_or("None")))
+                        .show_ui(ui, |ui| {
+                            for (i, n) in names.iter().enumerate() {
+                                ui.selectable_value(value, i, crate::i18n::tr(n));
+                            }
+                        });
+                });
+            }
+            pref_row(ui, "Show gridlines", "", |ui| {
+                ui.checkbox(&mut p.show_grid, "");
+            });
+            pref_row(ui, "Show object labels", "", |ui| {
+                ui.checkbox(&mut p.show_labels, "");
+            });
+            pref_title(ui, "3Dconnexion");
+            pref_row(ui, "Use a 3D mouse", "", |ui| {
+                ui.checkbox(&mut p.space_mouse, "");
+            });
+            pref_row(ui, "3D mouse speed", "", |ui| {
+                ui.add(egui::Slider::new(&mut p.space_mouse_speed, 0.1..=5.0));
+            });
+            ui.label(RichText::new(crate::space_mouse::support_note()).small().color(t.text_muted));
+        }
+        4 => {
+            pref_title(ui, "Keyboard");
+            pref_row(ui, "Keyboard shortcuts", "", |ui| {
+                if ui.button(crate::i18n::tr("Show keyboard shortcuts list")).clicked() {
+                    *shortcuts = true;
+                }
+            });
+        }
+        _ => {
+            pref_title(ui, "Log Level");
+            pref_row(ui, "Log Level", "", |ui| {
+                for level in ["error", "warn", "info", "debug"] {
+                    if ui.selectable_value(&mut p.log_level, level.to_owned(), level).changed() {
+                        log::set_max_level(match level {
+                            "error" => log::LevelFilter::Error,
+                            "info" => log::LevelFilter::Info,
+                            "debug" => log::LevelFilter::Debug,
+                            _ => log::LevelFilter::Warn,
+                        });
+                    }
+                }
+            });
+            let data = crate::store::data_dir().map_or_else(|| "—".to_owned(), |d| d.display().to_string());
+            pref_row(ui, "Data folder", "Settings, user presets, autosaves and crash reports.", |ui| {
+                ui.label(RichText::new(data).small());
+            });
+        }
+    }
 }

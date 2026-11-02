@@ -734,6 +734,20 @@ impl Viewport {
             }
         }
 
+        // A 3Dconnexion mouse: twist and tilt orbit, push and pull zoom, slide pans.
+        if session.prefs.space_mouse {
+            crate::space_mouse::start();
+        }
+        if session.prefs.space_mouse && crate::space_mouse::connected() {
+            let m = crate::space_mouse::take();
+            if m.events > 0 {
+                let k = session.prefs.space_mouse_speed.clamp(0.1, 5.0) * 0.004;
+                self.camera.orbit(Vec2::new(-m.r[1], -m.r[0]) * k * 4.0);
+                self.camera.pan(Vec2::new(-m.t[0], m.t[1]) * k * 4.0, self.size.y);
+                self.camera.zoom((m.t[2] * k * 0.05).exp(), None);
+            }
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+        }
         // Zoom with the wheel, towards the point under the mouse.
         if response.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y + i.zoom_delta().ln() * 300.0);
@@ -744,19 +758,43 @@ impl Viewport {
                         .map(|(_, dist, _)| o + d * dist)
                         .or_else(|| camera::hit_plane(o, d, 0.0))
                 });
+                let scroll = if session.prefs.reverse_zoom { -scroll } else { scroll };
                 self.camera.zoom((-scroll * 0.0015).exp(), towards);
             }
         }
 
         let modifiers = ui.input(|i| i.modifiers);
+        // What dragging empty space does, per button (Preferences › Camera).
+        let empty = |choice: usize| match choice {
+            1 => Some(Drag::Pan),
+            2 => Some(Drag::Orbit),
+            _ => None,
+        };
+        let p = &session.prefs;
+        let (left, middle, right) = (p.left_drag, p.middle_drag, p.right_drag);
         if response.drag_started_by(egui::PointerButton::Primary)
             && let Some(m) = mouse
         {
-            self.drag = Some(self.start_drag(session, page, m, rect));
-        } else if response.drag_started_by(egui::PointerButton::Secondary)
-            || response.drag_started_by(egui::PointerButton::Middle)
-        {
-            self.drag = Some(Drag::Pan);
+            self.drag = match self.start_drag(session, page, m, rect) {
+                Drag::Orbit => empty(left),
+                d => Some(d),
+            };
+        } else if response.drag_started_by(egui::PointerButton::Secondary) {
+            self.drag = empty(right);
+        } else if response.drag_started_by(egui::PointerButton::Middle) {
+            self.drag = empty(middle);
+        }
+        // Touchpad style: Alt and move orbits, Shift and move pans, no button needed.
+        if session.prefs.camera_style == 1 && response.hovered() && self.drag.is_none() {
+            let delta = ui.input(|i| i.pointer.delta());
+            if delta.length_sq() > 0.0 {
+                let d = Vec2::new(delta.x, delta.y);
+                if modifiers.alt {
+                    self.camera.orbit(d * session.prefs.orbit_speed.clamp(0.1, 5.0));
+                } else if modifiers.shift {
+                    self.camera.pan(d, self.size.y);
+                }
+            }
         }
 
         if let Some(m) = mouse
@@ -945,7 +983,7 @@ impl Viewport {
         let ray = self.ray(m);
         let mouse = Pos2::new(m.x + rect.left(), m.y + rect.top());
         match &mut self.drag {
-            Some(Drag::Orbit) => self.camera.orbit(delta),
+            Some(Drag::Orbit) => self.camera.orbit(delta * session.prefs.orbit_speed.clamp(0.1, 5.0)),
             Some(Drag::Pan) => self.camera.pan(delta, self.size.y),
             Some(Drag::Tower { plate, at, last, moved }) => {
                 if let Some(p) = camera::hit_plane(ray.0, ray.1, 0.0) {

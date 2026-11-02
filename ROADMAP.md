@@ -23,6 +23,7 @@ end of every session (no crashes, tests and clippy clean, smoke tests cover new 
 | 14 | Arrange, orient and plates | No-fit-polygon arrangement of convex footprints (spacing, auto rotate, excluded bed area, prime tower), arrange selection / plate / all plates, overflow and new objects onto new plates; auto orient by overhang and contact area; shared instances (+ / −, 3MF one object placed many times); prime tower drawn and dragged on the canvas, per plate; slice all, export every plate's G-code, Preview plate strip with thumbnails |
 | 15 | Printer connections | Physical printers with Orca's host types; upload / upload-and-print to OctoPrint, Klipper (Moonraker), PrusaLink (digest or key, storage choice), Duet, Repetier, AstroBox, ESP3D, MKS, FlashAir; Bambu Lab printers in LAN mode (MQTT status and control, FTPS upload, `.gcode.3mf`, SSDP discovery, P1/A1 camera); live Device page (state, progress, temperatures, pause/resume/stop, jog, fan, speed, camera) and Multi-device list; every connection on its own thread |
 | 16 | Calibration | Every Orca calibration: temperature tower, flow rate (pass 1 and 2, YOLO and perfectionist), pressure advance (line, pattern, tower), retraction tower, max volumetric speed, VFA, input shaping frequency and damping, cornering (jerk / junction deviation); Orca's models, settings and per-layer changes; results saved into the filament or printer preset |
+| 17 | App completeness | OrcaSlicer's translations (22 languages, system fonts for CJK and Thai), Preferences pages wired to real behaviour (language, start page, project load behaviour, backup interval, recent files, arrange after clone, remembered print action, camera style, drag buttons, orbit speed, reverse zoom, log level), Orca's keyboard shortcut table, 3Dconnexion through spacenavd, Project page profile notes and attachments in the 3MF, accessibility names, checks at several pixel densities |
 
 ## Order, and why
 Get a user's own printer printing well and safely first (profiles, correct motion G-code,
@@ -51,7 +52,7 @@ CI comes early because the Windows and macOS builds are not yet checked by anyth
 | 19 | Parity check against OrcaSlicer on a reference set | 6–14 |
 | 20 | Packaging and release for all three platforms | 3, 18 |
 
-4 more sessions. 17 can be split up and done between others.
+3 more sessions. 17 can be split up and done between others.
 
 ---
 
@@ -422,12 +423,45 @@ numbers on its last layer; Orca's PA test option for bed-mesh accelerations and 
 "Orca tolerance test"; belt-printer variants; the calibration tab's guided flow for Bambu
 printers (their automatic calibration needs Bambu's network plugin).
 
-## 17 · App completeness
-- Full Preferences (all of Orca's pages that apply), every Orca keyboard shortcut, 3Dconnexion.
-- Translations: Orca's `.po` catalogues loaded, language picker, right-to-left check.
-- Home: recent projects with thumbnails, manuals and online models links.
-- Project page: pictures, BOM, assembly guide, profile notes saved in the 3MF.
-- High-DPI and multi-monitor checks; light/dark switching everywhere; accessibility labels.
+## 17 · App completeness — done
+- Translations: OrcaSlicer's catalogues for its 22 languages, packed by
+  `tools/pack_translations.py` down to the English texts CosmicSlicer shows (every setting's
+  label, tooltip, unit and choice, page and group names, and the UI's own strings where Orca
+  has the same wording; about 1,950 per language). Shown through `i18n::tr`: settings, menus,
+  window titles, tabs, the sidebar, buttons, tooltips, Home and the shortcut list. Chinese,
+  Japanese, Korean and Thai take a font from the system (Noto, Droid, WenQuanYi, Microsoft and
+  Apple fonts are looked for); a notice says when none is found. Orca has no right-to-left
+  language, so there is nothing to mirror. Language in Preferences (or the system's).
+- Preferences as OrcaSlicer's pages that apply, each wired to what it says: language, units,
+  default page, dark mode, advanced settings, multi-device; 3MF load behaviour (load all, ask
+  when the presets differ, always ask, geometry only), auto backup interval (or off), maximum
+  recent files, models in the recent list; arrange after cloning, arrange spacing and
+  rotation; remember the print button's choice; camera style (default or touchpad: Alt+move
+  orbits, Shift+move pans), orbit speed, zoom to mouse, reverse zoom, perspective, what each
+  mouse button's drag does; 3D mouse; the shortcut list; log level and the data folder.
+- Keyboard shortcuts: OrcaSlicer's table (`Shortcuts.cpp`) for every feature CosmicSlicer has:
+  Ctrl+Shift+G print, Ctrl+Shift+A all plates, Ctrl+D delete all, V printable, Shift+Q orient
+  plate, arrows 10 mm (Shift 1 mm), Page Up/Down 45°, E brim ears, Ctrl+0–7 views, I/O zoom,
+  Ctrl+E labels, Ctrl+F search, Shift+G jump to layer, Preview's ←/→/Home/End, the painting
+  brushes (C/S/F) while painting, F5, and the rest as before. One table drives the handler
+  and the Keyboard Shortcuts window; a test checks no two clash.
+- 3Dconnexion mice through spacenavd (Linux/BSD) on their own thread: twist and tilt orbit,
+  push/pull zooms, slide pans, with a speed setting.
+- Project page: model information as before, OrcaSlicer's profile notes (title, description)
+  and attachments (Model Pictures shown, Bill of Materials, Assembly Guide, Others) added,
+  saved out and removed, all saved in the 3MF (`Auxiliaries/`, `ProfileTitle`,
+  `ProfileDescription`) and read back from Orca's.
+- Home: online model sites listed (Printables, MakerWorld, Thingiverse, Cults) besides the
+  manuals and recent projects.
+- Accessibility: icon buttons carry their names for screen readers (AccessKit). Every page and
+  dialog is drawn in German, Japanese and Thai at 1×, 1.25×, 1.5× and 2× pixel density,
+  changing scale between frames as moving to another monitor does (both themes are drawn by
+  the other smoke tests).
+
+Moved on to session 19: re-binding shortcuts (Orca lets them be reassigned); 3Dconnexion on
+Windows and macOS (3Dconnexion's driver interface); STEP import tolerances as preferences;
+OrcaSlicer's "Speed Dial"; translating CosmicSlicer's own wording (texts Orca does not have stay
+English); attachments in autosaves (they live in the project file).
 
 ## 18 · Hardening
 - Fuzz the STL/OBJ/3MF/STEP/G-code readers and the engine with random meshes and settings
@@ -454,6 +488,8 @@ printers (their automatic calibration needs Bambu's network plugin).
   Orca's settings to get `wall_filament`, `sparse_infill_filament`, `solid_infill_filament`).
 - From session 13: per-object layer stacks; independent support layer height; spiral vase
   XY smoothing; leading-edge-only brims; the layer profile drawn beside the object.
+- From session 17: re-binding shortcuts; 3Dconnexion on Windows and macOS; STEP tolerance
+  preferences; the Speed Dial; translations of CosmicSlicer's own texts.
 - From session 16: the PA pattern's frame and Orca's numbering layout; the PA test's
   acceleration/speed lists; the tolerance test.
 - From session 15: WebRTC and X1 (RTSP) cameras; live status for Duet, Repetier and the other

@@ -396,8 +396,13 @@ impl Autosaver {
         if self.saved.is_none() && session.model.objects.is_empty() && !session.dirty {
             return None;
         }
+        // Preferences › Project › Auto backup (0: off).
+        let delay = match session.prefs.backup_seconds {
+            0 => return None,
+            s => f64::from(s.clamp(10, 3600)),
+        };
         let since = *self.changed_at.get_or_insert(now);
-        if now - since < AUTOSAVE_DELAY {
+        if now - since < delay {
             return None;
         }
         self.save(session).err()

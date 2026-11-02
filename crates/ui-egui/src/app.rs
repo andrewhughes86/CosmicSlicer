@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use egui::{Event, Key, KeyboardShortcut, Modifiers, Ui, UserData, ViewportCommand};
+use egui::{Event, KeyboardShortcut, Ui, UserData, ViewportCommand};
 use egui_wgpu::RenderState;
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +64,8 @@ pub struct CosmicSlicerApp {
     render_state: Option<RenderState>,
     automation: Automation,
     ephemeral: bool,
+    /// The language the fonts and texts were set up for (the preference as it was).
+    applied_language: Option<String>,
     applied_theme: Option<Theme>,
     capture: Option<PathBuf>,
     capture_requested: bool,
@@ -142,6 +144,21 @@ impl CosmicSlicerApp {
         }
         app.user_files = Some(files);
         restore_presets(&mut app.session, saved);
+        // Preferences that act at start.
+        let prefs = &app.session.prefs;
+        if app.startup_files.is_empty() {
+            app.session.page = if prefs.default_page == Page::Prepare { Page::Prepare } else { Page::Home };
+        }
+        if prefs.remember_print_action {
+            app.choices = SliceChoices { slice_all: prefs.slice_all, print: prefs.print_choice.min(3) };
+        }
+        let level = match prefs.log_level.as_str() {
+            "error" => log::LevelFilter::Error,
+            "info" => log::LevelFilter::Info,
+            "debug" => log::LevelFilter::Debug,
+            _ => log::LevelFilter::Warn,
+        };
+        log::set_max_level(level);
         app.user_presets_seen = user_presets_hash(&app.session);
         // First run: the setup wizard, as OrcaSlicer opens it.
         if !app.session.prefs.setup_done {
@@ -186,6 +203,7 @@ impl CosmicSlicerApp {
             automation: options.automation,
             ephemeral: options.ephemeral,
             applied_theme: None,
+            applied_language: None,
             capture: None,
             capture_requested: false,
             capture_wait: 0,
@@ -643,7 +661,20 @@ impl CosmicSlicerApp {
             return;
         }
         match crate::project::open(&self.session, path) {
-            Ok((restored, warnings)) => {
+            Ok((mut restored, warnings)) => {
+                // Preferences › Project › Load behaviour.
+                let differs = restored.presets.printer.preset != self.session.presets.printer.preset
+                    || restored.presets.process.preset != self.session.presets.process.preset;
+                let geometry_only = match self.session.prefs.load_behaviour {
+                    3 => true,
+                    1 if differs => self.ask_geometry_only(),
+                    2 => self.ask_geometry_only(),
+                    _ => false,
+                };
+                if geometry_only {
+                    restored.presets = self.session.presets.clone();
+                    restored.bed_type = self.session.bed_type;
+                }
                 crate::recovery::apply(&mut self.session, restored);
                 self.session.dirty = false;
                 self.session.page = Page::Prepare;
@@ -657,6 +688,20 @@ impl CosmicSlicerApp {
             }
             Err(e) => self.session.notify(Level::Error, e),
         }
+    }
+
+    /// Asks whether to keep the current presets when opening a project (Preferences › Project
+    /// › Load behaviour); true keeps them (geometry only).
+    fn ask_geometry_only(&self) -> bool {
+        if self.ephemeral {
+            return false;
+        }
+        let answer = rfd::MessageDialog::new()
+            .set_title("Open project")
+            .set_description("Load the project's printer, filament and process settings too, or only its objects?")
+            .set_buttons(rfd::MessageButtons::OkCancelCustom("Load all".into(), "Geometry only".into()))
+            .show();
+        matches!(answer, rfd::MessageDialogResult::Custom(ref s) if s == "Geometry only")
     }
 
     fn save_project(&mut self, path: &std::path::Path) {
@@ -859,6 +904,36 @@ impl CosmicSlicerApp {
                 self.start_slice_all();
             }
             Action::ExportAllGcode => self.export_all_gcode(),
+            Action::AddAttachment(kind) => {
+                let mut dialog = rfd::FileDialog::new().set_title(format!("Add to {kind}"));
+                if kind == "Model Pictures" {
+                    dialog = dialog.add_filter("Pictures", &["png", "jpg", "jpeg"]);
+                }
+                for path in dialog.pick_files().unwrap_or_default() {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_owned();
+                    match std::fs::metadata(&path) {
+                        Ok(m) if m.len() > 64 << 20 => {
+                            s.notify(Level::Warning, format!("{name} is over 64 MB; it was not added."))
+                        }
+                        Ok(_) => match std::fs::read(&path) {
+                            Ok(bytes) => {
+                                s.project.files.push((kind.to_owned(), name, Arc::new(bytes)));
+                                s.dirty = true;
+                            }
+                            Err(e) => s.notify(Level::Error, format!("Could not read {name}: {e}")),
+                        },
+                        Err(e) => s.notify(Level::Error, format!("Could not read {name}: {e}")),
+                    }
+                }
+            }
+            Action::SaveAttachment(i) => {
+                if let Some((_, name, bytes)) = s.project.files.get(i).cloned()
+                    && let Some(path) = rfd::FileDialog::new().set_file_name(&name).save_file()
+                    && let Err(e) = crate::store::write_atomic(&path, &bytes)
+                {
+                    s.notify(Level::Error, format!("Could not write {}: {e}", path.display()));
+                }
+            }
             Action::Print => self.dialogs.print = true,
             Action::Settings(kind) => {
                 self.dialogs.editor = Some(Editor { kind, filament: 0, page: 0, search: String::new() });
@@ -915,112 +990,30 @@ impl CosmicSlicerApp {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        use crate::shortcuts::Scope;
         let typing = ctx.egui_wants_keyboard_input();
-        let ctrl = Modifiers::COMMAND;
-        let shift = Modifiers::SHIFT;
         let page = self.session.page;
-        let three_d = page.is_3d();
+        let painting = page == Page::Prepare && self.viewport.tool.and_then(Tool::paint_kind).is_some();
+        let table = crate::shortcuts::by_priority();
         let mut fired: Vec<&str> = Vec::new();
         ctx.input_mut(|i| {
-            let mut take = |m: Modifiers, k: Key, name: &'static str| {
-                if i.consume_shortcut(&KeyboardShortcut::new(m, k)) {
-                    fired.push(name);
+            for s in &table {
+                let active = match s.scope {
+                    Scope::Global => true,
+                    Scope::App => !typing,
+                    Scope::Canvas => !typing && page.is_3d(),
+                    Scope::Prepare => {
+                        // While painting, the brush keys take the keys they share with the tools.
+                        let shadowed = painting
+                            && table.iter().any(|p| p.scope == Scope::Painting && p.key == s.key && p.mods == s.mods);
+                        !typing && page == Page::Prepare && !shadowed
+                    }
+                    Scope::Preview => !typing && page == Page::Preview,
+                    Scope::Painting => !typing && painting,
+                };
+                if active && i.consume_shortcut(&KeyboardShortcut::new(s.mods, s.key)) {
+                    fired.push(s.id);
                 }
-            };
-            // With Ctrl: always, even in a text box, except the editing keys.
-            take(ctrl, Key::N, "new");
-            take(ctrl, Key::O, "open");
-            take(ctrl | shift, Key::S, "save-as");
-            take(ctrl, Key::S, "save");
-            take(ctrl, Key::I, "import");
-            take(ctrl, Key::R, "slice");
-            take(ctrl, Key::G, "export");
-            take(ctrl, Key::P, "prefs");
-            take(ctrl, Key::Q, "quit");
-            for (k, n) in [
-                (Key::Num1, "page1"),
-                (Key::Num2, "page2"),
-                (Key::Num3, "page3"),
-                (Key::Num4, "page4"),
-                (Key::Num5, "page5"),
-            ] {
-                take(ctrl, k, n);
-            }
-            if typing {
-                return;
-            }
-            take(ctrl | shift, Key::Z, "redo");
-            take(ctrl, Key::Z, "undo");
-            take(ctrl, Key::Y, "redo");
-            take(ctrl, Key::A, "select-all");
-            take(ctrl, Key::K, "clone");
-            take(ctrl, Key::C, "copy");
-            take(ctrl, Key::X, "cut");
-            take(ctrl, Key::V, "paste");
-            take(ctrl, Key::Delete, "delete-all");
-            take(Modifiers::NONE, Key::Delete, "delete");
-            take(Modifiers::NONE, Key::Backspace, "delete");
-            take(Modifiers::NONE, Key::Escape, "escape");
-            take(shift, Key::Tab, "sidebar");
-            take(Modifiers::NONE, Key::Tab, "tab");
-            take(shift, Key::Slash, "help");
-            take(Modifiers::NONE, Key::Questionmark, "help");
-            if !three_d {
-                return;
-            }
-            for (k, n) in [
-                (Key::Num0, "view0"),
-                (Key::Num1, "view1"),
-                (Key::Num2, "view2"),
-                (Key::Num3, "view3"),
-                (Key::Num4, "view4"),
-                (Key::Num5, "view5"),
-                (Key::Num6, "view6"),
-                (Key::Z, "fit"),
-                (Key::K, "projection"),
-                (Key::E, "labels"),
-            ] {
-                take(Modifiers::NONE, k, n);
-            }
-            if page == Page::Preview {
-                take(Modifiers::NONE, Key::ArrowUp, "layer-up");
-                take(Modifiers::NONE, Key::ArrowDown, "layer-down");
-                return;
-            }
-            take(shift, Key::A, "arrange-plate");
-            for (k, n) in [
-                (Key::A, "arrange"),
-                (Key::Q, "orient"),
-                (Key::Plus, "add-instance"),
-                (Key::Equals, "add-instance"),
-                (Key::Minus, "remove-instance"),
-                (Key::M, "tool-move"),
-                (Key::R, "tool-rotate"),
-                (Key::S, "tool-scale"),
-                (Key::F, "tool-lay on face"),
-                (Key::C, "tool-cut"),
-                (Key::B, "tool-mesh boolean"),
-                (Key::L, "tool-support painting"),
-                (Key::P, "tool-seam painting"),
-                (Key::H, "tool-fuzzy skin painting"),
-                (Key::N, "tool-color painting"),
-                (Key::T, "tool-text shape"),
-                (Key::U, "tool-measure"),
-                (Key::Y, "tool-assemble"),
-            ] {
-                take(Modifiers::NONE, k, n);
-            }
-            for (m, k, n) in [
-                (Modifiers::NONE, Key::ArrowLeft, "nudge-left"),
-                (Modifiers::NONE, Key::ArrowRight, "nudge-right"),
-                (Modifiers::NONE, Key::ArrowUp, "nudge-up"),
-                (Modifiers::NONE, Key::ArrowDown, "nudge-down"),
-                (shift, Key::ArrowLeft, "nudge-left10"),
-                (shift, Key::ArrowRight, "nudge-right10"),
-                (shift, Key::ArrowUp, "nudge-up10"),
-                (shift, Key::ArrowDown, "nudge-down10"),
-            ] {
-                take(m, k, n);
             }
         });
         let s = &mut self.session;
@@ -1033,16 +1026,13 @@ impl CosmicSlicerApp {
                 "import" => actions.push(Action::Import),
                 "slice" => actions.push(Action::Slice),
                 "export" => actions.push(Action::ExportGcode),
+                "print" => actions.push(Action::Print),
                 "prefs" => actions.push(Action::Preferences),
                 "quit" => actions.push(Action::Quit),
-                "page1" => s.page = Page::Home,
-                "page2" => s.page = Page::Prepare,
-                "page3" => actions.push(Action::Slice),
-                "page4" => s.page = Page::Device,
-                "page5" => s.page = Page::Project,
                 "undo" => s.undo(),
                 "redo" => s.redo(),
                 "select-all" => s.select_all(),
+                "select-all-plates" => s.selection = s.model.objects.iter().map(|o| o.id).collect(),
                 "clone" => s.clone_selected(),
                 "copy" => s.copy(),
                 "cut" => {
@@ -1068,35 +1058,74 @@ impl CosmicSlicerApp {
                     _ => {}
                 },
                 "help" => self.dialogs.shortcuts = true,
+                "search" => {
+                    s.page = if s.page.is_3d() { s.page } else { Page::Prepare };
+                    self.sidebar.focus_search = true;
+                }
+                "reload-device" => {
+                    self.device.devices = Default::default();
+                }
                 "fit" => self.viewport.fit_pending = true,
+                "zoom-in" => self.viewport.camera.zoom(0.8, None),
+                "zoom-out" => self.viewport.camera.zoom(1.25, None),
                 "projection" => s.prefs.perspective = !s.prefs.perspective,
                 "labels" => s.prefs.show_labels = !s.prefs.show_labels,
                 "arrange" => s.arrange(true),
                 "arrange-plate" => s.arrange(false),
                 "add-instance" => s.add_instance(),
                 "remove-instance" => s.remove_instance(),
+                "toggle-printable" => {
+                    for id in s.selection.clone() {
+                        s.toggle_visible(id);
+                    }
+                }
                 "orient" => s.auto_orient(),
+                "orient-plate" => {
+                    let kept = std::mem::take(&mut s.selection);
+                    s.auto_orient();
+                    s.selection = kept;
+                }
+                "rotate-left" | "rotate-right" if !s.selection.is_empty() => {
+                    let angle = if name == "rotate-left" { 45f32 } else { -45f32 }.to_radians();
+                    s.checkpoint();
+                    let ids = s.selection.clone();
+                    for id in &ids {
+                        if let Some(o) = s.model.get_mut(*id) {
+                            let c = o.bounds().centre().truncate();
+                            o.turn_about(angle, c, c);
+                        }
+                    }
+                    s.settle(&ids);
+                }
                 "layer-up" => self.viewport.layers.top = (self.viewport.layers.top + 1).min(self.viewport.layers.count),
                 "layer-down" => {
                     self.viewport.layers.top =
                         self.viewport.layers.top.saturating_sub(1).max(self.viewport.layers.bottom)
                 }
+                "go-to-layer" => self.dialogs.go_to_layer = Some(self.viewport.layers.top.to_string()),
+                "moves-left" => self.viewport.moves = (self.viewport.moves - 0.01).max(0.0),
+                "moves-right" => self.viewport.moves = (self.viewport.moves + 0.01).min(1.0),
+                "moves-start" => self.viewport.moves = 0.0,
+                "moves-end" => self.viewport.moves = 1.0,
+                "brush-circle" => self.viewport.tools.brush = crate::viewport::tools::Brush::Circle,
+                "brush-sphere" => self.viewport.tools.brush = crate::viewport::tools::Brush::Sphere,
+                "brush-fill" => self.viewport.tools.brush = crate::viewport::tools::Brush::Fill,
                 view if view.starts_with("view") => {
-                    let i: usize = view[4..].parse().unwrap_or(0);
+                    let i: usize = view.get(4..).and_then(|v| v.parse().ok()).unwrap_or(0);
                     if let Some((v, ..)) = View::ALL.get(i) {
                         self.viewport.set_view(*v);
                     }
                 }
                 tool if tool.starts_with("tool-") => {
-                    let wanted = &tool[5..];
+                    let wanted = tool.get(5..).unwrap_or("");
                     let found = Tool::GIZMOS.iter().find(|g| g.2.eq_ignore_ascii_case(wanted)).map(|g| g.0);
                     if !s.model.objects.is_empty() {
                         self.viewport.tool = if self.viewport.tool == found { None } else { found };
                     }
                 }
                 nudge if nudge.starts_with("nudge-") && !s.selection.is_empty() => {
-                    let step = if nudge.ends_with("10") { 10.0 } else { 1.0 };
-                    let d = match nudge.trim_end_matches("10") {
+                    let step = if nudge.ends_with("-fine") { 1.0 } else { 10.0 };
+                    let d = match nudge.trim_end_matches("-fine") {
                         "nudge-left" => glam::Vec3::NEG_X,
                         "nudge-right" => glam::Vec3::X,
                         "nudge-up" => glam::Vec3::Y,
@@ -1225,6 +1254,23 @@ impl CosmicSlicerApp {
     pub fn frame(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         let tokens: &'static Tokens = Tokens::for_theme(self.session.prefs.theme);
+        if self.applied_language.as_deref() != Some(self.session.prefs.language.as_str()) {
+            let chosen = self.session.prefs.language.clone();
+            let code = if chosen.is_empty() {
+                crate::i18n::system_language().unwrap_or_else(|| "en".into())
+            } else {
+                chosen.clone()
+            };
+            crate::i18n::set_language(&code);
+            if !crate::i18n::install_fonts(&ctx, &code) {
+                self.session.notify(Level::Warning, "No font for this language was found on the system; install Noto Sans CJK (or Noto Sans Thai) to see its text.");
+            }
+            self.applied_language = Some(chosen);
+        }
+        if self.session.prefs.remember_print_action {
+            self.session.prefs.slice_all = self.choices.slice_all;
+            self.session.prefs.print_choice = self.choices.print;
+        }
         if self.applied_theme != Some(self.session.prefs.theme) {
             theme::apply(&ctx, tokens);
             self.applied_theme = Some(self.session.prefs.theme);
@@ -1331,11 +1377,15 @@ impl CosmicSlicerApp {
             }
             Page::Project => {
                 egui::CentralPanel::default().frame(ui_kit::frame(Surface::Page, tokens)).show(ui, |ui| {
-                    pages::project(ui, &mut self.session, tokens);
+                    pages::project(ui, &mut self.session, tokens, &mut actions);
                 });
             }
         }
         self.dialogs.show(&ctx, &mut self.session, tokens, &mut self.device);
+        if let Some(layer) = self.dialogs.jump_to_layer.take() {
+            let l = &mut self.viewport.layers;
+            l.top = layer.min(l.count).max(l.bottom.min(l.count));
+        }
         if std::mem::take(&mut self.dialogs.calibration_ready) {
             self.session.page = Page::Prepare;
             self.viewport.fit_pending = true;
@@ -1743,5 +1793,83 @@ mod smoke {
         // The menu's names reach the dialog.
         app.handle(&ctx, Action::Calibration(Test::PaPattern.label()));
         assert!(app.dialogs.calibration.as_ref().is_some_and(|d| d.test == Test::PaPattern));
+    }
+
+    #[test]
+    fn pages_draw_in_other_languages_and_at_any_scale() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_objects();
+        let png = CosmicSlicer_engine::thumbnail::png(&[200; 16 * 16 * 4], 16, 16).unwrap_or_default();
+        app.session.project.files = vec![
+            ("Model Pictures".into(), "front.png".into(), Arc::new(png)),
+            ("Model Pictures".into(), "broken.jpg".into(), Arc::new(vec![1, 2, 3])),
+            ("Bill of Materials".into(), "bom.csv".into(), Arc::new(b"a,b".to_vec())),
+        ];
+        for (lang, scale) in [("de", 1.0), ("ja", 1.5), ("th", 2.0), ("", 1.25)] {
+            app.session.prefs.language = lang.into();
+            // Moving to another monitor changes the scale between frames.
+            ctx.set_pixels_per_point(scale);
+            for page in [Page::Home, Page::Prepare, Page::Preview, Page::Device, Page::Project] {
+                app.session.page = page;
+                frames(&mut app, &ctx, 2);
+            }
+            app.dialogs.preferences = true;
+            for p in 0..6 {
+                app.dialogs.preferences_page = p;
+                frames(&mut app, &ctx, 1);
+            }
+            app.dialogs.preferences = false;
+            app.dialogs.shortcuts = true;
+            app.dialogs.go_to_layer = Some("3".into());
+            frames(&mut app, &ctx, 2);
+            app.dialogs.shortcuts = false;
+        }
+        ctx.set_pixels_per_point(1.0);
+        crate::i18n::set_language("en");
+        app.session.prefs.language = "en".into();
+        frames(&mut app, &ctx, 1);
+    }
+
+    #[test]
+    fn shortcuts_from_the_table_act() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_objects();
+        let press = |app: &mut CosmicSlicerApp, key: egui::Key, modifiers: egui::Modifiers| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+                events: vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }],
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+            out.textures_delta.clear();
+        };
+        app.session.page = Page::Prepare;
+        frames(&mut app, &ctx, 1);
+        // Ctrl+Shift+A: every object on every plate.
+        press(&mut app, egui::Key::A, egui::Modifiers { shift: true, ..egui::Modifiers::COMMAND });
+        assert_eq!(app.session.selection.len(), app.session.model.objects.len());
+        // Page Up turns the selection 45°.
+        let id = app.session.model.objects.first().map(|o| o.id).unwrap_or(0);
+        app.session.selection = vec![id];
+        let before = app.session.model.get(id).map(|o| o.transform.quat());
+        press(&mut app, egui::Key::PageUp, egui::Modifiers::NONE);
+        let after = app.session.model.get(id).map(|o| o.transform.quat());
+        let turned = before.zip(after).map(|(a, b)| a.angle_between(b).to_degrees());
+        assert!(turned.is_some_and(|d| (d - 45.0).abs() < 0.5), "{turned:?}");
+        // Arrows move 10 mm, Shift+arrows 1 mm.
+        let x0 = app.session.model.get(id).map_or(0.0, |o| o.transform.offset.x);
+        press(&mut app, egui::Key::ArrowRight, egui::Modifiers::NONE);
+        press(&mut app, egui::Key::ArrowRight, egui::Modifiers::SHIFT);
+        let x1 = app.session.model.get(id).map_or(0.0, |o| o.transform.offset.x);
+        assert!((x1 - x0 - 11.0).abs() < 1e-3, "{x0} {x1}");
+        // A tool key, and the painting keys taking over while painting.
+        press(&mut app, egui::Key::H, egui::Modifiers::NONE);
+        assert_eq!(app.viewport.tool, Some(Tool::FuzzySkin));
+        press(&mut app, egui::Key::S, egui::Modifiers::NONE);
+        assert_eq!(app.viewport.tools.brush, crate::viewport::tools::Brush::Sphere);
+        assert_eq!(app.viewport.tool, Some(Tool::FuzzySkin));
+        // Ctrl+1 is the top view; ? opens the list.
+        press(&mut app, egui::Key::Questionmark, egui::Modifiers::NONE);
+        assert!(app.dialogs.shortcuts);
     }
 }

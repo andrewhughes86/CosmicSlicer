@@ -163,6 +163,36 @@ pub struct Prefs {
     pub printers: Vec<CosmicSlicer_connect::PhysicalPrinter>,
     /// The printer the Device page and Print use, by name.
     pub active_printer: String,
+    /// Language code ("" follows the system).
+    pub language: String,
+    /// The page opened at start: Home or Prepare.
+    pub default_page: Page,
+    /// Opening a 3MF: 0 load all, 1 ask when its presets differ, 2 always ask, 3 geometry only.
+    pub load_behaviour: usize,
+    /// Back the project up (autosave) this many seconds after a change; 0 never.
+    pub backup_seconds: u32,
+    pub max_recent: usize,
+    /// Model files (STL, STEP, ...) go in the recent list too.
+    pub recent_models: bool,
+    /// Arrange the plate after cloning.
+    pub arrange_after_clone: bool,
+    /// Keep the Slice and Print buttons' choices between runs.
+    pub remember_print_action: bool,
+    pub slice_all: bool,
+    pub print_choice: usize,
+    /// 0 default (left drag orbits), 1 touchpad (Alt+move orbits, Shift+move pans).
+    pub camera_style: usize,
+    pub orbit_speed: f32,
+    pub reverse_zoom: bool,
+    /// What dragging with each button does on empty space: 0 nothing, 1 pan, 2 orbit.
+    pub left_drag: usize,
+    pub middle_drag: usize,
+    pub right_drag: usize,
+    /// A 3Dconnexion mouse moves the camera (through spacenavd on Linux).
+    pub space_mouse: bool,
+    pub space_mouse_speed: f32,
+    /// Log level: error, warn, info, debug.
+    pub log_level: String,
 }
 
 impl Default for Prefs {
@@ -184,6 +214,25 @@ impl Default for Prefs {
             arrange_rotate: false,
             printers: Vec::new(),
             active_printer: String::new(),
+            language: String::new(),
+            default_page: Page::Home,
+            load_behaviour: 0,
+            backup_seconds: crate::recovery::AUTOSAVE_DELAY as u32,
+            max_recent: 12,
+            recent_models: true,
+            arrange_after_clone: false,
+            remember_print_action: true,
+            slice_all: false,
+            print_choice: 0,
+            camera_style: 0,
+            orbit_speed: 1.0,
+            reverse_zoom: false,
+            left_drag: 2,
+            middle_drag: 1,
+            right_drag: 1,
+            space_mouse: true,
+            space_mouse_speed: 1.0,
+            log_level: "warn".into(),
         }
     }
 }
@@ -223,7 +272,19 @@ pub struct ProjectInfo {
     pub author: String,
     pub license: String,
     pub description: String,
+    /// OrcaSlicer's profile notes: a title and description of the settings used.
+    #[serde(default)]
+    pub profile_title: String,
+    #[serde(default)]
+    pub profile_description: String,
+    /// Attachments saved in the 3MF (`Auxiliaries/`): (category folder, file name, bytes).
+    /// Kept with the project file, not in autosaves.
+    #[serde(skip)]
+    pub files: Vec<(String, String, std::sync::Arc<Vec<u8>>)>,
 }
+
+/// OrcaSlicer's attachment folders.
+pub const ATTACHMENT_KINDS: [&str; 4] = ["Model Pictures", "Bill of Materials", "Assembly Guide", "Others"];
 
 #[derive(Clone)]
 struct Snapshot {
@@ -601,7 +662,9 @@ impl Session {
                 if self.project.name == "Untitled" && self.model.objects.len() == ids.len() {
                     self.project.name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("Untitled").to_owned();
                 }
-                self.remember(path);
+                if self.prefs.recent_models {
+                    self.remember(path);
+                }
                 if ids.iter().any(|id| !self.fits(*id)) {
                     self.notify(
                         Level::Warning,
@@ -1098,7 +1161,7 @@ impl Session {
     pub fn remember(&mut self, path: &Path) {
         self.prefs.recent.retain(|p| p != path);
         self.prefs.recent.insert(0, path.to_owned());
-        self.prefs.recent.truncate(12);
+        self.prefs.recent.truncate(self.prefs.max_recent.clamp(1, 100));
     }
 
     /// Scales objects by `factor` about their own centres (inches to millimetres), resting
@@ -1257,6 +1320,11 @@ impl Session {
             self.place_clear_of_others(id);
         }
         self.selection = copies;
+        if self.prefs.arrange_after_clone {
+            let ids: Vec<u64> = self.model.objects.iter().filter(|o| o.plate == self.plate).map(|o| o.id).collect();
+            let plate = self.plate;
+            self.arrange_ids(&ids, &[plate], true, self.prefs.arrange_rotate);
+        }
     }
 
     /// Arranges the current plate (or every unlocked plate).

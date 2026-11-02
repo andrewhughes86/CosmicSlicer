@@ -22,7 +22,7 @@ pub fn file_menu(ui: &mut Ui, session: &mut Session, actions: &mut Vec<Action>) 
     if menu_item(ui, "Open Project", &ctrl("O"), true) {
         actions.push(Action::OpenProject);
     }
-    ui.menu_button("Recent files", |ui| {
+    ui.menu_button(crate::i18n::tr("Recent files"), |ui| {
         let recent = session.prefs.recent.clone();
         if recent.is_empty() {
             ui.add_enabled(false, egui::Button::new("No recent files"));
@@ -50,7 +50,7 @@ pub fn file_menu(ui: &mut Ui, session: &mut Session, actions: &mut Vec<Action>) 
         actions.push(Action::SaveProjectAs);
     }
     ui.separator();
-    ui.menu_button("Import", |ui| {
+    ui.menu_button(crate::i18n::tr("Import"), |ui| {
         if menu_item(ui, "Import 3MF/STL/STEP/SVG/OBJ/AMF", &ctrl("I"), true) {
             actions.push(Action::Import);
         }
@@ -61,7 +61,7 @@ pub fn file_menu(ui: &mut Ui, session: &mut Session, actions: &mut Vec<Action>) 
             actions.push(Action::ImportConfig);
         }
     });
-    ui.menu_button("Export", |ui| {
+    ui.menu_button(crate::i18n::tr("Export"), |ui| {
         let any = !session.model.objects.is_empty();
         if menu_item(ui, "Export all objects as one STL", "", any) {
             actions.push(Action::ExportStl);
@@ -206,13 +206,13 @@ pub fn calibration_menu(ui: &mut Ui, actions: &mut Vec<Action>) {
         }
     };
     item(ui, "Temperature", Test::Temperature);
-    ui.menu_button("Flow rate", |ui| {
+    ui.menu_button(crate::i18n::tr("Flow rate"), |ui| {
         item(ui, "Pass 1", Test::FlowPass1);
         item(ui, "Pass 2", Test::FlowPass2);
         item(ui, "YOLO (Recommended)", Test::FlowYolo);
         item(ui, "YOLO (perfectionist version)", Test::FlowYoloFine);
     });
-    ui.menu_button("Pressure advance", |ui| {
+    ui.menu_button(crate::i18n::tr("Pressure advance"), |ui| {
         item(ui, "Line", Test::PaLine);
         item(ui, "Pattern", Test::PaPattern);
         item(ui, "Tower", Test::PaTower);
@@ -220,7 +220,7 @@ pub fn calibration_menu(ui: &mut Ui, actions: &mut Vec<Action>) {
     item(ui, "Retraction test", Test::Retraction);
     item(ui, "Max flowrate", Test::MaxFlow);
     item(ui, "VFA", Test::Vfa);
-    ui.menu_button("Input Shaping", |ui| {
+    ui.menu_button(crate::i18n::tr("Input Shaping"), |ui| {
         item(ui, "Input Shaping Frequency", Test::ShaperFreq);
         item(ui, "Input Shaping Damping/zeta factor", Test::ShaperDamp);
     });
@@ -275,7 +275,7 @@ pub fn object_menu(ui: &mut Ui, session: &mut Session, id: u64, actions: &mut Ve
     if menu_item(ui, "Auto orient", "", true) {
         session.auto_orient();
     }
-    ui.menu_button("Mirror", |ui| {
+    ui.menu_button(crate::i18n::tr("Mirror"), |ui| {
         for (axis, name) in ["Along X axis", "Along Y axis", "Along Z axis"].iter().enumerate() {
             if menu_item(ui, name, "", true) {
                 session.mirror(axis);
@@ -291,7 +291,7 @@ pub fn object_menu(ui: &mut Ui, session: &mut Session, id: u64, actions: &mut Ve
     if menu_item(ui, "Assemble", "", session.selection.len() > 1) {
         session.assemble();
     }
-    ui.menu_button("Change filament", |ui| {
+    ui.menu_button(crate::i18n::tr("Change filament"), |ui| {
         let n = session.presets.project_filaments.len();
         for f in 1..=n {
             let current = session.model.get(id).is_some_and(|o| o.filament == f);
@@ -338,7 +338,7 @@ pub fn object_menu(ui: &mut Ui, session: &mut Session, id: u64, actions: &mut Ve
 
 /// Right-click on the empty canvas.
 pub fn canvas_menu(ui: &mut Ui, session: &mut Session, actions: &mut Vec<Action>) {
-    ui.menu_button("Add Primitive", |ui| {
+    ui.menu_button(crate::i18n::tr("Add Primitive"), |ui| {
         for (name, _) in primitives::ALL {
             if menu_item(ui, name, "", true) {
                 session.add_primitive(name);
@@ -362,9 +362,4 @@ pub fn canvas_menu(ui: &mut Ui, session: &mut Session, actions: &mut Vec<Action>
     if menu_item(ui, "Paste", &ctrl("V"), session.can_paste()) {
         session.paste();
     }
-}
-
-/// A shortcut as written in the shortcut list, with ⌘ for Ctrl on macOS.
-pub fn ctrl_text(s: &str) -> String {
-    if cfg!(target_os = "macos") { s.replace("Ctrl+", "⌘") } else { s.to_owned() }
 }

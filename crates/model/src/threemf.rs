@@ -250,8 +250,15 @@ pub struct Project {
     pub plates: Vec<Plate>,
     /// `Metadata/project_settings.config`: the presets, as OrcaSlicer's JSON.
     pub settings: Option<String>,
+    /// OrcaSlicer's attachments (`Auxiliaries/`): pictures, bill of materials, assembly guide
+    /// and other files, by path below `Auxiliaries/` ("Model Pictures/front.png").
+    pub aux: Vec<(String, Vec<u8>)>,
     pub warnings: Vec<String>,
 }
+
+/// Largest attachment kept, and the most kept in all.
+const MAX_AUX_FILE: usize = 64 << 20;
+const MAX_AUX_TOTAL: usize = 256 << 20;
 
 impl Project {
     /// Whether the file is a slicer project (plates and settings), not just a model.
@@ -829,6 +836,18 @@ pub fn read(bytes: &[u8]) -> ModelResult<Project> {
         }
     }
     project.settings = z.read("Metadata/project_settings.config").ok().and_then(|b| String::from_utf8(b).ok());
+    let aux: Vec<String> =
+        z.names().filter(|n| n.starts_with("Auxiliaries/") && !n.ends_with('/')).map(str::to_owned).collect();
+    let mut total = 0;
+    for name in aux.into_iter().take(500) {
+        let Ok(b) = z.read(&name) else { continue };
+        if b.len() > MAX_AUX_FILE || total + b.len() > MAX_AUX_TOTAL {
+            project.warnings.push(format!("{name} is too large and was left out"));
+            continue;
+        }
+        total += b.len();
+        project.aux.push((name.trim_start_matches("Auxiliaries/").to_owned(), b));
+    }
     if project.objects.is_empty() && !project.is_project() {
         return Err(ModelError::Format("the 3MF file has no objects".into()));
     }
@@ -1108,6 +1127,12 @@ pub fn write(project: &Project) -> ModelResult<Vec<u8>> {
             files.push((format!("Metadata/plate_{}.png", p + 1), png.clone()));
         }
     }
+    for (name, bytes) in &project.aux {
+        let clean: String = name.split('/').filter(|s| !s.is_empty() && *s != "..").collect::<Vec<_>>().join("/");
+        if !clean.is_empty() {
+            files.push((format!("Auxiliaries/{clean}"), bytes.clone()));
+        }
+    }
     zip::write(&files).map_err(|e| ModelError::Format(format!("could not pack the project: {e}")))
 }
 
@@ -1186,6 +1211,7 @@ mod tests {
                 Plate::default(),
             ],
             settings: Some(r#"{"layer_height": "0.16"}"#.into()),
+            aux: vec![("Model Pictures/front.png".into(), vec![1, 2, 3]), ("../Assembly Guide/a.pdf".into(), vec![4])],
             warnings: vec![],
         }
     }
@@ -1194,6 +1220,11 @@ mod tests {
     fn a_project_round_trips() -> ModelResult<()> {
         let p = sample();
         let back = read(&write(&p)?)?;
+        // Attachments come back, a path that tried to climb out of the folder cleaned.
+        assert_eq!(
+            back.aux,
+            vec![("Model Pictures/front.png".to_owned(), vec![1, 2, 3]), ("Assembly Guide/a.pdf".to_owned(), vec![4])]
+        );
         assert_eq!(back.application, "Test-1.0");
         assert!(back.metadata.iter().any(|(k, v)| k == "Title" && v == "A & B"));
         assert_eq!(back.objects.len(), 2);

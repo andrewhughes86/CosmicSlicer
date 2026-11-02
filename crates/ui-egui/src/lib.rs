@@ -16,6 +16,7 @@ mod calibration;
 mod devices;
 mod dialogs;
 mod emboss;
+mod i18n;
 pub mod icons;
 mod menus;
 mod pages;
@@ -24,8 +25,10 @@ mod profiles;
 mod project;
 mod recovery;
 mod settings;
+mod shortcuts;
 mod sidebar;
 mod slicer;
+mod space_mouse;
 pub mod state;
 mod store;
 pub mod theme;
@@ -64,6 +67,10 @@ pub enum Action {
     PickFont,
     ExportStl,
     ExportGcode,
+    /// Pick files to attach to the project under this kind (Project page).
+    AddAttachment(&'static str),
+    /// Save the attachment at this index to a file.
+    SaveAttachment(usize),
     /// Slice every plate and write each one's G-code into a folder.
     ExportAllGcode,
     Quit,

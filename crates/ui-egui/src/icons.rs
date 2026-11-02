@@ -183,7 +183,16 @@ pub fn button_enabled(
         ui.painter().rect_filled(rect, 4.0, t.hover_bg);
     }
     paint(ui, rect.shrink(side * 0.12), name, t, enabled);
-    if tooltip.is_empty() { response } else { response.on_hover_text(tooltip) }
+    // Screen readers name the button by its tooltip (or its icon, when it has none).
+    let label = if tooltip.is_empty() { name.replace('_', " ") } else { crate::i18n::tr(tooltip) };
+    response.widget_info(|| {
+        let mut info = egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &label);
+        if checked {
+            info.selected = Some(true);
+        }
+        info
+    });
+    if tooltip.is_empty() { response } else { response.on_hover_text(crate::i18n::tr(tooltip)) }
 }
 
 #[cfg(test)]

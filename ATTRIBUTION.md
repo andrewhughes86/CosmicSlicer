@@ -17,6 +17,10 @@ Taken from OrcaSlicer (commit 95a27321456e73cf6c6270d37dccfe819a96b130, 2026-11-
   The calibration tests follow `src/libslic3r/calib.cpp`, `src/slic3r/GUI/Plater.cpp`
   (`calib_*`), `src/slic3r/GUI/calib_dlg.cpp` and the per-layer changes in
   `src/libslic3r/GCode.cpp`.
+- `assets/i18n/translations.bin` — OrcaSlicer's translations (`localization/i18n/`, by
+  OrcaSlicer's translators), cut down by `tools/pack_translations.py` to the texts CosmicSlicer
+  shows. The keyboard shortcuts follow `src/slic3r/GUI/Shortcuts.cpp`; the Preferences pages
+  `src/slic3r/GUI/Preferences.cpp`.
 - `assets/profiles/orca_profiles.bin` — OrcaSlicer's printer, filament and process profile
   library (`resources/profiles`, 72 vendors), packed by `tools/pack_orca_profiles.py`. The
   vendor profiles were contributed to OrcaSlicer by the printer and filament makers and the
