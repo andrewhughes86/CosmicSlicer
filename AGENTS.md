@@ -48,14 +48,20 @@ OrcaSlicer's crashes are the reason this exists.
   splits loops into runs by degree for speed, fan, flow and the Overhang wall type, and builds
   scarf seams there. `plan` runs in two passes so solid infill can see the sparse infill below
   (internal bridges).
-- `crates/model` — meshes, objects, plates, STL/OBJ readers, primitives, arrange.
+- `crates/model` — meshes, objects, plates, primitives, arrange; `load` (every format, zip
+  archives); `threemf` reads and writes 3MF projects in OrcaSlicer's layout (objects and parts
+  in `3D/Objects/`, `Metadata/model_settings.config`, `project_settings.config`, painted
+  facets kept as Orca's encoded strings).
+- `crates/import` — the model readers (mesh formats and STEP/IGES/SAT with their B-rep kernel),
+  vendored from CosmicDMS; keep fixes in step with it.
 - `crates/engine` — the slicer: `slicing` (mesh → layer shapes), `walls`, `plan` (top /
   bottom / solid / sparse regions per island), `infill`, `skirt`, `support`, `gcode` (order,
   travel, cooling, G-code, estimates, Preview moves). `geom` wraps i_overlay under
   `catch_unwind`; `settings` clamps every value it reads. `slice()` never panics.
   `SLICE_FILE=x.stl cargo test --release -p CosmicSlicer-engine slice_a_file -- --nocapture`
   times a real model.
-- `crates/ui-egui` — the UI. `slicer.rs` runs the engine on a thread (results checked against a
+- `crates/ui-egui` — the UI. `project.rs` maps the session to and from 3MF projects (presets by name, edits kept);
+  `slicer.rs` runs the engine on a thread (results checked against a
   settings fingerprint and the model revision); `preview.rs` colours toolpaths. `state.rs` is the session (all edits go through its methods, which
   checkpoint undo); `topbar`, `sidebar`, `settings`, `pages`, `dialogs`, `menus`; `viewport/`
   is the 3D canvas (wgpu renderer, camera, gizmos, overlays).

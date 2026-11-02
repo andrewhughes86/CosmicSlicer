@@ -18,6 +18,7 @@ mod menus;
 mod pages;
 mod preview;
 mod profiles;
+mod project;
 mod recovery;
 mod settings;
 mod sidebar;
@@ -46,7 +47,10 @@ pub const APP_ICON_SVG: &str = include_str!("../../../assets/icons/app/cosmicsli
 pub enum Action {
     NewProject,
     OpenProject,
+    /// Opens a project file, or imports it when it is only a model.
+    OpenProjectPath(PathBuf),
     SaveProject,
+    SaveProjectAs,
     Import,
     ImportPath(PathBuf),
     ExportStl,

@@ -21,3 +21,8 @@ Taken from OrcaSlicer (commit 95a27321456e73cf6c6270d37dccfe819a96b130, 2026-11-
 ## CosmicSlicer's own
 - `assets/icons/app/cosmicslicer.svg` and `assets/icons/cosmic/cosmic_logo.svg` — original.
 - The theme palettes and UI kit follow CosmicDMS / CosmicCut by the same author.
+- `crates/import` — the model readers (STL, OBJ, PLY, OFF, 3MF, AMF, glTF, COLLADA, VRML, X3D,
+  3DS, DXF, STEP, IGES, ACIS SAT) and the B-rep / NURBS / trimmed-face kernel STEP, IGES and
+  SAT are tessellated with, from CosmicDMS (`crates/io`, and `brep`, `nurbs`, `trim`, `mesh`
+  of `crates/geom`) by the same author, there MIT OR Apache-2.0, here under the AGPL with
+  the rest of CosmicSlicer.

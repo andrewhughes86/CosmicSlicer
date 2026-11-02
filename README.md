@@ -8,7 +8,12 @@ Step 1 — the user interface — is done: OrcaSlicer's Home, Prepare, Preview, 
 and Project pages; the sidebar (printer, filaments, objects, process); every OrcaSlicer setting
 on its page and group, with Advanced, search, per-object settings, presets, saving and comparing;
 the 3D plates with picking, Move / Rotate / Scale / Lay on face, arrange, auto orient, split,
-multiple plates, undo / redo; STL and OBJ import, STL export.
+multiple plates, undo / redo; STL export.
+
+Projects save and open as 3MF in OrcaSlicer's layout (plates, objects, per-object settings,
+presets, painted supports, plate thumbnails), and OrcaSlicer, Bambu Studio and plain 3MF files
+open here. Import reads STL, OBJ, 3MF, STEP, IGES, SAT, AMF, PLY, OFF, glTF, COLLADA, VRML,
+X3D, 3DS and DXF, and zip archives of them.
 
 Step 2 — the slicing engine — is done: layers, walls (inner/outer order, aligned / nearest /
 back / random seams), top / bottom / bridge / solid / sparse regions, infill (rectilinear,
@@ -19,8 +24,10 @@ placeholders, and estimates of time, filament, weight and cost. Slicing runs in 
 with progress and Cancel; Preview draws the real toolpaths with OrcaSlicer's legend and view
 types; Export G-code writes the file.
 
-Not yet: tree supports (printed as normal supports), rafts, prime tower, gap fill, arc fitting,
-variable layer height, painting tools, 3MF projects and printer connections.
+Since then (see `ROADMAP.md`): every OrcaSlicer infill pattern, walls with gap fill, overhangs,
+bridges and seams, tree and normal supports, rafts, a firmware-style motion planner and arc
+fitting. Not yet: modifiers and parts, painting tools, prime tower, variable layer height and
+printer connections.
 
 Script it: `CosmicSlicer model.stl --set sparse_infill_density=30% --export out.gcode`.
 

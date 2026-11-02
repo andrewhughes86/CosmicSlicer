@@ -10,6 +10,7 @@ description = "Meshes, objects and plates; model file readers"
 workspace = true
 
 [dependencies]
+CosmicSlicer-import = { workspace = true }
 glam = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 thiserror = { workspace = true }

@@ -155,13 +155,22 @@ pub fn home(ui: &mut Ui, session: &mut Session, t: &Tokens, actions: &mut Vec<Ac
                 );
                 let thumb = egui::Rect::from_min_size(r.min + vec2(10.0, 10.0), vec2(card_w - 20.0, 120.0));
                 ui.painter().rect_filled(thumb, 6.0, t.raised_bg);
-                icons::paint(
-                    ui,
-                    egui::Rect::from_center_size(thumb.center(), vec2(56.0, 56.0)),
-                    "menu_obj_cube",
-                    t,
-                    true,
-                );
+                match project_thumbnail(ui.ctx(), path) {
+                    Some(tex) => {
+                        // Fit the square image in the card, centred.
+                        let side = thumb.height().min(thumb.width());
+                        let img = egui::Rect::from_center_size(thumb.center(), vec2(side, side));
+                        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                        ui.painter().image(tex.id(), img, uv, egui::Color32::WHITE);
+                    }
+                    None => icons::paint(
+                        ui,
+                        egui::Rect::from_center_size(thumb.center(), vec2(56.0, 56.0)),
+                        "menu_obj_cube",
+                        t,
+                        true,
+                    ),
+                }
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
                 ui.painter().text(
                     r.left_top() + vec2(12.0, 142.0),
@@ -180,7 +189,7 @@ pub fn home(ui: &mut Ui, session: &mut Session, t: &Tokens, actions: &mut Vec<Ac
                     t.text_muted,
                 );
                 if response.on_hover_text(path.display().to_string()).clicked() {
-                    actions.push(Action::ImportPath(path.clone()));
+                    actions.push(Action::OpenProjectPath(path.clone()));
                     session.page = Page::Prepare;
                 }
                 if (i + 1) % cols == 0 {
@@ -189,6 +198,46 @@ pub fn home(ui: &mut Ui, session: &mut Session, t: &Tokens, actions: &mut Vec<Ac
             }
         });
     });
+}
+
+/// A project's plate thumbnail, read once per file and kept for the session.
+fn project_thumbnail(ctx: &egui::Context, path: &std::path::Path) -> Option<egui::TextureHandle> {
+    let ext_ok = path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("3mf"));
+    if !ext_ok {
+        return None;
+    }
+    let id = egui::Id::new(("recent-thumbnail", path));
+    if let Some(cached) = ctx.data(|d| d.get_temp::<Option<egui::TextureHandle>>(id)) {
+        return cached;
+    }
+    let tex = crate::project::thumbnail(path)
+        .and_then(|png| decode_png(&png))
+        .map(|image| ctx.load_texture(format!("recent-{}", path.display()), image, egui::TextureOptions::LINEAR));
+    ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
+    tex
+}
+
+/// An 8-bit RGBA or RGB PNG as an image; `None` for anything else or a damaged file.
+fn decode_png(bytes: &[u8]) -> Option<egui::ColorImage> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND);
+    let mut reader = decoder.read_info().ok()?;
+    let info = reader.info();
+    let (w, h) = (info.width as usize, info.height as usize);
+    if w == 0 || h == 0 || w > 4096 || h > 4096 {
+        return None;
+    }
+    let mut buf = vec![0; reader.output_buffer_size()?];
+    let frame = reader.next_frame(&mut buf).ok()?;
+    let data = buf.get(..frame.buffer_size())?;
+    let rgba: Vec<u8> = match (frame.color_type, frame.bit_depth) {
+        (png::ColorType::Rgba, png::BitDepth::Eight) => data.to_vec(),
+        (png::ColorType::Rgb, png::BitDepth::Eight) => {
+            data.as_chunks::<3>().0.iter().flat_map(|[r, g, b]| [*r, *g, *b, 255]).collect()
+        }
+        _ => return None,
+    };
+    (rgba.len() == w * h * 4).then(|| egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba))
 }
 
 // ---- Device ----

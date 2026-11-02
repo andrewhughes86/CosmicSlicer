@@ -36,7 +36,7 @@ pub fn file_name(name: &str) -> String {
 }
 
 /// The system preset `name` of `kind`, wherever in the library it is.
-fn find_parent(kind: TabKind, name: &str) -> Option<library::SystemPreset> {
+pub fn find_parent(kind: TabKind, name: &str) -> Option<library::SystemPreset> {
     let lib = Library::get();
     if kind == TabKind::Printer
         && let Some(v) = lib.vendor_of_printer(name)
@@ -50,7 +50,7 @@ fn find_parent(kind: TabKind, name: &str) -> Option<library::SystemPreset> {
 }
 
 /// A value as OrcaSlicer writes it: lists as arrays, everything else as a string.
-fn to_json_value(schema: &Schema, key: &str, value: &str) -> Value {
+pub fn to_json_value(schema: &Schema, key: &str, value: &str) -> Value {
     match schema.option(key) {
         Some(def) if def.is_vector() && def.kind() != OptionType::String => {
             Value::Array(value.split(',').map(|v| Value::String(v.to_owned())).collect())
@@ -60,7 +60,7 @@ fn to_json_value(schema: &Schema, key: &str, value: &str) -> Value {
     }
 }
 
-fn from_json_value(v: &Value) -> String {
+pub fn from_json_value(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Array(items) => {

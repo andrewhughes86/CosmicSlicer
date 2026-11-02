@@ -35,9 +35,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "CosmicSlicer-import"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "miniz_oxide 0.8.9",
+ "quick-xml",
+ "serde_json",
+ "spade",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "CosmicSlicer-model"
 version = "0.1.0"
 dependencies = [
+ "CosmicSlicer-import",
  "glam",
  "serde",
  "thiserror 2.0.21",
@@ -49,6 +62,7 @@ version = "0.1.0"
 dependencies = [
  "CosmicSlicer-config",
  "CosmicSlicer-engine",
+ "CosmicSlicer-import",
  "CosmicSlicer-model",
  "bytemuck",
  "eframe",
@@ -2865,6 +2879,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "robust"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e27ee8bb91ca0adcf0ecb116293afa12d393f9c2b9b9cd54d33e8078fe19839"
+
+[[package]]
 name = "ron"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3183,6 +3203,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "spade"
+version = "2.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9699399fd9349b00b184f5635b074f9ec93afffef30c853f8c875b32c0f8c7fa"
+dependencies = [
+ "hashbrown 0.16.1",
+ "num-traits",
+ "robust",
+ "smallvec",
 ]
 
 [[package]]

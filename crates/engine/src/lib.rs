@@ -884,10 +884,10 @@ mod tests {
     #[test]
     fn slice_a_file() {
         let Ok(path) = std::env::var("SLICE_FILE") else { return };
-        let mesh = CosmicSlicer_model::load(std::path::Path::new(&path));
-        assert!(mesh.is_ok(), "{:?}", mesh.as_ref().err());
-        let Ok(mesh) = mesh else { return };
-        let mesh = mesh.centred();
+        let file = CosmicSlicer_model::load(std::path::Path::new(&path));
+        assert!(file.is_ok(), "{:?}", file.as_ref().err());
+        let Some(mesh) = file.ok().and_then(|f| f.objects.into_iter().next()) else { return };
+        let mesh = mesh.mesh.centred();
         let mut j = job(vec![JobObject {
             name: path.clone(),
             mesh: Arc::new(mesh),

@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 CosmicSlicer-config = { workspace = true }
 CosmicSlicer-engine = { workspace = true }
+CosmicSlicer-import = { workspace = true }
 CosmicSlicer-model = { workspace = true }
 bytemuck = { workspace = true }
 eframe = { workspace = true, features = ["accesskit", "default_fonts", "persistence", "wgpu", "wayland", "x11"] }

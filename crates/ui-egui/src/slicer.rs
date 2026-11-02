@@ -10,7 +10,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use glam::{Mat4, Vec3};
 
 use CosmicSlicer_config::TabKind;
-use CosmicSlicer_engine::{Job, JobObject, Progress, SliceError, Sliced};
+use CosmicSlicer_engine::{Job, JobObject, Progress, SliceError, Sliced, SupportPaint};
 
 use crate::state::{BED_TYPES, Session};
 
@@ -84,7 +84,16 @@ pub fn job(session: &Session, plate: usize) -> Job {
                 extruder: o.filament.saturating_sub(1),
                 overrides: o.overrides.clone(),
                 support_volumes: Vec::new(),
-                support_paint: Vec::new(),
+                support_paint: o
+                    .paint
+                    .as_deref()
+                    .map(|p| {
+                        p.support_states()
+                            .into_iter()
+                            .map(|(t, state)| (t, if state == 1 { SupportPaint::Enforce } else { SupportPaint::Block }))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             })
             .collect(),
         plate_name: session.plate_name(plate),

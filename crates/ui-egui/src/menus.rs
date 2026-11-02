@@ -47,14 +47,16 @@ pub fn file_menu(ui: &mut Ui, session: &mut Session, actions: &mut Vec<Action>) 
         actions.push(Action::SaveProject);
     }
     if menu_item(ui, "Save Project as", &ctrl("Shift+S"), true) {
-        actions.push(Action::SaveProject);
+        actions.push(Action::SaveProjectAs);
     }
     ui.separator();
     ui.menu_button("Import", |ui| {
         if menu_item(ui, "Import 3MF/STL/STEP/SVG/OBJ/AMF", &ctrl("I"), true) {
             actions.push(Action::Import);
         }
-        menu_item(ui, "Import ZIP Archive", "", false);
+        if menu_item(ui, "Import ZIP Archive", "", true) {
+            actions.push(Action::Import);
+        }
         if menu_item(ui, "Import Configs", "", true) {
             actions.push(Action::ImportConfig);
         }

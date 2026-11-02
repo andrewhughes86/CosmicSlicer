@@ -9,6 +9,7 @@ pub mod mesh;
 pub mod obj;
 pub mod primitives;
 pub mod stl;
+pub mod threemf;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use std::sync::Arc;
 use glam::{EulerRot, Mat4, Quat, Vec3};
 
 pub use mesh::{Aabb, Mesh};
+pub use threemf::Paint;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
@@ -32,27 +34,113 @@ pub type ModelResult<T> = Result<T, ModelError>;
 /// Largest model file read, so a hostile file cannot exhaust memory.
 pub const MAX_FILE_BYTES: u64 = 2 << 30;
 
-/// Extensions the Import dialog offers.
-pub const IMPORT_EXTENSIONS: &[&str] = &["stl", "obj"];
+/// Extensions the Import dialog offers: every model format the readers know, and zip
+/// archives of them.
+pub fn import_extensions() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> =
+        CosmicSlicer_import::ModelFormat::ALL.iter().flat_map(|f| f.extensions().iter().copied()).collect();
+    out.push("zip");
+    out
+}
 
-/// Reads a model file into a mesh, by its extension.
-pub fn load(path: &Path) -> ModelResult<Mesh> {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+/// One object read from a model file.
+#[derive(Clone, Debug)]
+pub struct Loaded {
+    pub name: String,
+    /// In millimetres, placed as the file places it.
+    pub mesh: Mesh,
+    pub paint: Option<Paint>,
+}
+
+/// What [`load`] read, and what it skipped or approximated.
+#[derive(Clone, Debug, Default)]
+pub struct LoadedFile {
+    pub objects: Vec<Loaded>,
+    pub warnings: Vec<String>,
+}
+
+/// Most model files read from one zip archive.
+const MAX_ZIP_MODELS: usize = 500;
+
+fn from_import(m: &CosmicSlicer_import::geom::Mesh) -> Mesh {
+    let mut mesh = Mesh { vertices: m.positions().to_vec(), triangles: m.triangles().to_vec() };
+    mesh.sanitise();
+    mesh
+}
+
+/// Reads one model from `bytes`, its format from `name`'s extension.
+fn load_bytes(name: &str, bytes: &[u8], out: &mut LoadedFile) -> ModelResult<()> {
+    let stem = Path::new(name).file_name().and_then(|n| n.to_str()).unwrap_or("Object").to_owned();
+    let ext = Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+    match ext.as_str() {
+        "3mf" => {
+            // Each object (and each copy of it) on its own, as placed.
+            let p = threemf::read(bytes)?;
+            out.warnings.extend(p.warnings);
+            for o in &p.objects {
+                let (mesh, paint) = o.merged();
+                for inst in &o.instances {
+                    let mut placed = mesh.clone();
+                    for v in &mut placed.vertices {
+                        *v = inst.matrix.transform_point3(*v);
+                    }
+                    let name = if o.name.is_empty() { stem.clone() } else { o.name.clone() };
+                    let paint = (!paint.is_empty()).then(|| paint.clone());
+                    out.objects.push(Loaded { name, mesh: placed, paint });
+                }
+            }
+        }
+        "zip" => {
+            let z = CosmicSlicer_import::zip::Zip::open(bytes).map_err(|e| ModelError::Format(e.to_string()))?;
+            let names: Vec<String> = z.names().map(str::to_owned).collect();
+            let mut read = 0;
+            for entry in names {
+                let known = CosmicSlicer_import::ModelFormat::from_path(Path::new(&entry)).is_ok();
+                if !known || entry.ends_with('/') || entry.contains("__MACOSX") {
+                    continue;
+                }
+                read += 1;
+                if read > MAX_ZIP_MODELS {
+                    out.warnings.push(format!("only the first {MAX_ZIP_MODELS} models in the archive were read"));
+                    break;
+                }
+                let data = z.read(&entry).map_err(|e| ModelError::Format(e.to_string()))?;
+                if let Err(e) = load_bytes(&entry, &data, out) {
+                    out.warnings.push(format!("{entry}: {e}"));
+                }
+            }
+        }
+        _ => {
+            let options = CosmicSlicer_import::Options::default();
+            let (imported, _) =
+                CosmicSlicer_import::import_mesh_bytes(name, bytes, None, options).map_err(|e| match e {
+                    CosmicSlicer_import::ImportError::UnsupportedFormat(f) => ModelError::Unsupported(f.to_uppercase()),
+                    e => ModelError::Format(format!("{stem}: {e}")),
+                })?;
+            out.warnings.extend(imported.warnings);
+            out.objects.push(Loaded { name: stem, mesh: from_import(&imported.mesh), paint: None });
+        }
+    }
+    Ok(())
+}
+
+/// Reads a model file: STL, OBJ, 3MF, STEP, AMF and the other formats CosmicDMS reads, or a
+/// zip archive of them. Each object comes back as the file places it.
+pub fn load(path: &Path) -> ModelResult<LoadedFile> {
     let io = |source| ModelError::Io { path: path.display().to_string(), source };
     let len = std::fs::metadata(path).map_err(io)?.len();
     if len > MAX_FILE_BYTES {
         return Err(ModelError::Format(format!("{} is larger than 2 GB", path.display())));
     }
     let bytes = std::fs::read(path).map_err(io)?;
-    let mesh = match ext.as_str() {
-        "stl" => stl::parse(&bytes)?,
-        "obj" => obj::parse(&bytes)?,
-        other => return Err(ModelError::Unsupported(other.to_uppercase())),
-    };
-    if mesh.triangle_count() == 0 {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("model");
+    let mut out = LoadedFile::default();
+    load_bytes(name, &bytes, &mut out)?;
+    out.objects.retain(|o| o.mesh.triangle_count() > 0);
+    if out.objects.is_empty() {
         return Err(ModelError::Format(format!("{} has no triangles", path.display())));
     }
-    Ok(mesh)
+    Ok(out)
 }
 
 /// Placement of an object on the plate: scale, then rotate, then move.
@@ -102,6 +190,8 @@ pub struct Object {
     pub visible: bool,
     /// Settings this object overrides, by option key.
     pub overrides: Vec<(String, String)>,
+    /// Painted supports, seams and colours, by triangle of `mesh`.
+    pub paint: Option<Arc<Paint>>,
 }
 
 impl Object {
@@ -155,6 +245,7 @@ impl Model {
             plate,
             visible: true,
             overrides: Vec::new(),
+            paint: None,
         };
         object.drop_to_bed();
         self.objects.push(object);

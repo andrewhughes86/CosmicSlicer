@@ -15,6 +15,7 @@ end of every session (no crashes, tests and clippy clean, smoke tests cover new 
 | 6 | Walls | Variable-width thin walls and gap fill (medial axis), precise outer wall, wall direction, overhang degrees with Orca's speeds/fan/flow, make overhangs printable, bridge direction detection, internal and thick bridges, corner-aware seams, scarf seams, seam gap, staggered inner seams, role-based wipe, wipe on loops |
 | 7 | Infill and surfaces | Every Orca infill pattern as its own generator (incl. lightning, adaptive/support/quarter cubic, 3D and lateral honeycomb, lateral lattice, cross hatch, TPMS-D/FK, Hilbert, Archimedean, octagram, zig-zag variants, monotonic line), gyroid solved per layer as waves, anchors, infill combination, rotation templates, small-area filter, vertical shell thickness, top surface flow/density, extra perimeters on overhangs, ironing, fuzzy skin |
 | 8 | Supports | Grid and snug normal supports, tree supports (organic, slim, strong, hybrid) with trunk brims, top and bottom interfaces with every Orca pattern, top/bottom/xy/first-layer gaps, on build plate only, critical regions only, enforce layers, rafts, per-object brims (outer, inner, both, mouse ears), support enforcer/blocker volumes and painted support in the engine |
+| 9 | Project files and import | 3MF projects in OrcaSlicer's layout (plates, objects and copies, per-object and per-plate settings, presets by name with edits, painted data, thumbnails), Orca / Bambu / plain 3MF opened; CosmicDMS's readers vendored (STEP, IGES, SAT, AMF, PLY, OFF, glTF, COLLADA, VRML, X3D, 3DS, DXF), zip archives, multi-object 3MF import, inches prompt, recent projects with thumbnails |
 
 ## Order, and why
 Get a user's own printer printing well and safely first (profiles, correct motion G-code,
@@ -43,7 +44,7 @@ CI comes early because the Windows and macOS builds are not yet checked by anyth
 | 19 | Parity check against OrcaSlicer on a reference set | 6–14 |
 | 20 | Packaging and release for all three platforms | 3, 18 |
 
-12 more sessions. Session 13 can come earlier; 17 can be split up and done between others.
+11 more sessions. Session 13 can come earlier; 17 can be split up and done between others.
 
 ---
 
@@ -162,15 +163,31 @@ painted brims (session 11, with the painting tools), leading-edge-only brims and
 object in by-object printing (session 13), support ironing and small-perimeter support speed
 (session 19).
 
-## 9 · Project files and import
-- 3MF read and write compatible with OrcaSlicer and Bambu Studio: plates, objects, parts,
-  transforms, per-object and per-plate settings, filament list and colours, painted data,
-  thumbnails; open Orca projects and have Orca open ours.
-- Import STEP (from CosmicDMS's reader), AMF, colour OBJ, 3MF models from other slicers, ZIP of
-  models, SVG to emboss; drag in multiple files; "seems to be in inches" and huge-mesh prompts.
-- Recent projects with thumbnails on Home.
+## 9 · Project files and import — done
+- 3MF projects (`model::threemf`, `ui-egui/project.rs`) in OrcaSlicer's layout: each object's
+  parts in `3D/Objects/object_N.model` as components of the main object, build items for every
+  copy, `Metadata/model_settings.config` (names, filaments, part types, per-object settings,
+  plates with their name, lock, plate type, sequence, spiral and objects), Orca's
+  `project_settings.config` JSON (every printer, process and filament value, filament values as
+  one list entry per filament, preset names, inherits and changed keys), plate thumbnails, and
+  the painted facets as Orca's encoded strings (`paint_supports`, `paint_seam`, `paint_color`),
+  kept as they are; painted supports reach the engine.
+- Opening selects presets by name — installed, then the library — and keeps the project's
+  changed values as unsaved edits; a preset found nowhere becomes a project preset.
+- Plain 3MF from other programs (inline meshes, nested components, units) opens or imports.
+- CosmicDMS's readers vendored as `crates/import`: STL, OBJ, PLY, OFF, 3MF, AMF, glTF,
+  COLLADA, VRML, X3D, 3DS, DXF, STEP, IGES and ACIS SAT; zip archives of models; multi-object
+  files keep their layout; Open Project / Save / Save As (Ctrl+Shift+S); dropped and recent
+  `.3mf` files open as projects; the "seems to be in inches" prompt and a huge-mesh warning;
+  recent projects on Home show their plate thumbnail.
 
-**Done when:** a project saved by Orca reopens here with the same plates and settings, and back.
+Not verified: no OrcaSlicer or Bambu Studio project files were on this machine, so opening
+theirs is tested on files written in their layout, not on files they wrote. CosmicSlicer
+writes itself as the project's application; OrcaSlicer may take that as a non-Orca 3MF and
+load the geometry only. Check both directions with real files (session 19).
+
+Moved on: modifier, negative and support parts (left out with a warning; session 10), colour
+OBJ (session 12), SVG import (session 11, with emboss).
 
 ## 10 · Object model
 - Objects with parts, modifiers, negative volumes, support enforcers/blockers; instances.

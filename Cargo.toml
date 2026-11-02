@@ -4,6 +4,7 @@ members = [
     "apps/CosmicSlicer",
     "crates/config",
     "crates/engine",
+    "crates/import",
     "crates/model",
     "crates/ui-egui",
 ]
@@ -29,6 +30,7 @@ unreachable = "deny"
 [workspace.dependencies]
 CosmicSlicer-config = { path = "crates/config" }
 CosmicSlicer-engine = { path = "crates/engine" }
+CosmicSlicer-import = { path = "crates/import" }
 CosmicSlicer-model = { path = "crates/model" }
 CosmicSlicer-ui-egui = { path = "crates/ui-egui" }
 
@@ -42,12 +44,14 @@ i_overlay = { version = "9.1", default-features = false }
 log = "0.4"
 miniz_oxide = "0.8"
 png = "0.18"
+quick-xml = "0.41"
 rayon = "1.10"
 regex = { version = "1.11", default-features = false, features = ["std", "unicode-perl", "unicode-case"] }
 resvg = { version = "=0.48.1", default-features = false }
 rfd = "0.17.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+spade = "2.15"
 thiserror = "2"
 wgpu = { version = "30", default-features = false }
 
@@ -59,6 +63,12 @@ debug = "line-tables-only"
 opt-level = 2
 
 [profile.dev.package.CosmicSlicer-engine]
+opt-level = 2
+
+[profile.dev.package.CosmicSlicer-import]
+opt-level = 2
+
+[profile.dev.package.spade]
 opt-level = 2
 
 [profile.dev.package.i_overlay]

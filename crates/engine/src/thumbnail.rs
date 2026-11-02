@@ -138,7 +138,8 @@ pub fn render(items: &[Item<'_>], w: u32, h: u32) -> Vec<u8> {
     rgba
 }
 
-fn png(rgba: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
+/// RGBA pixels as a PNG file.
+pub fn png(rgba: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     {
         let mut enc = png::Encoder::new(&mut out, w, h);

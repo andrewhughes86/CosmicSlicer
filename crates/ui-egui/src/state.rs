@@ -131,6 +131,13 @@ struct Snapshot {
 /// Most undo steps kept.
 const HISTORY: usize = 200;
 
+/// Triangles past which an import warns that slicing will be slow.
+const HUGE_MESH: usize = 2_000_000;
+
+/// Models smaller than this (mm³) look as though they were drawn in inches (OrcaSlicer's
+/// test).
+const INCHES_VOLUME: f32 = 9.0;
+
 pub struct Session {
     pub schema: &'static Schema,
     pub presets: PresetBundle,
@@ -165,6 +172,8 @@ pub struct Session {
     clipboard: Vec<CosmicSlicer_model::Object>,
     /// Per-plate settings (name, bed type, sequence), one per plate.
     pub plate_settings: Vec<PlateSettings>,
+    /// Objects just imported that look as if they are in inches, for the prompt.
+    pub units_prompt: Option<Vec<u64>>,
 }
 
 /// OrcaSlicer's "Customize current plate" settings.
@@ -211,6 +220,7 @@ impl Session {
             dirty: false,
             clipboard: Vec::new(),
             plate_settings: vec![PlateSettings::default()],
+            units_prompt: None,
         }
     }
 
@@ -411,29 +421,86 @@ impl Session {
         self.selection = vec![id];
     }
 
-    /// Imports a model file onto the current plate.
+    /// Imports a model file onto the current plate. A file of several objects (a 3MF, a zip)
+    /// keeps them as it laid them out, centred on the plate.
     pub fn import(&mut self, path: &Path) {
         match CosmicSlicer_model::load(path) {
-            Ok(mesh) => {
+            Ok(file) => {
                 self.checkpoint();
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("Object").to_owned();
-                let id = self.model.add(name, mesh, self.plate_centre(self.plate), self.plate);
-                self.place_clear_of_others(id);
-                self.selection = vec![id];
-                if self.project.name == "Untitled" && self.model.objects.len() == 1 {
+                for w in &file.warnings {
+                    self.notify(Level::Warning, w.clone());
+                }
+                let single = file.objects.len() == 1;
+                let group = file.objects.iter().fold(Aabb::EMPTY, |b, o| b.union(&o.mesh.bounds()));
+                let centre = self.plate_centre(self.plate);
+                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("Object").to_owned();
+                let mut ids = Vec::new();
+                let mut triangles = 0;
+                for o in file.objects {
+                    let rel = o.mesh.bounds().centre() - group.centre();
+                    let at = centre + Vec3::new(rel.x, rel.y, 0.0);
+                    let name = if single { file_name.clone() } else { o.name };
+                    triangles += o.mesh.triangle_count();
+                    let id = self.model.add(name, o.mesh, at, self.plate);
+                    if let (Some(paint), Some(obj)) = (o.paint, self.model.get_mut(id)) {
+                        obj.paint = Some(std::sync::Arc::new(paint));
+                    }
+                    ids.push(id);
+                }
+                if let [id] = ids.as_slice() {
+                    self.place_clear_of_others(*id);
+                }
+                if self.project.name == "Untitled" && self.model.objects.len() == ids.len() {
                     self.project.name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("Untitled").to_owned();
                 }
-                self.prefs.recent.retain(|p| p != path);
-                self.prefs.recent.insert(0, path.to_owned());
-                self.prefs.recent.truncate(12);
-                if !self.fits(id) {
+                self.remember(path);
+                if ids.iter().any(|id| !self.fits(*id)) {
                     self.notify(
                         Level::Warning,
                         "An object is laid over the boundary of the plate or exceeds the height limit.",
                     );
                 }
+                if triangles > HUGE_MESH {
+                    self.notify(
+                        Level::Warning,
+                        format!(
+                            "This model has {triangles} triangles; slicing it may be slow and use a lot of memory."
+                        ),
+                    );
+                }
+                // Tiny models were probably drawn in inches (OrcaSlicer asks the same).
+                let volume: f32 = ids.iter().filter_map(|id| self.model.get(*id)).map(|o| o.mesh.volume().abs()).sum();
+                if volume > 0.0 && volume < INCHES_VOLUME {
+                    self.units_prompt = Some(ids.clone());
+                }
+                self.selection = ids;
             }
             Err(e) => self.notify(Level::Error, e.to_string()),
+        }
+    }
+
+    /// Puts `path` at the top of the recent files.
+    pub fn remember(&mut self, path: &Path) {
+        self.prefs.recent.retain(|p| p != path);
+        self.prefs.recent.insert(0, path.to_owned());
+        self.prefs.recent.truncate(12);
+    }
+
+    /// Scales objects by `factor` about their own centres (inches to millimetres), resting
+    /// them on the plate again.
+    pub fn scale_objects(&mut self, ids: &[u64], factor: f32) {
+        if !(factor.is_finite() && factor > 0.0) {
+            return;
+        }
+        self.checkpoint();
+        for id in ids {
+            if let Some(o) = self.model.get_mut(*id) {
+                o.transform.scale *= factor;
+                o.drop_to_bed();
+            }
+        }
+        if let [id] = ids {
+            self.place_clear_of_others(*id);
         }
     }
 

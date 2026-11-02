@@ -100,6 +100,7 @@ impl Dialogs {
         self.small_windows(ctx, session, t);
         self.restore_window(ctx, t);
         self.preset_windows(ctx, session, t);
+        units_window(ctx, session, t);
     }
 
     fn editor_window(&mut self, ctx: &egui::Context, session: &mut Session, t: &Tokens) {
@@ -656,6 +657,10 @@ impl Dialogs {
         }
     }
 
+    pub fn close_units(session: &mut Session) -> bool {
+        session.units_prompt.take().is_some()
+    }
+
     fn restore_window(&mut self, ctx: &egui::Context, t: &Tokens) {
         let Some(o) = self.restore.clone() else { return };
         if self.restore_choice.is_some() {
@@ -858,3 +863,36 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
     ),
     ("Preview", &[("Up / Down", "Show one more / one fewer layer")]),
 ];
+
+/// "The object seems to be in inches": convert the imported objects to millimetres, or keep
+/// them as they are.
+fn units_window(ctx: &egui::Context, session: &mut Session, t: &Tokens) {
+    let Some(ids) = session.units_prompt.clone() else { return };
+    let mut open = true;
+    let mut answer = None;
+    Window::dialog("Object dimensions").show(ctx, t, &mut open, |ui| {
+        ui.set_width(440.0);
+        let size = ids.iter().filter_map(|id| session.model.get(*id)).fold(glam::Vec3::ZERO, |a, o| a.max(o.size()));
+        ui.label(format!(
+            "The imported object is only {:.2} × {:.2} × {:.2} mm. It seems to have been drawn in inches.",
+            size.x, size.y, size.z
+        ));
+        ui.add_space(4.0);
+        ui.label(RichText::new("Converting scales it by 25.4.").color(t.text_muted));
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if ui_kit::primary_button(ui, t, "Convert to millimetres").clicked() {
+                answer = Some(true);
+            }
+            if ui.button("Keep as it is").clicked() {
+                answer = Some(false);
+            }
+        });
+    });
+    if answer == Some(true) {
+        session.scale_objects(&ids, 25.4);
+    }
+    if answer.is_some() || !open {
+        session.units_prompt = None;
+    }
+}

@@ -45,6 +45,8 @@ struct ObjectEntry {
     plate: usize,
     visible: bool,
     overrides: Vec<(String, String)>,
+    #[serde(default)]
+    paint: Option<CosmicSlicer_model::Paint>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -96,6 +98,7 @@ pub fn encode(session: &Session) -> Vec<u8> {
             plate: o.plate,
             visible: o.visible,
             overrides: o.overrides.clone(),
+            paint: o.paint.as_deref().cloned(),
         });
     }
     let manifest = Manifest {
@@ -211,6 +214,7 @@ pub fn decode(bytes: &[u8]) -> Result<Restored, String> {
             plate: o.plate.min(plates - 1),
             visible: o.visible,
             overrides: o.overrides,
+            paint: o.paint.map(Arc::new),
         });
     }
     let mut presets = manifest.presets;

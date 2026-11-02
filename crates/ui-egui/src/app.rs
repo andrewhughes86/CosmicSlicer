@@ -453,15 +453,75 @@ impl CosmicSlicerApp {
 
     fn import_dialog(&mut self) {
         let files = rfd::FileDialog::new()
-            .set_title("Import 3MF/STL/STEP/SVG/OBJ/AMF")
-            .add_filter("Supported files", CosmicSlicer_model::IMPORT_EXTENSIONS)
+            .set_title("Import 3MF/STL/STEP/OBJ/AMF")
+            .add_filter("Supported files", &CosmicSlicer_model::import_extensions())
+            .add_filter("3MF", &["3mf"])
             .add_filter("STL", &["stl"])
+            .add_filter("STEP", &["step", "stp"])
             .add_filter("OBJ", &["obj"])
+            .add_filter("ZIP archive", &["zip"])
             .pick_files();
         for path in files.unwrap_or_default() {
             self.session.import(&path);
         }
         self.viewport.fit_pending = true;
+    }
+
+    /// Opens a 3MF project, replacing the current one (undoably); a 3MF holding only a model is
+    /// imported instead.
+    fn open_project(&mut self, path: &std::path::Path) {
+        if !crate::project::is_project_file(path) {
+            self.session.import(path);
+            self.viewport.fit_pending = true;
+            return;
+        }
+        match crate::project::open(&self.session, path) {
+            Ok((restored, warnings)) => {
+                crate::recovery::apply(&mut self.session, restored);
+                self.session.dirty = false;
+                self.session.page = Page::Prepare;
+                self.session.remember(path);
+                for w in warnings {
+                    self.session.notify(Level::Warning, w);
+                }
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("project").to_owned();
+                self.session.notify(Level::Info, format!("Opened {name}"));
+                self.viewport.fit_pending = true;
+            }
+            Err(e) => self.session.notify(Level::Error, e),
+        }
+    }
+
+    fn save_project(&mut self, path: &std::path::Path) {
+        let s = &mut self.session;
+        match crate::project::save(s, path) {
+            Ok(()) => {
+                s.project.path = Some(path.to_owned());
+                if let Some(stem) = path.file_stem().and_then(|n| n.to_str()) {
+                    s.project.name = stem.to_owned();
+                }
+                s.dirty = false;
+                s.remember(path);
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("project").to_owned();
+                s.notify(Level::Info, format!("Saved {name}"));
+            }
+            Err(e) => s.notify(Level::Error, e),
+        }
+    }
+
+    fn save_project_as(&mut self) {
+        let name = format!("{}.3mf", self.session.project.name.trim());
+        let picked = rfd::FileDialog::new()
+            .set_title("Save Project as")
+            .add_filter("Project (.3mf)", &["3mf"])
+            .set_file_name(name)
+            .save_file();
+        if let Some(mut path) = picked {
+            if !is_3mf(&path) {
+                path.set_extension("3mf");
+            }
+            self.save_project(&path);
+        }
     }
 
     /// Imports OrcaSlicer or CosmicSlicer preset files as user presets.
@@ -541,16 +601,27 @@ impl CosmicSlicerApp {
                 s.new_project();
                 self.viewport.fit_pending = true;
             }
-            Action::OpenProject | Action::SaveProject => {
-                s.notify(
-                    Level::Warning,
-                    "Project files (.3mf) arrive with the next step; use Import for STL and OBJ models.",
-                );
+            Action::OpenProject => {
+                let picked =
+                    rfd::FileDialog::new().set_title("Open Project").add_filter("Project (.3mf)", &["3mf"]).pick_file();
+                if let Some(path) = picked {
+                    self.open_project(&path);
+                }
             }
+            Action::OpenProjectPath(path) => self.open_project(&path),
+            Action::SaveProject => match s.project.path.clone().filter(|p| is_3mf(p)) {
+                Some(path) => self.save_project(&path),
+                None => self.save_project_as(),
+            },
+            Action::SaveProjectAs => self.save_project_as(),
             Action::Import => self.import_dialog(),
             Action::ImportPath(path) => {
-                s.import(&path);
-                self.viewport.fit_pending = true;
+                if is_3mf(&path) {
+                    self.open_project(&path);
+                } else {
+                    s.import(&path);
+                    self.viewport.fit_pending = true;
+                }
             }
             Action::ExportStl => self.export_stl(),
             Action::ExportGcode => {
@@ -638,7 +709,7 @@ impl CosmicSlicerApp {
             // With Ctrl: always, even in a text box, except the editing keys.
             take(ctrl, Key::N, "new");
             take(ctrl, Key::O, "open");
-            take(ctrl | shift, Key::S, "save");
+            take(ctrl | shift, Key::S, "save-as");
             take(ctrl, Key::S, "save");
             take(ctrl, Key::I, "import");
             take(ctrl, Key::R, "slice");
@@ -733,6 +804,7 @@ impl CosmicSlicerApp {
                 "new" => actions.push(Action::NewProject),
                 "open" => actions.push(Action::OpenProject),
                 "save" => actions.push(Action::SaveProject),
+                "save-as" => actions.push(Action::SaveProjectAs),
                 "import" => actions.push(Action::Import),
                 "slice" => actions.push(Action::Slice),
                 "export" => actions.push(Action::ExportGcode),
@@ -756,7 +828,7 @@ impl CosmicSlicerApp {
                 "delete-all" => s.delete_all(),
                 "delete" => s.delete_selected(),
                 "escape" => {
-                    if !self.dialogs.close_one() {
+                    if !self.dialogs.close_one() && !crate::dialogs::Dialogs::close_units(s) {
                         if self.viewport.tool.is_some() {
                             self.viewport.tool = None;
                         } else {
@@ -1055,6 +1127,10 @@ impl CosmicSlicerApp {
     }
 }
 
+fn is_3mf(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("3mf"))
+}
+
 #[cfg(test)]
 mod smoke {
     //! Draws every page, dialog, settings page and canvas tool headlessly, so a layout bug
@@ -1169,6 +1245,7 @@ mod smoke {
             age: 125,
             report: Some(PathBuf::from("/nonexistent/crash.txt")),
         });
+        app.session.units_prompt = Some(app.session.selection.clone());
         frames(&mut app, &ctx, 3);
         for page in [crate::wizard::WizardPage::Printers, crate::wizard::WizardPage::Filaments] {
             app.dialogs.wizard = Some(crate::wizard::Wizard::new(&app.session.prefs, page));
