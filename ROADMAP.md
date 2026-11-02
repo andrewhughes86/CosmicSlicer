@@ -22,6 +22,7 @@ end of every session (no crashes, tests and clippy clean, smoke tests cover new 
 | 13 | Layer height | Variable layer height tool (draw the curve, adaptive from surface slopes with a quality setting, smooth, reset), saved per object (3MF `layer_heights_profile.txt`); layer stacks from profiles and height ranges with `layer_height`; a continuous-Z spiral vase; each object's brim with it when printing one at a time |
 | 14 | Arrange, orient and plates | No-fit-polygon arrangement of convex footprints (spacing, auto rotate, excluded bed area, prime tower), arrange selection / plate / all plates, overflow and new objects onto new plates; auto orient by overhang and contact area; shared instances (+ / −, 3MF one object placed many times); prime tower drawn and dragged on the canvas, per plate; slice all, export every plate's G-code, Preview plate strip with thumbnails |
 | 15 | Printer connections | Physical printers with Orca's host types; upload / upload-and-print to OctoPrint, Klipper (Moonraker), PrusaLink (digest or key, storage choice), Duet, Repetier, AstroBox, ESP3D, MKS, FlashAir; Bambu Lab printers in LAN mode (MQTT status and control, FTPS upload, `.gcode.3mf`, SSDP discovery, P1/A1 camera); live Device page (state, progress, temperatures, pause/resume/stop, jog, fan, speed, camera) and Multi-device list; every connection on its own thread |
+| 16 | Calibration | Every Orca calibration: temperature tower, flow rate (pass 1 and 2, YOLO and perfectionist), pressure advance (line, pattern, tower), retraction tower, max volumetric speed, VFA, input shaping frequency and damping, cornering (jerk / junction deviation); Orca's models, settings and per-layer changes; results saved into the filament or printer preset |
 
 ## Order, and why
 Get a user's own printer printing well and safely first (profiles, correct motion G-code,
@@ -50,7 +51,7 @@ CI comes early because the Windows and macOS builds are not yet checked by anyth
 | 19 | Parity check against OrcaSlicer on a reference set | 6–14 |
 | 20 | Packaging and release for all three platforms | 3, 18 |
 
-5 more sessions. 17 can be split up and done between others.
+4 more sessions. 17 can be split up and done between others.
 
 ---
 
@@ -388,13 +389,38 @@ Repetier and the other upload-only hosts; PrusaConnect, Obico, SimplyPrint, Crea
 Flashforge and Elegoo Link; an AMS slot mapping editor; sending one plate to several printers
 from Multi-device; tying physical printers to printer presets; a custom HTTPS CA file.
 
-## 16 · Calibration
-- Orca's calibration prints, generated with their settings: temperature tower, flow rate
-  (coarse/fine and YOLO), pressure advance (line, pattern, tower), retraction tower, max
-  volumetric speed, VFA, input shaping frequency and damping, cornering (jerk/junction).
-- Results written back into the filament or printer preset.
+## 16 · Calibration — done
+- The Calibration menu as OrcaSlicer's: Temperature; Flow rate (Pass 1, Pass 2, YOLO,
+  YOLO perfectionist); Pressure advance (Line, Pattern, Tower); Retraction test; Max
+  flowrate; VFA; Input shaping frequency and damping; Cornering. Each opens a dialog with
+  Orca's defaults (the temperature range by filament type, junction deviation or jerk by
+  firmware), replaces the project with the test, and then asks what was read off the print.
+- The tests are set up as Orca's Plater does: Orca's models (packed into `assets/calib/` by
+  `tools/pack_calib_models.py`), cut to the range asked for (the temperature tower to its
+  blocks, the others to their height), scaled to the nozzle, and the settings each needs as
+  edits to the presets or as the object's own settings (the flow blocks each with its
+  `print_flow_ratio`, which the engine now honours per object).
+- Engine (`calib`): Orca's per-layer stepping (`interpolate_value_across_layers`) for
+  temperature, pressure advance, retraction length, outer wall speed (VFA, and max volumetric
+  speed converted to mm/s for the test's line), input shaping (Klipper `SET_INPUT_SHAPER`,
+  Marlin 2 / RepRapFirmware `M593`) and cornering (`M205 J`, Klipper's square corner
+  velocity, jerk); the PA line and pattern are drawn as toolpaths (each line or corner its own
+  island with its PA value; Orca's seven-segment numbers), so the Preview, the estimate and the
+  start and end G-code are as for any print.
+- Results saved into the presets as edits: nozzle temperature, flow ratio (×(100+n)% for the
+  passes, +n for YOLO), pressure advance (the tower's from the measured height), retraction
+  length, max volumetric speed, input shaper frequency and damping, junction deviation or jerk.
+  VFA has nothing to save (its instructions say what to look for).
+- Checked by tests: every test sets up, fits the plate, slices, and its G-code carries its
+  changes (falling `M104`s 5 °C apart, growing retractions all given back, a PA command per
+  line or layer, input shaper and cornering commands); results land in the right presets; the
+  temperature tower is cut to nine blocks for 230–190 °C; the flow blocks get Orca's ratios.
+- `--calibrate <test>` sets a test up from the command line (screenshots).
 
-**Done when:** every Calibration menu item produces the print and its instructions.
+Not like Orca yet (moved to session 19): the PA pattern has no frame round it and prints its
+numbers on its last layer; Orca's PA test option for bed-mesh accelerations and speeds; the
+"Orca tolerance test"; belt-printer variants; the calibration tab's guided flow for Bambu
+printers (their automatic calibration needs Bambu's network plugin).
 
 ## 17 · App completeness
 - Full Preferences (all of Orca's pages that apply), every Orca keyboard shortcut, 3Dconnexion.
@@ -428,6 +454,8 @@ from Multi-device; tying physical printers to printer presets; a custom HTTPS CA
   Orca's settings to get `wall_filament`, `sparse_infill_filament`, `solid_infill_filament`).
 - From session 13: per-object layer stacks; independent support layer height; spiral vase
   XY smoothing; leading-edge-only brims; the layer profile drawn beside the object.
+- From session 16: the PA pattern's frame and Orca's numbering layout; the PA test's
+  acceleration/speed lists; the tolerance test.
 - From session 15: WebRTC and X1 (RTSP) cameras; live status for Duet, Repetier and the other
   upload-only hosts; PrusaConnect, Obico, SimplyPrint, CrealityPrint, Flashforge, Elegoo Link;
   AMS mapping editor; one plate to several printers; physical printers tied to presets;

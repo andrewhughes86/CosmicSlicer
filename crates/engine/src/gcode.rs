@@ -91,6 +91,8 @@ pub struct Context<'a> {
     pub thumbnails: String,
     /// Pauses, colour changes and custom G-code by height.
     pub events: &'a [(f64, LayerEvent)],
+    /// A calibration print's per-layer changes.
+    pub calib: Option<&'a crate::calib::Calib>,
 }
 
 /// Something asked for at a layer from the layer slider.
@@ -236,6 +238,10 @@ enum Op {
 
 struct Writer<'a> {
     cx: &'a Context<'a>,
+    /// What a calibration print changes on the current layer.
+    calib: crate::calib::LayerCalib,
+    /// How far the filament was drawn back by the last retraction.
+    retracted_by: f64,
     ops: Vec<Op>,
     pos: DVec3,
     retracted: bool,
@@ -379,8 +385,17 @@ impl<'a> Writer<'a> {
         self.s().retract.z_hop > 0.0 && z >= m.lift_above && (m.lift_below <= 0.0 || z <= m.lift_below)
     }
 
+    /// The retraction settings, with the retraction tower's length for this layer.
+    fn retraction(&self) -> crate::settings::Retract {
+        let mut r = self.s().retract;
+        if let Some(l) = self.calib.retract_length {
+            r.length = l;
+        }
+        r
+    }
+
     fn retract(&mut self) {
-        let r = self.s().retract;
+        let r = self.retraction();
         if self.retracted || r.length <= 0.0 {
             return;
         }
@@ -434,6 +449,7 @@ impl<'a> Writer<'a> {
             }
         }
         self.retracted = true;
+        self.retracted_by = r.length;
         self.last_path.clear();
     }
 
@@ -448,14 +464,15 @@ impl<'a> Writer<'a> {
     }
 
     fn unretract(&mut self) {
-        let r = self.s().retract;
+        let r = self.retraction();
         if self.hop > 0.0 {
             let to = DVec3::new(self.pos.x, self.pos.y, self.print_z);
             self.mv(to, 0.0, self.s().speeds.travel_z.max(5.0), MoveKind::Travel);
             self.hop = 0.0;
         }
         if self.retracted {
-            let length = r.length + self.s().motion.restart_extra;
+            // What was taken back, even if the length changed since (the retraction tower).
+            let length = self.retracted_by + self.s().motion.restart_extra;
             if self.s().motion.firmware_retraction {
                 self.ops.push(Op::FirmwareRetract { retract: false, length, feed: r.deretract_speed });
             } else {
@@ -717,6 +734,11 @@ impl<'a> Writer<'a> {
             self.line(format!(";WIDTH:{}", f3(path.width)));
         }
         let mut base = path.speed;
+        if path.role == Role::OuterWall
+            && let Some(v) = self.calib.outer_speed
+        {
+            base = v;
+        }
         let mut flow = path.flow;
         if deg > 0 && s.walls.overhang_speed {
             base = match s.walls.overhang_speeds.get(usize::from(deg) - 1) {
@@ -1099,6 +1121,10 @@ impl<'a> Writer<'a> {
     }
 
     fn island(&mut self, island: &Island, object: usize) {
+        if let Some(k) = island.pressure_advance {
+            let line = crate::calib::pressure_advance(self.s().motion.flavor, k, self.extruder);
+            self.line(line);
+        }
         // Arriving uses the plain rules; travel within the island uses its region from the
         // first extrusion on.
         self.region = None;
@@ -1442,6 +1468,8 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
     let n_ext = cx.filaments.len().max(1);
     let mut w = Writer {
         cx,
+        calib: Default::default(),
+        retracted_by: 0.0,
         ops: Vec::with_capacity(plans.len() * 2000),
         pos: DVec3::ZERO,
         retracted: false,
@@ -1643,6 +1671,13 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         let after = render("Layer change G-code", &s.gcode.layer_change, &layer_vars);
         if !after.trim().is_empty() {
             w.line(after.trim_end().to_owned());
+        }
+        if let Some(c) = cx.calib {
+            let jd = s.motion.limits.junction_deviation > 0.0;
+            w.calib = c.layer(li, plans.len(), plan.print_z, s.motion.flavor, w.extruder, jd);
+            for g in w.calib.gcode.clone() {
+                w.line(g);
+            }
         }
         // After the first layer: printing temperatures.
         if li == 1 {

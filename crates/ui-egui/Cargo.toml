@@ -21,6 +21,7 @@ egui-wgpu = { workspace = true }
 epaint_default_fonts = { workspace = true }
 glam = { workspace = true }
 log = { workspace = true }
+miniz_oxide = { workspace = true }
 png = { workspace = true }
 resvg = { workspace = true }
 rfd = { workspace = true }

@@ -199,21 +199,32 @@ pub fn view_menu(ui: &mut Ui, session: &mut Session, actions: &mut Vec<Action>) 
 }
 
 pub fn calibration_menu(ui: &mut Ui, actions: &mut Vec<Action>) {
-    for name in ["Temperature", "Max flowrate", "Pressure advance", "Flow ratio", "Retraction", "Cornering"] {
-        if menu_item(ui, name, "", true) {
-            actions.push(Action::Calibration(name));
+    use crate::calibration::Test;
+    let mut item = |ui: &mut Ui, label: &str, test: Test| {
+        if menu_item(ui, label, "", true) {
+            actions.push(Action::Calibration(test.label()));
         }
-    }
-    ui.menu_button("Input Shaping", |ui| {
-        for name in ["Input Shaping Frequency", "Input Shaping Damping/zeta factor"] {
-            if menu_item(ui, name, "", true) {
-                actions.push(Action::Calibration(name));
-            }
-        }
+    };
+    item(ui, "Temperature", Test::Temperature);
+    ui.menu_button("Flow rate", |ui| {
+        item(ui, "Pass 1", Test::FlowPass1);
+        item(ui, "Pass 2", Test::FlowPass2);
+        item(ui, "YOLO (Recommended)", Test::FlowYolo);
+        item(ui, "YOLO (perfectionist version)", Test::FlowYoloFine);
     });
-    if menu_item(ui, "VFA", "", true) {
-        actions.push(Action::Calibration("VFA"));
-    }
+    ui.menu_button("Pressure advance", |ui| {
+        item(ui, "Line", Test::PaLine);
+        item(ui, "Pattern", Test::PaPattern);
+        item(ui, "Tower", Test::PaTower);
+    });
+    item(ui, "Retraction test", Test::Retraction);
+    item(ui, "Max flowrate", Test::MaxFlow);
+    item(ui, "VFA", Test::Vfa);
+    ui.menu_button("Input Shaping", |ui| {
+        item(ui, "Input Shaping Frequency", Test::ShaperFreq);
+        item(ui, "Input Shaping Damping/zeta factor", Test::ShaperDamp);
+    });
+    item(ui, "Cornering", Test::Cornering);
     ui.separator();
     if menu_item(ui, "Calibration Guide", "", true) {
         actions.push(Action::OpenUrl("https://github.com/SoftFever/OrcaSlicer/wiki/Calibration"));

@@ -87,6 +87,7 @@ dependencies = [
  "epaint_default_fonts",
  "glam",
  "log",
+ "miniz_oxide 0.8.9",
  "png",
  "resvg",
  "rfd",

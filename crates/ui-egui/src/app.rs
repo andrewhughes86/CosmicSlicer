@@ -540,6 +540,19 @@ impl CosmicSlicerApp {
             }
             Step::Open(path) => actions.push(Action::ImportPath(path)),
             Step::Arrange => self.session.arrange(false),
+            Step::Calibrate(name) => {
+                let test = crate::calibration::Test::ALL.into_iter().find(|t| t.label().eq_ignore_ascii_case(&name));
+                match test {
+                    Some(t) => {
+                        let d = crate::calibration::Dialog::new(t, &self.session);
+                        if let Err(e) = crate::calibration::set_up(&mut self.session, &d) {
+                            eprintln!("--calibrate: {e}");
+                        }
+                        self.viewport.fit_pending = true;
+                    }
+                    None => eprintln!("--calibrate: there is no calibration called {name}"),
+                }
+            }
             Step::SelectAll => self.session.select_all(),
             Step::Theme(name) => {
                 self.session.prefs.theme = if name.eq_ignore_ascii_case("light") { Theme::Light } else { Theme::Dark };
@@ -866,7 +879,10 @@ impl CosmicSlicerApp {
             Action::Preferences => self.dialogs.preferences = true,
             Action::About => self.dialogs.about = true,
             Action::Shortcuts => self.dialogs.shortcuts = true,
-            Action::Calibration(name) => self.dialogs.calibration = Some(name),
+            Action::Calibration(name) => {
+                self.dialogs.calibration =
+                    crate::calibration::Test::from_name(name).map(|t| crate::calibration::Dialog::new(t, s));
+            }
             Action::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
             Action::View(v) => self.viewport.set_view(v),
             Action::ZoomFit => self.viewport.fit_pending = true,
@@ -1320,6 +1336,10 @@ impl CosmicSlicerApp {
             }
         }
         self.dialogs.show(&ctx, &mut self.session, tokens, &mut self.device);
+        if std::mem::take(&mut self.dialogs.calibration_ready) {
+            self.session.page = Page::Prepare;
+            self.viewport.fit_pending = true;
+        }
         if std::mem::take(&mut self.dialogs.export_requested) {
             actions.push(Action::ExportGcode);
         }
@@ -1482,7 +1502,7 @@ mod smoke {
         d.plate = Some(0);
         d.physical_printer = true;
         d.flushing = true;
-        d.calibration = Some("Temperature");
+        d.calibration = Some(crate::calibration::Dialog::new(crate::calibration::Test::Temperature, &app.session));
         d.rename = Some((1, "Renamed".into()));
         d.bed_shape = Some([220.0, 220.0, 0.0, 0.0]);
         d.print = true;
@@ -1705,5 +1725,23 @@ mod smoke {
         let text = body.map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
         assert!(text.contains("filename=\"Untitled_plate_1.gcode\""), "no upload arrived");
         assert!(text.contains("name=\"print\"\r\n\r\ntrue") && text.contains("G1 "), "{}", text.len());
+    }
+
+    #[test]
+    fn every_calibration_dialog_draws() {
+        use crate::calibration::{Dialog, Test};
+        let ctx = egui::Context::default();
+        let mut app = app_with_objects();
+        for test in Test::ALL {
+            for printed in [false, true] {
+                let mut d = Dialog::new(test, &app.session);
+                d.printed = printed;
+                app.dialogs.calibration = Some(d);
+                frames(&mut app, &ctx, 2);
+            }
+        }
+        // The menu's names reach the dialog.
+        app.handle(&ctx, Action::Calibration(Test::PaPattern.label()));
+        assert!(app.dialogs.calibration.as_ref().is_some_and(|d| d.test == Test::PaPattern));
     }
 }

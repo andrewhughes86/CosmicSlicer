@@ -112,6 +112,7 @@ pub fn job(session: &Session, plate: usize) -> Job {
         })
         .unwrap_or_default();
     Job {
+        calib: session.calib.clone(),
         printer: p.effective(TabKind::Printer, 0),
         process,
         filaments,

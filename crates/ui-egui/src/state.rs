@@ -280,6 +280,8 @@ pub struct Session {
     pub plate_settings: Vec<PlateSettings>,
     /// Objects just imported that look as if they are in inches, for the prompt.
     pub units_prompt: Option<Vec<u64>>,
+    /// The calibration this project prints (set up from the Calibration menu).
+    pub calib: Option<CosmicSlicer_engine::calib::Calib>,
     /// What each group of instances shared when last in step, to see which one was edited.
     instance_sigs: std::collections::HashMap<u64, u64>,
 }
@@ -348,6 +350,7 @@ impl Session {
             dirty: false,
             clipboard: Vec::new(),
             plate_settings: vec![PlateSettings::default()],
+            calib: None,
             instance_sigs: std::collections::HashMap::new(),
             units_prompt: None,
         }
@@ -1695,6 +1698,7 @@ impl Session {
         self.locked = vec![false];
         self.plate_settings = vec![PlateSettings::default()];
         self.project = ProjectInfo { name: "Untitled".into(), ..Default::default() };
+        self.calib = None;
         self.dirty = false;
     }
 

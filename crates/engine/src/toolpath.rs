@@ -211,6 +211,8 @@ pub struct Island {
     pub seam_block: Vec<crate::geom::Shape>,
     /// The filament (0-based) when not the object's: a painted colour region.
     pub extruder: Option<usize>,
+    /// Pressure advance to set before printing it (the calibration tests).
+    pub pressure_advance: Option<f64>,
 }
 
 /// Everything printed on one layer.

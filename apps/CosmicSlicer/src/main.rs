@@ -23,6 +23,8 @@ const USAGE: &str = "usage: CosmicSlicer [model.stl ...] [options]
                           add a part, modifier, negative, enforcer or blocker to the last
                           object (e.g. modifier:cube), or a height range (range)
   --arrange               arrange the plate
+  --calibrate <test>      set up a calibration print with its defaults, named as in the
+                          Calibration menu (Temperature, 'Pressure advance: Pattern', ...)
   --select-all            select every object
   --theme <dark|light>    use this theme
   --dialog <name>         open preferences, printer, filament, process, compare, shortcuts or about
@@ -72,6 +74,7 @@ fn main() -> ExitCode {
                 .and_then(|v| v.parse().map(Step::Layer).map_err(|_| format!("--layer needs a number, not {v}"))),
             "--export" => value("--export").map(|p| Step::Export(PathBuf::from(p))),
             "--arrange" => Ok(Step::Arrange),
+            "--calibrate" => value("--calibrate").map(Step::Calibrate),
             "--select-all" => Ok(Step::SelectAll),
             "--advanced" => Ok(Step::Advanced),
             "--slice" => Ok(Step::Slice),

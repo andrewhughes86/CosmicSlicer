@@ -12,6 +12,7 @@
 
 mod app;
 pub mod automation;
+mod calibration;
 mod devices;
 mod dialogs;
 mod emboss;

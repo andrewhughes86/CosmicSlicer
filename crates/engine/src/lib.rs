@@ -12,6 +12,7 @@
 #![allow(non_snake_case)]
 
 pub mod arcs;
+pub mod calib;
 pub mod fuzzy;
 pub mod gcode;
 pub mod gcodeview;
@@ -137,6 +138,8 @@ pub struct Job {
     pub plate_name: String,
     /// Pauses, colour changes and custom G-code by print height (mm).
     pub events: Vec<(f64, LayerEvent)>,
+    /// A calibration print (OrcaSlicer's Calibration menu).
+    pub calib: Option<calib::Calib>,
 }
 
 /// Shared with the UI while a slice runs: how far along, what stage, and a stop button.
@@ -365,11 +368,20 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
             let heights: Vec<f64> = layers.iter().map(|l| l.height).collect();
             overhang::make_printable(&mut slices, &heights, angle);
         }
-        let islands = if o.color_paint.is_empty() {
+        let mut islands = if o.color_paint.is_empty() {
             plan::object(&slices, &layers, &os, &regions, &cancelled)
         } else {
             coloured(o, p, &slices, &layers, &os, &regions, filaments.len(), &cancelled)
         };
+        // OrcaSlicer's per-object flow ratio (the flow calibration's blocks).
+        let ratio = cfg.get(schema, "print_flow_ratio").trim().parse::<f64>().ok().filter(|r| r.is_finite());
+        if let Some(r) = ratio.map(|r| r.clamp(0.1, 3.0)).filter(|r| (r - 1.0).abs() > 1e-9) {
+            for path in
+                islands.iter_mut().flatten().flat_map(|i| i.walls.iter_mut().flatten().chain(i.fills.iter_mut()))
+            {
+                path.flow *= r;
+            }
+        }
         if cancelled() {
             return Err(SliceError::Cancelled);
         }
@@ -597,6 +609,30 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
             .collect();
         thumbnail::blocks(&items, &specs)
     };
+    // The pressure advance line and pattern are drawn where their placeholder stands.
+    if let Some(c) = job.calib.as_ref().filter(|c| c.drawn()) {
+        let b = placed.first().map(|p| {
+            let (lo, hi) = p
+                .vertices
+                .iter()
+                .fold((glam::DVec2::splat(f64::INFINITY), glam::DVec2::splat(f64::NEG_INFINITY)), |(a, b), v| {
+                    (a.min(v.truncate()), b.max(v.truncate()))
+                });
+            (lo, hi)
+        });
+        let (at, room) = match b {
+            Some((lo, hi)) if lo.is_finite() && hi.is_finite() => (lo, hi - lo),
+            _ => (glam::DVec2::new(lo[0] + 10.0, lo[1] + 10.0), glam::DVec2::new(size[0] - 20.0, size[1] - 20.0)),
+        };
+        plans = match c.mode {
+            calib::Mode::PaLine => {
+                let fast = s.speeds.outer.max(20.0);
+                let slow = (fast / 5.0).max(10.0);
+                calib::pa_line(c, &s, at, glam::DVec2::new(room.x, room.y.max(40.0)), fast, slow)
+            }
+            _ => calib::pa_pattern(c, &s, at, glam::DVec2::new(room.x.max(60.0), room.y)),
+        };
+    }
     let cx = gcode::Context {
         settings: &s,
         filaments: &filaments,
@@ -607,6 +643,7 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
         plate_name: job.plate_name.clone(),
         thumbnails,
         events: &job.events,
+        calib: job.calib.as_ref(),
     };
     let out = gcode::emit(&plans, &cx);
     if let Some(e) = out.error {
@@ -937,6 +974,7 @@ mod tests {
             objects,
             plate_name: "Plate 1".into(),
             events: Vec::new(),
+            calib: None,
         }
     }
 
@@ -1023,6 +1061,63 @@ mod tests {
     }
 
     /// Slices, checks the G-code reads back with the same time, and returns it.
+    #[test]
+    fn calibration_towers_step_their_values_up_the_layers() {
+        use calib::{Calib, Mode};
+        // A temperature tower from 230 down to 210: falling M104s, 5 apart.
+        let mut j = job(vec![cube(Vec3::new(100.0, 100.0, 0.0), 10.0)]);
+        j.calib = Some(Calib::new(Mode::TempTower, 230.0, 210.0, 5.0));
+        let Some(out) = sliced(&j) else { return };
+        let temps: Vec<i64> = out
+            .gcode
+            .lines()
+            .filter(|l| l.ends_with("; temperature tower"))
+            .filter_map(|l| l.strip_prefix("M104 S")?.split(' ').next()?.parse().ok())
+            .collect();
+        assert_eq!(temps.first(), Some(&230));
+        assert_eq!(temps.last(), Some(&210));
+        assert!(temps.windows(2).all(|w| w[1] <= w[0] && (w[0] - w[1]) % 5 == 0), "{temps:?}");
+        // A retraction tower: retractions grow with height, and every one is given back.
+        let mut j = job(vec![cube(Vec3::new(60.0, 100.0, 0.0), 6.0), cube(Vec3::new(140.0, 100.0, 0.0), 6.0)]);
+        j.process.set("retraction_length", "0.8");
+        j.calib = Some(Calib::new(Mode::Retraction, 0.2, 1.0, 0.2));
+        let Some(out) = sliced(&j) else { return };
+        let lengths: Vec<f64> =
+            out.gcode.lines().filter_map(|l| l.split("length:").nth(1)?.trim().parse().ok()).collect();
+        assert!(lengths.first().is_some_and(|l| (*l - 0.2).abs() < 1e-6), "{lengths:?}");
+        assert!(lengths.last().is_some_and(|l| (*l - 1.2).abs() < 1e-6), "{lengths:?}");
+        // A PA tower sets pressure advance on every layer.
+        let mut j = job(vec![cube(Vec3::new(100.0, 100.0, 0.0), 6.0)]);
+        j.printer.set("gcode_flavor", "klipper");
+        j.calib = Some(Calib::new(Mode::PaTower, 0.0, 0.1, 0.002));
+        let Some(out) = sliced(&j) else { return };
+        let n = out.gcode.lines().filter(|l| l.starts_with("SET_PRESSURE_ADVANCE")).count();
+        assert!(n >= 29, "{n}");
+    }
+
+    #[test]
+    fn pressure_advance_line_and_pattern_are_drawn() {
+        use calib::{Calib, Mode};
+        // The placeholder only says where; the lines replace it.
+        let mut plate = cube(Vec3::new(30.0, 30.0, 0.0), 1.0);
+        plate.matrix =
+            Mat4::from_translation(Vec3::new(30.0, 30.0, 0.0)) * Mat4::from_scale(Vec3::new(160.0, 150.0, 0.2));
+        let mut j = job(vec![plate.clone()]);
+        j.printer.set("gcode_flavor", "klipper");
+        j.calib = Some(Calib::new(Mode::PaLine, 0.0, 0.07, 0.002));
+        let Some(out) = sliced(&j) else { return };
+        let pa: Vec<&str> = out.gcode.lines().filter(|l| l.starts_with("SET_PRESSURE_ADVANCE")).collect();
+        // 36 values, plus the anchor lines and numbers at no PA.
+        assert!(pa.len() >= 36, "{}", pa.len());
+        assert!(pa.iter().any(|l| l.ends_with("ADVANCE=0.07")), "{pa:?}");
+        assert_eq!(out.stats.layers, 2);
+        let mut j = job(vec![plate]);
+        j.calib = Some(Calib::new(Mode::PaPattern, 0.0, 0.08, 0.005));
+        let Some(out) = sliced(&j) else { return };
+        assert_eq!(out.stats.layers, 4);
+        assert!(out.gcode.lines().filter(|l| l.starts_with("M900 K")).count() >= 17 * 4);
+    }
+
     fn sliced(j: &Job) -> Option<Sliced> {
         let out = slice(j, &Progress::default());
         assert!(out.is_ok(), "{:?}", out.as_ref().err());

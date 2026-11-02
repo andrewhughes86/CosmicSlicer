@@ -24,6 +24,8 @@ pub enum Step {
     Open(PathBuf),
     /// Arrange the current plate.
     Arrange,
+    /// Set up a calibration test with its defaults, by its menu name ("Temperature", ...).
+    Calibrate(String),
     /// Select every object.
     SelectAll,
     /// Use the light or dark theme.

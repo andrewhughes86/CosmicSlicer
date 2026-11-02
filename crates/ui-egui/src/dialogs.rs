@@ -46,7 +46,9 @@ pub struct Dialogs {
     pub plate: Option<usize>,
     pub physical_printer: bool,
     pub flushing: bool,
-    pub calibration: Option<&'static str>,
+    pub calibration: Option<crate::calibration::Dialog>,
+    /// A calibration test was just set up: show it.
+    pub calibration_ready: bool,
     pub rename: Option<(u64, String)>,
     /// Bed shape: (width, depth, origin x, origin y).
     pub bed_shape: Option<[f32; 4]>,
@@ -1039,18 +1041,12 @@ impl Dialogs {
             });
             self.flushing = open;
         }
-        if let Some(name) = self.calibration {
-            let mut open = true;
-            Window::dialog(format!("{name} calibration")).show(ctx, t, &mut open, |ui| {
-                ui.set_width(420.0);
-                ui.label(format!(
-                    "The {} calibration builds a test print and slices it. It arrives with the slicing engine.",
-                    name.to_lowercase()
-                ));
+        if let Some(mut d) = self.calibration.take() {
+            let (mut open, mut keep) = (true, true);
+            Window::dialog(format!("{} calibration", d.test.label())).show(ctx, t, &mut open, |ui| {
+                calibration_body(ui, session, t, &mut d, &mut keep, &mut self.calibration_ready);
             });
-            if !open {
-                self.calibration = None;
-            }
+            self.calibration = (open && keep).then_some(d);
         }
         if let Some((id, mut name)) = self.rename.clone() {
             let mut open = true;
@@ -1202,4 +1198,171 @@ fn units_window(ctx: &egui::Context, session: &mut Session, t: &Tokens) {
     if answer.is_some() || !open {
         session.units_prompt = None;
     }
+}
+
+/// The calibration dialog: the test's range, then (once set up) what to read off the print
+/// and the result to save.
+fn calibration_body(
+    ui: &mut egui::Ui,
+    session: &mut Session,
+    t: &Tokens,
+    d: &mut crate::calibration::Dialog,
+    open: &mut bool,
+    ready: &mut bool,
+) {
+    use crate::calibration::{self, Test};
+    ui.set_width(440.0);
+    let drag = |ui: &mut egui::Ui, v: &mut f64, unit: &str, speed: f64| {
+        ui.add(egui::DragValue::new(v).speed(speed).max_decimals(4).suffix(if unit.is_empty() {
+            String::new()
+        } else {
+            format!(" {unit}")
+        }));
+    };
+    if !d.printed {
+        ui.label("The current project is replaced by the test print, with the settings it needs changed (as edits you can see in the settings).");
+        ui.add_space(6.0);
+        let unit = d.test.range_unit().unwrap_or("");
+        let fine =
+            if matches!(d.test, Test::PaLine | Test::PaPattern | Test::PaTower | Test::ShaperDamp | Test::Cornering) {
+                0.001
+            } else {
+                0.1
+            };
+        egui::Grid::new("calib-range").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| match d.test {
+            Test::ShaperFreq => {
+                ui.label("Frequency X (from, to)");
+                ui.horizontal(|ui| {
+                    drag(ui, &mut d.freq_x.0, "Hz", 1.0);
+                    drag(ui, &mut d.freq_x.1, "Hz", 1.0);
+                });
+                ui.end_row();
+                ui.label("Frequency Y (from, to)");
+                ui.horizontal(|ui| {
+                    drag(ui, &mut d.freq_y.0, "Hz", 1.0);
+                    drag(ui, &mut d.freq_y.1, "Hz", 1.0);
+                });
+                ui.end_row();
+                ui.label("Damping ratio");
+                drag(ui, &mut d.damp, "", 0.005);
+                ui.end_row();
+                ui.label("Shaper type");
+                ui.add(
+                    egui::TextEdit::singleline(&mut d.shaper)
+                        .hint_text("firmware default (e.g. mzv)")
+                        .desired_width(160.0),
+                );
+                ui.end_row();
+            }
+            Test::ShaperDamp => {
+                ui.label("Frequency X / Y");
+                ui.horizontal(|ui| {
+                    drag(ui, &mut d.freq_x.0, "Hz", 1.0);
+                    drag(ui, &mut d.freq_y.0, "Hz", 1.0);
+                });
+                ui.end_row();
+                ui.label("Damping (from, to)");
+                ui.horizontal(|ui| {
+                    drag(ui, &mut d.start, "", 0.005);
+                    drag(ui, &mut d.end, "", 0.005);
+                });
+                ui.end_row();
+                ui.label("Shaper type");
+                ui.add(
+                    egui::TextEdit::singleline(&mut d.shaper)
+                        .hint_text("firmware default (e.g. mzv)")
+                        .desired_width(160.0),
+                );
+                ui.end_row();
+            }
+            _ if d.test.range_unit().is_some() => {
+                ui.label("Start");
+                drag(ui, &mut d.start, unit, fine);
+                ui.end_row();
+                ui.label("End");
+                drag(ui, &mut d.end, unit, fine);
+                ui.end_row();
+                if !matches!(d.test, Test::Temperature | Test::Cornering) {
+                    ui.label("Step");
+                    drag(ui, &mut d.step, unit, fine / 10.0);
+                    ui.end_row();
+                }
+            }
+            _ => {}
+        });
+        match d.test {
+            Test::PaLine => {
+                ui.checkbox(&mut d.numbers, "Print numbers");
+            }
+            Test::Temperature | Test::Vfa => {
+                ui.checkbox(&mut d.resize, "Scale the tower to the nozzle");
+            }
+            Test::ShaperFreq | Test::ShaperDamp | Test::Cornering => {
+                ui.horizontal(|ui| {
+                    ui.label("Model");
+                    ui.selectable_value(&mut d.model, 0, "Ringing tower");
+                    ui.selectable_value(&mut d.model, 1, "Fast tower");
+                    if d.test == Test::Cornering {
+                        ui.selectable_value(&mut d.model, 2, "SCV-V2");
+                    }
+                });
+            }
+            _ => {}
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui_kit::primary_button(ui, t, "Set up the test").clicked() {
+                match calibration::set_up(session, d) {
+                    Ok(()) => {
+                        d.printed = true;
+                        *ready = true;
+                        session.notify(
+                            Level::Info,
+                            format!("{} is on the plate; slice and print it, then come back here.", d.test.label()),
+                        );
+                    }
+                    Err(e) => session.notify(Level::Error, e),
+                }
+            }
+            if ui.button("Cancel").clicked() {
+                *open = false;
+            }
+        });
+        return;
+    }
+    ui.label(d.test.instructions());
+    ui.add_space(6.0);
+    let height = matches!(d.test, Test::PaTower | Test::Retraction | Test::MaxFlow);
+    if d.test != Test::Vfa {
+        ui.horizontal(|ui| {
+            ui.label(match d.test {
+                _ if height => "Height (mm)",
+                Test::ShaperFreq => "Frequency X / Y (Hz)",
+                _ => "Value",
+            });
+            drag(ui, &mut d.result, "", if d.test == Test::Temperature { 1.0 } else { 0.001 });
+            if d.test == Test::ShaperFreq {
+                drag(ui, &mut d.result_y, "", 0.5);
+            }
+        });
+    }
+    let saved = calibration::result(session, d);
+    if let Some((_, note)) = &saved {
+        ui.label(RichText::new(format!("Saves: {note}")).color(t.text_muted));
+    }
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if saved.is_some() && ui_kit::primary_button(ui, t, "Save to presets").clicked() {
+            if let Some(note) = calibration::save(session, d) {
+                session.notify(Level::Info, format!("{note} — set in the presets; save the preset to keep it."));
+            }
+            *open = false;
+        }
+        if ui.button("Back").clicked() {
+            d.printed = false;
+        }
+        if ui.button("Close").clicked() {
+            *open = false;
+        }
+    });
 }

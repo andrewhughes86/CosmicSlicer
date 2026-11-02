@@ -11,6 +11,12 @@ Taken from OrcaSlicer (commit 95a27321456e73cf6c6270d37dccfe819a96b130, 2026-11-
   the settings page / group layout, extracted from `src/libslic3r/PrintConfig.cpp` and
   `src/slic3r/GUI/Tab.cpp`.
 - The preview legend's feature colours, from `src/libvgcode/src/ViewerImpl.cpp`.
+- `assets/calib/` — OrcaSlicer's calibration models (`resources/calib/`: temperature,
+  retraction, PA, VFA, max volumetric speed, input shaping and cornering towers, decoded from
+  Draco to compressed STL by `tools/pack_calib_models.py`, and the flow-rate test projects).
+  The calibration tests follow `src/libslic3r/calib.cpp`, `src/slic3r/GUI/Plater.cpp`
+  (`calib_*`), `src/slic3r/GUI/calib_dlg.cpp` and the per-layer changes in
+  `src/libslic3r/GCode.cpp`.
 - `assets/profiles/orca_profiles.bin` — OrcaSlicer's printer, filament and process profile
   library (`resources/profiles`, 72 vendors), packed by `tools/pack_orca_profiles.py`. The
   vendor profiles were contributed to OrcaSlicer by the printer and filament makers and the

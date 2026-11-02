@@ -468,6 +468,7 @@ pub fn object(
                         seam_enforce: lr.map(|r| r.seam_enforce.clone()).unwrap_or_default(),
                         seam_block: lr.map(|r| r.seam_block.clone()).unwrap_or_default(),
                         extruder: None,
+                        pressure_advance: None,
                     };
                     for p in &w.pieces {
                         match p.settings.as_deref() {

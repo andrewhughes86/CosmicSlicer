@@ -60,7 +60,8 @@ OrcaSlicer's crashes are the reason this exists.
   UI only sends requests and picks up events (`ui-egui/src/devices.rs`), never waits.
 - `crates/import` — the model readers (mesh formats and STEP/IGES/SAT with their B-rep kernel),
   vendored from CosmicDMS; keep fixes in step with it.
-- `crates/engine` — the slicer: `slicing` (mesh → layer shapes), `walls`, `plan` (top /
+- `crates/engine` — the slicer (`calib`: the calibration prints' per-layer changes and the drawn
+  pressure advance tests): `slicing` (mesh → layer shapes), `walls`, `plan` (top /
   bottom / solid / sparse regions per island), `infill`, `skirt`, `support`, `gcode` (order,
   travel, cooling, G-code, estimates, Preview moves). `geom` wraps i_overlay under
   `catch_unwind`; `settings` clamps every value it reads. `slice()` never panics.
@@ -81,6 +82,8 @@ OrcaSlicer's crashes are the reason this exists.
 - Units inside are millimetres and degrees, as in OrcaSlicer.
 - Regenerate the profile pack with
   `python3 tools/pack_orca_profiles.py <OrcaSlicer>/resources/profiles assets/profiles/orca_profiles.bin`.
+- Regenerate the calibration models with
+  `python3 tools/pack_calib_models.py <OrcaSlicer>/resources/calib assets/calib` (needs DracoPy).
 - Regenerate the settings JSON with
   `python3 tools/extract_orca_settings.py <OrcaSlicer>/src assets/settings/orca_settings.json`.
 
