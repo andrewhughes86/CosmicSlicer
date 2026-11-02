@@ -27,6 +27,9 @@ pub fn show(vp: &mut Viewport, ui: &mut Ui, rect: Rect, session: &mut Session, t
         }
         Page::Preview => {
             legend(vp, ui, rect, session, t);
+            if session.model.plates > 1 && session.viewer.is_none() {
+                plate_strip(vp, ui, rect, session, t);
+            }
             layer_slider(vp, ui, rect, session, t);
             move_slider(vp, ui, rect, t);
         }
@@ -68,18 +71,23 @@ fn toolbar(vp: &mut Viewport, ui: &mut Ui, rect: Rect, session: &mut Session, t:
                     {
                         session.auto_orient();
                     }
-                    if icons::button_enabled(
+                    let arrange = icons::button_enabled(
                         ui,
                         "toolbar_arrange",
                         t,
                         side,
-                        false,
+                        vp.arrange_settings,
                         has_objects,
-                        "Arrange all objects (A)",
-                    )
-                    .clicked()
-                    {
-                        session.arrange(false);
+                        "Arrange all objects (A); right-click for settings",
+                    );
+                    if arrange.clicked() {
+                        session.arrange(true);
+                    }
+                    if arrange.secondary_clicked() {
+                        vp.arrange_settings = !vp.arrange_settings;
+                    }
+                    if vp.arrange_settings {
+                        arrange_settings(vp, ui, arrange.rect, session, t);
                     }
                     separator(ui, t, side);
                     if icons::button_enabled(ui, "split_objects", t, side, false, has_selection, "Split to objects")
@@ -115,6 +123,115 @@ fn toolbar(vp: &mut Viewport, ui: &mut Ui, rect: Rect, session: &mut Session, t:
                             vp.tool = if on { None } else { Some(tool) };
                         }
                     }
+                });
+            });
+        });
+}
+
+/// OrcaSlicer's arrange settings, under the toolbar button.
+fn arrange_settings(vp: &mut Viewport, ui: &Ui, button: Rect, session: &mut Session, t: &Tokens) {
+    egui::Area::new(egui::Id::new("arrange-settings"))
+        .pivot(Align2::CENTER_TOP)
+        .fixed_pos(pos2(button.center().x, button.bottom() + 6.0))
+        .show(ui.ctx(), |ui| {
+            ui_kit::frame(Surface::Overlay, t).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+                ui.set_width(260.0);
+                ui.label(RichText::new("Arrange settings").strong());
+                ui.horizontal(|ui| {
+                    ui.label("Spacing");
+                    ui.add(
+                        egui::DragValue::new(&mut session.prefs.arrange_spacing)
+                            .range(0.0..=100.0)
+                            .speed(0.1)
+                            .suffix(" mm"),
+                    );
+                });
+                ui.checkbox(&mut session.prefs.arrange_rotate, "Auto rotate for arrangement");
+                ui.label(
+                    RichText::new("Objects keep clear of the excluded bed area and the prime tower.")
+                        .color(t.text_muted)
+                        .small(),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Arrange").clicked() {
+                        session.arrange(true);
+                    }
+                    if ui.button("Close").clicked() {
+                        vp.arrange_settings = false;
+                    }
+                });
+            });
+        });
+}
+
+/// Preview's plate list: each plate's thumbnail, the shown one marked, a tick once sliced;
+/// a click shows that plate.
+fn plate_strip(vp: &mut Viewport, ui: &Ui, rect: Rect, session: &mut Session, t: &Tokens) {
+    const SIZE: u32 = 72;
+    let plates = session.model.plates;
+    vp.plate_thumbs.retain(|(p, rev, _)| *p < plates && *rev == session.revision);
+    for p in 0..plates {
+        if vp.plate_thumbs.iter().any(|(q, _, _)| *q == p) {
+            continue;
+        }
+        let image = crate::project::plate_image(session, p, SIZE)
+            .map(|rgba| egui::ColorImage::from_rgba_unmultiplied([SIZE as usize, SIZE as usize], &rgba));
+        let tex = image.map(|i| ui.ctx().load_texture(format!("plate-thumb-{p}"), i, egui::TextureOptions::LINEAR));
+        vp.plate_thumbs.push((p, session.revision, tex));
+    }
+    egui::Area::new(egui::Id::new("plate-strip"))
+        .pivot(Align2::LEFT_BOTTOM)
+        .fixed_pos(pos2(rect.left() + 10.0, rect.bottom() - 10.0))
+        .constrain_to(rect)
+        .show(ui.ctx(), |ui| {
+            ui_kit::frame(Surface::Overlay, t).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
+                ui.set_max_width((rect.width() * 0.6).max(100.0));
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for p in 0..plates {
+                            let (r, response) =
+                                ui.allocate_exact_size(vec2(SIZE as f32, SIZE as f32 + 16.0), Sense::click());
+                            let current = p == session.plate;
+                            let painter = ui.painter_at(r);
+                            painter.rect_filled(r, 4.0, if current { t.hover_bg } else { t.raised_bg });
+                            let image_r = Rect::from_min_size(r.min, vec2(SIZE as f32, SIZE as f32));
+                            match vp.plate_thumbs.iter().find(|(q, _, _)| *q == p).and_then(|x| x.2.as_ref()) {
+                                Some(tex) => {
+                                    painter.image(
+                                        tex.id(),
+                                        image_r,
+                                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                                        Color32::WHITE,
+                                    );
+                                }
+                                None => {
+                                    painter.text(
+                                        image_r.center(),
+                                        Align2::CENTER_CENTER,
+                                        "Empty",
+                                        FontId::proportional(11.0),
+                                        t.text_muted,
+                                    );
+                                }
+                            }
+                            let sliced = session.result_for(p).is_some();
+                            let label = format!("{}{}", p + 1, if sliced { " ✔" } else { "" });
+                            painter.text(
+                                pos2(r.center().x, r.bottom() - 8.0),
+                                Align2::CENTER_CENTER,
+                                label,
+                                FontId::proportional(11.0),
+                                if current { t.accent } else { t.text },
+                            );
+                            if current {
+                                painter.rect_stroke(r, 4.0, Stroke::new(1.5, t.accent), egui::StrokeKind::Inside);
+                            }
+                            if response.on_hover_text(session.plate_name(p)).clicked() {
+                                session.plate = p;
+                                vp.fit_pending = true;
+                            }
+                        }
+                    });
                 });
             });
         });

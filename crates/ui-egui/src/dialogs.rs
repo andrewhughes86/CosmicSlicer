@@ -268,7 +268,7 @@ impl Dialogs {
             self.switch = Some(PendingSwitch { kind, filament, index });
         } else {
             session.presets.select(kind, filament, index);
-            session.sliced = None;
+            session.sliced.clear();
         }
     }
 
@@ -360,7 +360,7 @@ impl Dialogs {
             None => {}
         }
         if !open {
-            session.sliced = None;
+            session.sliced.clear();
         }
         self.switch = if open { Some(sw) } else { None };
     }
@@ -823,19 +823,19 @@ impl Dialogs {
                             "flush_multiplier",
                             format!("{mult:.2}"),
                         );
-                        session.sliced = None;
+                        session.sliced.clear();
                     }
                 });
                 if changed {
                     let text = table.iter().map(|v| format!("{}", v.round())).collect::<Vec<_>>().join(",");
                     session.presets.set_value(schema, TabKind::Process, 0, "flush_volumes_matrix", text);
-                    session.sliced = None;
+                    session.sliced.clear();
                 }
                 let mut tower = session.presets.value(schema, TabKind::Process, 0, "enable_prime_tower") == "1";
                 if ui.checkbox(&mut tower, "Purge into a prime tower").changed() {
                     let v = if tower { "1" } else { "0" };
                     session.presets.set_value(schema, TabKind::Process, 0, "enable_prime_tower", v.to_owned());
-                    session.sliced = None;
+                    session.sliced.clear();
                 }
                 ui.label(
                     RichText::new("The tower's place and size are in Process › Multimaterial.")
@@ -933,7 +933,9 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+C / Ctrl+V", "Copy / paste"),
             ("Ctrl+K", "Clone selected"),
             ("Ctrl+Z / Ctrl+Y", "Undo / redo"),
-            ("A", "Arrange"),
+            ("A", "Arrange all plates"),
+            ("Shift+A", "Arrange the current plate"),
+            ("+ / -", "Add or remove an instance"),
             ("Q", "Auto orient"),
             ("M / R / S / F", "Move / Rotate / Scale / Lay on face"),
             ("0 … 6", "Default, top, bottom, front, rear, left, right view"),

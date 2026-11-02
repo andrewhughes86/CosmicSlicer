@@ -20,6 +20,7 @@ end of every session (no crashes, tests and clippy clean, smoke tests cover new 
 | 11 | Prepare tools | Support, seam, fuzzy-skin and colour painting (circle, sphere, fill, smart fill, gap fill) with the engine using support, seam and fuzzy paint; Cut with capped faces, flip, cut to parts, plug and dowel connectors; Text and SVG emboss/engrave; Measure; brim ears placed by hand ("Painted" brim); Boolean union/difference; Assemble; lay-on-face highlight, scale to fit; undoable volume edits |
 | 12 | Multi-material | Colour painting sliced into filaments (nearest painted surface, or a set depth); layers printed filament by filament; prime tower sized to the purges, with brim and sparse layers; flushing volumes table (auto from colours, multiplier); change-filament G-code; ooze prevention; support and interface filaments; print by object with clearance checks and per-plate sequence; colour change, pause and custom G-code from the layer slider (3MF `custom_gcode_per_layer.xml`) |
 | 13 | Layer height | Variable layer height tool (draw the curve, adaptive from surface slopes with a quality setting, smooth, reset), saved per object (3MF `layer_heights_profile.txt`); layer stacks from profiles and height ranges with `layer_height`; a continuous-Z spiral vase; each object's brim with it when printing one at a time |
+| 14 | Arrange, orient and plates | No-fit-polygon arrangement of convex footprints (spacing, auto rotate, excluded bed area, prime tower), arrange selection / plate / all plates, overflow and new objects onto new plates; auto orient by overhang and contact area; shared instances (+ / −, 3MF one object placed many times); prime tower drawn and dragged on the canvas, per plate; slice all, export every plate's G-code, Preview plate strip with thumbnails |
 
 ## Order, and why
 Get a user's own printer printing well and safely first (profiles, correct motion G-code,
@@ -48,7 +49,7 @@ CI comes early because the Windows and macOS builds are not yet checked by anyth
 | 19 | Parity check against OrcaSlicer on a reference set | 6–14 |
 | 20 | Packaging and release for all three platforms | 3, 18 |
 
-7 more sessions. 17 can be split up and done between others.
+6 more sessions. 17 can be split up and done between others.
 
 ---
 
@@ -307,16 +308,44 @@ the plate, the thinnest any object wants); independent support layer height; the
 XY smoothing between layers (`spiral_mode_smooth`); leading-edge-only brims. The layer height
 profile is not drawn beside the object on the canvas, only in the tool's panel.
 
-## 14 · Arrange, orient and plates
-- Arrangement with rotation and alignment like Orca's (nesting, spacing, avoiding excluded bed
-  areas and the wipe tower), arrange selection / all plates, auto-plate new objects.
-- Auto orient minimising overhang and support (Orca's method).
-- Plates: drag objects between plates, plate thumbnails, per-plate names/types/sequence used by
-  the engine, slice all plates, export all plates, plate list strip.
-- From session 10: OrcaSlicer's shared instances (one object, several placements).
-- From session 12: drag the prime tower on the canvas.
+## 14 · Arrange, orient and plates — done
+- Arrange (`model::arrange`): each object's footprint is the convex hull of its shadow, grown
+  by half the spacing; largest first, each goes where it touches what is placed (no-fit
+  polygons of convex outlines, candidates at their corners and crossings) so the pile stays
+  tight round the plate's centre, lined up with its neighbours where that ties; with "Auto
+  rotate", also square to the plate turned 90° and square to its own smallest rectangle. When
+  large parts leave gaps, gathering in a corner and then centring is tried and the better kept.
+  Objects keep clear of the printer's `bed_exclude_area` and the prime tower with its brim.
+- Arrange all plates (A, the toolbar button), the current plate (Shift+A, the plate button),
+  the selection round the rest (object menu); locked plates are left alone. What does not fit
+  goes on new plates; a new object (add, import, paste, clone, cut pieces) goes beside what is
+  there, or on a new plate when its plate is full. Arrange settings (spacing, auto rotate) on
+  a right-click of the toolbar button, kept in the preferences.
+- Auto orient (`model::orient`, after OrcaSlicer's Tweaker-based method): the six axes and the
+  directions most of the surface faces are scored by the area left overhanging past the
+  support angle, the area resting on the plate and the height; the model turns only when that
+  is clearly better, where it stands.
+- Shared instances, as OrcaSlicer's: + adds an instance, − removes one, "Set as an individual
+  object" splits one off; instances share mesh, parts, paint, settings, ranges, ears and layer
+  heights (an edit to one by any route reaches the others), each placed on its own; saved as
+  one 3MF object with several build items, and Orca's multi-instance objects open that way.
+- The prime tower drawn on Prepare's plates where it will print (its depth estimated from the
+  flushing volumes as the engine sizes it), dragged on the canvas, its place kept per plate in
+  `wipe_tower_x`/`wipe_tower_y` as OrcaSlicer does and given to that plate's slice.
+- Plates: slices kept per plate; "Slice all" slices every plate in turn; File › Export ›
+  "Export G-code of all plates" writes each plate's G-code into a folder; Preview's plate strip
+  shows each plate's thumbnail, the slice state, and switches plate. (Dragging objects between
+  plates, per-plate name, bed type and sequence used by the slice were already there.)
+- Checked by tests: 30 mixed parts (cubes, cylinders, cones, spheres, tori, turned and
+  stretched) heaped in the middle are arranged onto one plate inside the printable area with
+  no two overlapping; twelve 60 mm cubes fill a plate with nine and put three on a new one;
+  arranged objects keep off an excluded area and the tower; a flipped cone stands on its base.
 
-**Done when:** "Arrange all" packs 30 mixed parts like Orca and nothing overlaps.
+Moved on to session 19: OrcaSlicer's "allow multiple materials on same plate", "align to Y
+axis" and "avoid extrusion calibration region" arrange options; nesting into concave
+pockets (footprints are convex, as Orca's default); exporting all plates as one sliced 3MF
+(`.gcode.3mf`); instances shown as their own rows in the object list (here a label says
+"instance k of n"); plate reordering by drag.
 
 ## 15 · Printer connections and Device pages
 - Physical printers with Orca's host types: OctoPrint/Klipper (Moonraker), PrusaLink,
@@ -376,6 +405,9 @@ and the Device page follows both prints.
   Orca's settings to get `wall_filament`, `sparse_infill_filament`, `solid_infill_filament`).
 - From session 13: per-object layer stacks; independent support layer height; spiral vase
   XY smoothing; leading-edge-only brims; the layer profile drawn beside the object.
+- From session 14: arrange options for multiple materials per plate, Y-axis alignment and the
+  calibration region; concave nesting; all plates as one `.gcode.3mf`; instances as their own
+  rows in the object list; reordering plates.
 
 ## 20 · Packaging and release
 - Windows installer (MSI) with file associations; macOS `.app` (universal) as a DMG; Linux

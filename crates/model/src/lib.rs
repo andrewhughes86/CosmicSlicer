@@ -5,10 +5,12 @@
 
 #![allow(non_snake_case)]
 
+pub mod arrange;
 pub mod cut;
 pub mod layers;
 pub mod mesh;
 pub mod obj;
+pub mod orient;
 pub mod primitives;
 pub mod repair;
 pub mod shape2d;
@@ -154,7 +156,7 @@ pub fn load(path: &Path) -> ModelResult<LoadedFile> {
 }
 
 /// What a part of an object is (OrcaSlicer's volume types).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum PartKind {
     #[default]
     Normal,
@@ -302,6 +304,9 @@ pub struct Object {
     pub brim_ears: Vec<BrimEar>,
     /// Variable layer height: (height above the plate, layer height) points; empty for none.
     pub layer_profile: Vec<(f32, f32)>,
+    /// Objects with the same non-zero `shared` are instances of one OrcaSlicer object: one
+    /// mesh, parts, paint and settings, each placed on its own.
+    pub shared: u64,
 }
 
 impl Object {
@@ -329,6 +334,32 @@ impl Object {
     /// Size on the plate after the transform.
     pub fn size(&self) -> Vec3 {
         self.bounds().size()
+    }
+
+    /// The convex hull of the object's shadow on the plate (what prints).
+    pub fn footprint(&self) -> Vec<glam::Vec2> {
+        let points: Vec<glam::Vec2> = self
+            .solids()
+            .iter()
+            .flat_map(|(mesh, m)| mesh.vertices.iter().map(move |v| m.transform_point3(*v).truncate()))
+            .collect();
+        arrange::hull(&points)
+    }
+
+    /// Turns the object `angle` radians about Z round `pivot` and moves the pivot to `to`.
+    pub fn turn_about(&mut self, angle: f32, pivot: glam::Vec2, to: glam::Vec2) {
+        if !(angle.is_finite() && pivot.is_finite() && to.is_finite()) {
+            return;
+        }
+        let q = Quat::from_rotation_z(angle);
+        let rel = self.transform.offset - pivot.extend(0.0);
+        let offset = q * rel + to.extend(0.0);
+        if angle.abs() > 1e-6 {
+            let mut t = self.transform;
+            t.set_quat(q * t.quat());
+            self.transform = t;
+        }
+        self.transform.offset = Vec3::new(offset.x, offset.y, self.transform.offset.z);
     }
 
     /// Moves the object so its lowest point touches the plate.
@@ -372,6 +403,7 @@ impl Model {
             ranges: Vec::new(),
             brim_ears: Vec::new(),
             layer_profile: Vec::new(),
+            shared: 0,
         };
         object.drop_to_bed();
         self.objects.push(object);
@@ -385,9 +417,64 @@ impl Model {
         self.next_id = new_id + 1;
         let mut copy = source;
         copy.id = new_id;
+        copy.shared = 0;
         copy.transform.offset.x += copy.size().x + 5.0;
         self.objects.push(copy);
         Some(new_id)
+    }
+
+    /// Another instance of `id` placed beside it, sharing its mesh, parts, paint and
+    /// settings; returns the new instance's id.
+    pub fn add_instance(&mut self, id: u64) -> Option<u64> {
+        let o = self.get_mut(id)?;
+        if o.shared == 0 {
+            o.shared = o.id;
+        }
+        let mut copy = o.clone();
+        copy.transform.offset.x += copy.size().x + 5.0;
+        Some(self.insert(copy))
+    }
+
+    /// The objects sharing `id`'s mesh and settings, `id` included (just `id` when it has no
+    /// other instances).
+    pub fn instances_of(&self, id: u64) -> Vec<u64> {
+        match self.get(id).map(|o| o.shared) {
+            None => Vec::new(),
+            Some(0) => vec![id],
+            Some(g) => self.objects.iter().filter(|o| o.shared == g).map(|o| o.id).collect(),
+        }
+    }
+
+    /// Copies what instances share (mesh, parts, paint, settings, name, filament, ears and
+    /// layer heights) from `id` to its other instances.
+    pub fn sync_instances(&mut self, id: u64) {
+        let Some(src) = self.get(id).filter(|o| o.shared != 0).cloned() else { return };
+        for o in self.objects.iter_mut().filter(|o| o.shared == src.shared && o.id != id) {
+            o.name.clone_from(&src.name);
+            o.mesh = Arc::clone(&src.mesh);
+            o.paint.clone_from(&src.paint);
+            o.parts.clone_from(&src.parts);
+            o.ranges.clone_from(&src.ranges);
+            o.overrides.clone_from(&src.overrides);
+            o.filament = src.filament;
+            o.brim_ears.clone_from(&src.brim_ears);
+            o.layer_profile.clone_from(&src.layer_profile);
+            o.drop_to_bed();
+        }
+    }
+
+    /// Makes `id` an object of its own, no longer sharing with its instances.
+    pub fn make_individual(&mut self, id: u64) {
+        let Some(g) = self.get(id).map(|o| o.shared).filter(|g| *g != 0) else { return };
+        if let Some(o) = self.get_mut(id) {
+            o.shared = 0;
+        }
+        let rest: Vec<u64> = self.objects.iter().filter(|o| o.shared == g).map(|o| o.id).collect();
+        if let [last] = rest.as_slice()
+            && let Some(o) = self.get_mut(*last)
+        {
+            o.shared = 0;
+        }
     }
 
     /// Adds `object` under a new id; returns the id.
@@ -525,78 +612,11 @@ impl Model {
         let to = to.min(self.objects.len());
         self.objects.insert(to, o);
     }
-
-    /// Lays the objects of `plate` out in rows across a `bed` sized plate, `gap` apart,
-    /// largest first, centred on the bed.
-    pub fn arrange(&mut self, plate: usize, bed_min: Vec3, bed_size: Vec3, gap: f32) {
-        let mut order: Vec<usize> = (0..self.objects.len()).filter(|&i| self.objects[i].plate == plate).collect();
-        order.sort_by(|&a, &b| {
-            let (sa, sb) = (self.objects[a].size(), self.objects[b].size());
-            (sb.x * sb.y).total_cmp(&(sa.x * sa.y))
-        });
-        /// Objects (index, centre x from the row's left) in one row, filled left to right;
-        /// each row is as deep as its deepest object.
-        #[derive(Default)]
-        struct Row {
-            items: Vec<(usize, f32)>,
-            width: f32,
-            depth: f32,
-        }
-        let mut rows: Vec<Row> = Vec::new();
-        let mut current = Row::default();
-        for &i in &order {
-            let s = self.objects[i].size();
-            if !current.items.is_empty() && current.width + gap + s.x > bed_size.x {
-                rows.push(std::mem::take(&mut current));
-            }
-            let left = if current.items.is_empty() { 0.0 } else { current.width + gap };
-            current.items.push((i, left + s.x / 2.0));
-            current.width = left + s.x;
-            current.depth = current.depth.max(s.y);
-        }
-        if !current.items.is_empty() {
-            rows.push(current);
-        }
-        let total_d: f32 = rows.iter().map(|r| r.depth).sum::<f32>() + gap * rows.len().saturating_sub(1) as f32;
-        let mut y = bed_min.y + bed_size.y / 2.0 + total_d / 2.0;
-        for Row { items, width, depth } in rows {
-            let left = bed_min.x + (bed_size.x - width) / 2.0;
-            for (i, cx) in items {
-                let Some(o) = self.objects.get_mut(i) else { continue };
-                let b = o.bounds();
-                let centre = (b.min + b.max) / 2.0;
-                o.transform.offset.x += left + cx - centre.x;
-                o.transform.offset.y += y - depth / 2.0 - centre.y;
-            }
-            y -= depth + gap;
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn arrange_keeps_objects_apart_and_on_the_bed() {
-        let mut m = Model::new();
-        for _ in 0..5 {
-            m.add("cube", primitives::cube(20.0), Vec3::ZERO, 0);
-        }
-        m.arrange(0, Vec3::ZERO, Vec3::new(220.0, 220.0, 250.0), 6.0);
-        let boxes: Vec<Aabb> = m.objects.iter().map(Object::bounds).collect();
-        for (i, a) in boxes.iter().enumerate() {
-            assert!(a.min.x >= 0.0 && a.max.x <= 220.0 && a.min.y >= 0.0 && a.max.y <= 220.0, "{a:?}");
-            assert!(a.min.z.abs() < 1e-4);
-            for b in boxes.iter().skip(i + 1) {
-                let apart = a.max.x <= b.min.x + 1e-3
-                    || b.max.x <= a.min.x + 1e-3
-                    || a.max.y <= b.min.y + 1e-3
-                    || b.max.y <= a.min.y + 1e-3;
-                assert!(apart, "{a:?} overlaps {b:?}");
-            }
-        }
-    }
 
     #[test]
     fn parts_split_assemble_and_count_in_the_bounds() {

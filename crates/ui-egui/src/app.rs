@@ -78,6 +78,10 @@ pub struct CosmicSlicerApp {
     last_failed: Option<(usize, u64, u64)>,
     /// Export the G-code as soon as the running slice finishes.
     export_when_sliced: bool,
+    /// Plates still to slice after the running one ("Slice all").
+    slice_queue: Vec<usize>,
+    /// Write every plate's G-code into this folder once "Slice all" is done.
+    export_all_to: Option<PathBuf>,
     /// Write the G-code here when the slice finishes, without asking (automation).
     export_to: Option<PathBuf>,
     /// A G-code file being read for the Preview.
@@ -189,6 +193,8 @@ impl CosmicSlicerApp {
             runner: None,
             last_failed: None,
             export_when_sliced: false,
+            slice_queue: Vec::new(),
+            export_all_to: None,
             export_to: None,
             gcode_load: None,
             data_dir: None,
@@ -225,21 +231,62 @@ impl CosmicSlicerApp {
 
     /// Starts slicing the current plate, unless that slice is already running or done.
     fn start_slice(&mut self) {
-        let s = &mut self.session;
-        if !s.model.objects.iter().any(|o| o.plate == s.plate && o.visible) {
-            s.notify(Level::Warning, "There is nothing on this plate to slice.");
+        self.slice_queue.clear();
+        let plate = self.session.plate;
+        self.slice_plate(plate);
+    }
+
+    /// Slices every plate with something on it, the current one first ("Slice all").
+    fn start_slice_all(&mut self) {
+        let s = &self.session;
+        let mut plates: Vec<usize> =
+            (0..s.model.plates).filter(|p| s.model.objects.iter().any(|o| o.plate == *p && o.visible)).collect();
+        if plates.is_empty() {
+            self.session.notify(Level::Warning, "There is nothing on the plates to slice.");
             return;
         }
-        if s.sliced.as_ref().is_some_and(|st| st.is_current(s)) {
-            if self.export_when_sliced {
+        if let Some(i) = plates.iter().position(|p| *p == s.plate) {
+            plates.remove(i);
+            plates.insert(0, s.plate);
+        }
+        let first = plates.remove(0);
+        self.slice_queue = plates;
+        self.slice_plate(first);
+    }
+
+    /// Starts the next plate waiting in the queue; at the end, writes "Export all" files.
+    fn next_in_queue(&mut self) {
+        while !self.slice_queue.is_empty() && self.runner.is_none() {
+            let p = self.slice_queue.remove(0);
+            self.slice_plate(p);
+        }
+        if self.runner.is_none()
+            && self.slice_queue.is_empty()
+            && let Some(dir) = self.export_all_to.take()
+        {
+            self.write_all_gcode(&dir);
+        }
+    }
+
+    /// Starts slicing plate `plate`, unless that slice is already running or done.
+    fn slice_plate(&mut self, plate: usize) {
+        let s = &mut self.session;
+        if !s.model.objects.iter().any(|o| o.plate == plate && o.visible) {
+            if self.slice_queue.is_empty() && self.export_all_to.is_none() {
+                s.notify(Level::Warning, "There is nothing on this plate to slice.");
+            }
+            return;
+        }
+        if s.result_for(plate).is_some() {
+            if self.export_when_sliced && plate == s.plate {
                 self.export_when_sliced = false;
                 self.export_gcode();
             }
             return;
         }
-        let fingerprint = crate::slicer::fingerprint(s);
+        let fingerprint = crate::slicer::fingerprint_for(s, plate);
         if let Some(r) = &self.runner {
-            if r.plate == s.plate && r.revision == s.revision && r.fingerprint == fingerprint {
+            if r.plate == plate && r.revision == s.revision && r.fingerprint == fingerprint {
                 return;
             }
             r.progress.cancel();
@@ -251,7 +298,7 @@ impl CosmicSlicerApp {
         {
             s.notify(Level::Warning, e);
         }
-        match crate::slicer::Runner::start(s) {
+        match crate::slicer::Runner::start(s, plate) {
             Ok(r) => {
                 s.slicing = Some((0.0, "Slicing".into()));
                 self.runner = Some(r);
@@ -291,7 +338,7 @@ impl CosmicSlicerApp {
         if s.page == Page::Preview
             && s.viewer.is_none()
             && self.runner.is_none()
-            && !s.sliced.as_ref().is_some_and(|st| st.is_current(s))
+            && s.result_for(s.plate).is_none()
             && s.model.objects.iter().any(|o| o.plate == s.plate && o.visible)
             && self.last_failed != Some((s.plate, s.revision, crate::slicer::fingerprint(s)))
         {
@@ -300,6 +347,9 @@ impl CosmicSlicerApp {
         let s = &mut self.session;
         let Some(runner) = &self.runner else {
             s.slicing = None;
+            if !self.slice_queue.is_empty() || self.export_all_to.is_some() {
+                self.next_in_queue();
+            }
             return;
         };
         if std::mem::take(&mut s.cancel_slice) {
@@ -322,8 +372,9 @@ impl CosmicSlicerApp {
                         Err(e) => eprintln!("could not write {}: {e}", path.display()),
                     }
                 }
-                s.sliced = Some(crate::slicer::SliceState { plate, revision, fingerprint, result: Arc::new(sliced) });
-                if self.export_when_sliced {
+                s.sliced.retain(|st| st.plate != plate && st.revision == revision);
+                s.sliced.push(crate::slicer::SliceState { plate, revision, fingerprint, result: Arc::new(sliced) });
+                if self.export_when_sliced && plate == s.plate {
                     self.export_when_sliced = false;
                     self.export_gcode();
                 }
@@ -335,8 +386,38 @@ impl CosmicSlicerApp {
                 }
                 self.last_failed = Some((plate, revision, fingerprint));
                 self.export_when_sliced = false;
+                self.slice_queue.clear();
+                self.export_all_to = None;
                 s.notify(Level::Error, e.to_string());
             }
+        }
+    }
+
+    /// Asks for a folder, then slices every plate and writes each plate's G-code there.
+    fn export_all_gcode(&mut self) {
+        let Some(dir) = rfd::FileDialog::new().set_title("Export G-code of all plates").pick_folder() else {
+            return;
+        };
+        self.export_all_to = Some(dir);
+        self.start_slice_all();
+        self.next_in_queue();
+    }
+
+    /// Writes each sliced plate's G-code into `dir`, named after the project and plate.
+    fn write_all_gcode(&mut self, dir: &std::path::Path) {
+        let s = &mut self.session;
+        let base = s.project.name.replace(['/', '\\', ':'], "_");
+        let mut written = 0;
+        for p in 0..s.model.plates {
+            let Some(result) = s.result_for(p) else { continue };
+            let path = dir.join(format!("{base}_plate_{}.gcode", p + 1));
+            match crate::store::write_atomic(&path, result.gcode.as_bytes()) {
+                Ok(()) => written += 1,
+                Err(e) => s.notify(Level::Error, format!("Could not write {}: {e}", path.display())),
+            }
+        }
+        if written > 0 {
+            s.notify(Level::Info, format!("Exported {written} plate(s) to {}", dir.display()));
         }
     }
 
@@ -695,7 +776,7 @@ impl CosmicSlicerApp {
             }
             Action::ExportStl => self.export_stl(),
             Action::ExportGcode => {
-                if s.sliced.as_ref().is_some_and(|st| st.is_current(s)) {
+                if s.result_for(s.plate).is_some() {
                     self.export_gcode();
                 } else if s.model.objects.iter().any(|o| o.plate == s.plate && o.visible) {
                     self.export_when_sliced = true;
@@ -711,6 +792,13 @@ impl CosmicSlicerApp {
                 self.last_failed = None;
                 self.start_slice();
             }
+            Action::SliceAll => {
+                s.viewer = None;
+                s.page = Page::Preview;
+                self.last_failed = None;
+                self.start_slice_all();
+            }
+            Action::ExportAllGcode => self.export_all_gcode(),
             Action::Print => self.dialogs.print = true,
             Action::Settings(kind) => {
                 self.dialogs.editor = Some(Editor { kind, filament: 0, page: 0, search: String::new() });
@@ -836,9 +924,13 @@ impl CosmicSlicerApp {
                 take(Modifiers::NONE, Key::ArrowDown, "layer-down");
                 return;
             }
+            take(shift, Key::A, "arrange-plate");
             for (k, n) in [
                 (Key::A, "arrange"),
                 (Key::Q, "orient"),
+                (Key::Plus, "add-instance"),
+                (Key::Equals, "add-instance"),
+                (Key::Minus, "remove-instance"),
                 (Key::M, "tool-move"),
                 (Key::R, "tool-rotate"),
                 (Key::S, "tool-scale"),
@@ -916,7 +1008,10 @@ impl CosmicSlicerApp {
                 "fit" => self.viewport.fit_pending = true,
                 "projection" => s.prefs.perspective = !s.prefs.perspective,
                 "labels" => s.prefs.show_labels = !s.prefs.show_labels,
-                "arrange" => s.arrange(false),
+                "arrange" => s.arrange(true),
+                "arrange-plate" => s.arrange(false),
+                "add-instance" => s.add_instance(),
+                "remove-instance" => s.remove_instance(),
                 "orient" => s.auto_orient(),
                 "layer-up" => self.viewport.layers.top = (self.viewport.layers.top + 1).min(self.viewport.layers.count),
                 "layer-down" => {
@@ -1104,6 +1199,7 @@ impl CosmicSlicerApp {
             }
         }
         self.shortcuts(&ctx, &mut actions);
+        self.session.sync_instances();
         self.poll_slice(&ctx);
         if let Some(saver) = self.autosaver.as_mut()
             && let Some(e) = saver.tick(&self.session, self.session.now)
@@ -1129,7 +1225,7 @@ impl CosmicSlicerApp {
                 self.session.prefs.installed_printers = printers;
                 self.session.prefs.visible_filaments = filaments;
                 self.session.presets = crate::profiles::rebuild(&self.session.presets, &self.session.prefs);
-                self.session.sliced = None;
+                self.session.sliced.clear();
                 self.save_settings();
             }
         }
@@ -1390,6 +1486,17 @@ mod smoke {
         }
         app.viewport.tool = Some(Tool::VariableLayerHeight);
         frames(&mut app, &ctx, 2);
+        // An object with instances in the list.
+        app.session.add_instance();
+        frames(&mut app, &ctx, 2);
+        // The arrange settings, and a prime tower on the plate.
+        app.viewport.tool = None;
+        app.viewport.arrange_settings = true;
+        app.session.presets.add_filament();
+        let schema = app.session.schema;
+        app.session.presets.set_value(schema, TabKind::Process, 0, "enable_prime_tower", "1".into());
+        frames(&mut app, &ctx, 2);
+        app.viewport.arrange_settings = false;
         // Several plates, one locked; the plate chrome draws for each.
         app.session.add_plate();
         app.session.add_plate();

@@ -62,8 +62,11 @@ pub enum Action {
     PickFont,
     ExportStl,
     ExportGcode,
+    /// Slice every plate and write each one's G-code into a folder.
+    ExportAllGcode,
     Quit,
     Slice,
+    SliceAll,
     Print,
     Settings(TabKind),
     FilamentSettings(usize),

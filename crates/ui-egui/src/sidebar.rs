@@ -477,7 +477,13 @@ fn object_row(
         }
     } else {
         let colour = if fits { t.text } else { t.warning };
-        let label = child.add(egui::Label::new(RichText::new(&name).color(colour)).truncate().sense(Sense::click()));
+        // Instances of one object, as OrcaSlicer lists them.
+        let instances = session.model.instances_of(id);
+        let shown = match instances.iter().position(|i| *i == id) {
+            Some(k) if instances.len() > 1 => format!("{name} (instance {} of {})", k + 1, instances.len()),
+            _ => name.clone(),
+        };
+        let label = child.add(egui::Label::new(RichText::new(&shown).color(colour)).truncate().sense(Sense::click()));
         if label.double_clicked() {
             sb.renaming = Some((id, name.clone()));
         }

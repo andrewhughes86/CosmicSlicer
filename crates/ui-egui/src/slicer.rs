@@ -27,14 +27,24 @@ pub struct SliceState {
 }
 
 impl SliceState {
-    /// Whether the result still matches the plate and settings.
+    /// Whether the result still matches the current plate and settings.
     pub fn is_current(&self, session: &Session) -> bool {
-        self.plate == session.plate && self.revision == session.revision && self.fingerprint == fingerprint(session)
+        self.is_current_for(session, session.plate)
+    }
+
+    /// Whether this is plate `plate`'s slice and still matches it and the settings.
+    pub fn is_current_for(&self, session: &Session, plate: usize) -> bool {
+        self.plate == plate && self.revision == session.revision && self.fingerprint == fingerprint_for(session, plate)
     }
 }
 
-/// Changes when any setting that affects slicing changes.
+/// Changes when any setting that affects slicing the current plate changes.
 pub fn fingerprint(session: &Session) -> u64 {
+    fingerprint_for(session, session.plate)
+}
+
+/// Changes when any setting that affects slicing plate `plate` changes.
+pub fn fingerprint_for(session: &Session, plate: usize) -> u64 {
     let p = &session.presets;
     let mut h = DefaultHasher::new();
     format!("{:?}{:?}{:?}", p.printer, p.process, p.project_filaments).hash(&mut h);
@@ -51,7 +61,7 @@ pub fn fingerprint(session: &Session) -> u64 {
     session.bed_type.hash(&mut h);
     session
         .plate_settings
-        .get(session.plate)
+        .get(plate)
         .map(|s| (s.bed_type, s.sequence, s.spiral, format!("{:?}", s.events)))
         .hash(&mut h);
     h.finish()
@@ -67,6 +77,11 @@ pub fn job(session: &Session, plate: usize) -> Job {
     let bed_key = BED_TYPES.get(bed).map_or("textured_plate_temp", |b| b.1).to_owned();
     let bed_type_name = BED_TYPES.get(bed).map_or("Textured PEI Plate", |b| b.0).to_owned();
     let mut process = p.effective(TabKind::Process, 0);
+    // OrcaSlicer keeps a prime tower place per plate.
+    if let Some((at, _)) = session.tower(plate) {
+        process.set("wipe_tower_x", at.x.to_string());
+        process.set("wipe_tower_y", at.y.to_string());
+    }
     if let Some(s) = session.plate_settings.get(plate) {
         match s.spiral {
             1 => process.set("spiral_mode", "1"),
@@ -256,8 +271,8 @@ pub struct Runner {
 }
 
 impl Runner {
-    pub fn start(session: &Session) -> Result<Runner, String> {
-        let job = job(session, session.plate);
+    pub fn start(session: &Session, plate: usize) -> Result<Runner, String> {
+        let job = job(session, plate);
         let progress = Arc::new(Progress::default());
         let (tx, rx) = mpsc::channel();
         let worker = Arc::clone(&progress);
@@ -268,7 +283,7 @@ impl Runner {
                 let _ = tx.send(CosmicSlicer_engine::slice(&job, &worker));
             })
             .map_err(|e| format!("could not start the slicer: {e}"))?;
-        Ok(Runner { progress, rx, plate: session.plate, revision: session.revision, fingerprint: fingerprint(session) })
+        Ok(Runner { progress, rx, plate, revision: session.revision, fingerprint: fingerprint_for(session, plate) })
     }
 
     /// The result, once it is ready.
@@ -295,7 +310,7 @@ mod tests {
         if let Some(id) = session.model.objects.last().map(|o| o.id) {
             session.set_filament(id, 2);
         }
-        let runner = Runner::start(&session);
+        let runner = Runner::start(&session, session.plate);
         assert!(runner.is_ok());
         let Ok(runner) = runner else { return };
         let started = std::time::Instant::now();
@@ -365,7 +380,7 @@ mod library_printers {
             return Err(format!("{printer} is not in the library"));
         }
         session.add_primitive("Cube");
-        let runner = Runner::start(&session)?;
+        let runner = Runner::start(&session, session.plate)?;
         let started = std::time::Instant::now();
         loop {
             if let Some(r) = runner.poll() {

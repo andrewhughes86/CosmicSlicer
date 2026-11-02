@@ -84,7 +84,7 @@ fn write(session: &mut Session, target: Target, key: &str, value: String) {
             session.dirty = true;
         }
     }
-    session.sliced = None;
+    session.sliced.clear();
 }
 
 fn revert(session: &mut Session, target: Target, key: &str) {
@@ -96,7 +96,7 @@ fn revert(session: &mut Session, target: Target, key: &str) {
         }
         None => session.presets.revert(target.kind, target.filament, key),
     }
-    session.sliced = None;
+    session.sliced.clear();
 }
 
 /// Whether `def` shows at this Advanced setting.

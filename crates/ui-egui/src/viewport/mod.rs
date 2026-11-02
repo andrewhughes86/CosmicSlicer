@@ -29,6 +29,14 @@ use gpu::{FlatGeometry, FrameParams, Gpu, ObjectDraw};
 enum Drag {
     Orbit,
     Pan,
+    /// Dragging plate `plate`'s prime tower, its corner at `at` (plate coordinates); `last`
+    /// is the point under the mouse on the plate.
+    Tower {
+        plate: usize,
+        at: Vec2,
+        last: Vec3,
+        moved: bool,
+    },
     /// Dragging objects across the plate, on the plane at `z`.
     Move {
         ids: Vec<u64>,
@@ -98,6 +106,12 @@ pub struct Viewport {
     pub tools: tools::ToolState,
     /// Custom G-code being typed for the layer slider.
     pub custom_gcode: String,
+    /// The arrange settings are open under the toolbar button.
+    pub arrange_settings: bool,
+    /// Preview's plate thumbnails: (plate, revision drawn at, texture; `None` when empty).
+    pub plate_thumbs: Vec<(usize, u64, Option<egui::TextureHandle>)>,
+    /// A unit cube, drawn scaled as each plate's prime tower.
+    tower_mesh: Arc<CosmicSlicer_model::Mesh>,
     hover: Option<u64>,
     hot: Option<Handle>,
     drag: Option<Drag>,
@@ -141,6 +155,9 @@ impl Default for Viewport {
             tool: None,
             tools: tools::ToolState::default(),
             custom_gcode: String::new(),
+            arrange_settings: false,
+            plate_thumbs: Vec::new(),
+            tower_mesh: Arc::new(CosmicSlicer_model::primitives::cube(1.0)),
             hover: None,
             hot: None,
             drag: None,
@@ -222,6 +239,37 @@ impl Viewport {
             }
         }
         best
+    }
+
+    /// Each plate's prime tower as a box in the scene, as tall as the plate's tallest object.
+    fn tower_boxes(session: &Session) -> Vec<(usize, Aabb)> {
+        (0..session.model.plates)
+            .filter_map(|p| {
+                let (at, size) = session.tower(p)?;
+                let origin = session.plate_origin(p);
+                let height = session
+                    .model
+                    .objects
+                    .iter()
+                    .filter(|o| o.plate == p && o.visible)
+                    .map(|o| o.bounds().max.z)
+                    .fold(1.0f32, f32::max)
+                    .min(session.printable_height());
+                let min = origin + at.extend(0.0);
+                Some((p, Aabb { min, max: min + size.extend(height) }))
+            })
+            .collect()
+    }
+
+    /// The prime tower under the mouse, nearer than any object: its plate and distance.
+    fn pick_tower(&self, session: &Session, mouse: Vec2) -> Option<(usize, f32)> {
+        let (o, d) = self.ray(mouse);
+        let tower = Self::tower_boxes(session)
+            .into_iter()
+            .filter_map(|(p, b)| b.ray_hit(o, d).map(|t| (p, t)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))?;
+        let object = self.pick(session, Page::Prepare, mouse).map(|h| h.1);
+        object.is_none_or(|t| tower.1 < t).then_some(tower)
     }
 
     /// The point on an object's surface under the mouse, with its face's normal.
@@ -367,7 +415,7 @@ impl Viewport {
         }
         let shown: Vec<&CosmicSlicer_model::Object> =
             if result.is_some() { Vec::new() } else { self.shown(session, page).collect() };
-        let meshes: Vec<(usize, &CosmicSlicer_model::Mesh)> = shown
+        let mut meshes: Vec<(usize, &CosmicSlicer_model::Mesh)> = shown
             .iter()
             .flat_map(|o| {
                 std::iter::once(&o.mesh)
@@ -375,6 +423,9 @@ impl Viewport {
                     .map(|m| (Arc::as_ptr(m) as usize, m.as_ref()))
             })
             .collect();
+        if page == Page::Prepare {
+            meshes.push((Arc::as_ptr(&self.tower_mesh) as usize, self.tower_mesh.as_ref()));
+        }
         gpu.sync_meshes(&meshes);
         let mut draws: Vec<ObjectDraw> = shown
             .iter()
@@ -426,6 +477,21 @@ impl Viewport {
                 } else if page == Page::Prepare {
                     glass.push(draw);
                 }
+            }
+        }
+        // The prime towers, where they will print.
+        if page == Page::Prepare {
+            let [r, g, b] =
+                crate::preview::FEATURES.iter().find(|f| f.0 == "Prime tower").map_or([179, 227, 171], |f| f.1);
+            for (_, tower) in Self::tower_boxes(session) {
+                draws.push(ObjectDraw {
+                    mesh: Arc::as_ptr(&self.tower_mesh) as usize,
+                    // The unit cube runs 0 to 1.
+                    model: glam::Mat4::from_translation(tower.min) * glam::Mat4::from_scale(tower.size()),
+                    color: linear(egui::Color32::from_rgb(r, g, b)),
+                    highlight: if matches!(self.drag, Some(Drag::Tower { .. })) { 0.4 } else { 0.0 },
+                    outside: false,
+                });
             }
         }
         draws.extend(glass);
@@ -853,6 +919,13 @@ impl Viewport {
         if self.tool.is_some_and(Tool::on_surface) {
             return Drag::Orbit;
         }
+        if let Some((plate, _)) = self.pick_tower(session, m)
+            && let Some((at, _)) = session.tower(plate)
+        {
+            let (o, d) = self.ray(m);
+            let last = camera::hit_plane(o, d, 0.0).unwrap_or(o);
+            return Drag::Tower { plate, at, last, moved: false };
+        }
         match self.pick(session, page, m) {
             Some((id, dist, _)) => {
                 if !session.selection.contains(&id) {
@@ -874,6 +947,23 @@ impl Viewport {
         match &mut self.drag {
             Some(Drag::Orbit) => self.camera.orbit(delta),
             Some(Drag::Pan) => self.camera.pan(delta, self.size.y),
+            Some(Drag::Tower { plate, at, last, moved }) => {
+                if let Some(p) = camera::hit_plane(ray.0, ray.1, 0.0) {
+                    let step = Vec2::new(p.x - last.x, p.y - last.y);
+                    if step.length() < 2000.0 && step.length() > 0.0 {
+                        if !*moved {
+                            session.checkpoint();
+                            *moved = true;
+                        }
+                        // Kept on the plate (min/max: the bounds cross for a tower wider than the bed).
+                        let (lo, bed) = session.bed();
+                        let size = session.tower(*plate).map_or(Vec2::ZERO, |t| t.1);
+                        *at = (*at + step).min(lo + bed - size).max(lo);
+                        session.set_tower_at(*plate, *at);
+                        *last = p;
+                    }
+                }
+            }
             Some(Drag::Move { ids, last, z, moved }) => {
                 if let Some(p) = camera::hit_plane(ray.0, ray.1, *z) {
                     let step = Vec3::new(p.x - last.x, p.y - last.y, 0.0);

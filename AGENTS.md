@@ -48,10 +48,12 @@ OrcaSlicer's crashes are the reason this exists.
   splits loops into runs by degree for speed, fan, flow and the Overhang wall type, and builds
   scarf seams there. `plan` runs in two passes so solid infill can see the sparse infill below
   (internal bridges).
-- `crates/model` — meshes, objects, plates, primitives, arrange; `load` (every format, zip
-  archives); `threemf` reads and writes 3MF projects in OrcaSlicer's layout (objects and parts
-  in `3D/Objects/`, `Metadata/model_settings.config`, `project_settings.config`, painted
-  facets kept as Orca's encoded strings).
+- `crates/model` — meshes, objects, plates, primitives; `arrange` (no-fit-polygon nesting of
+  convex footprints) and `orient` (auto orient); objects with the same non-zero `shared` are
+  instances of one object (`state::Session::sync_instances` carries edits across each
+  frame); `load` (every format, zip archives); `threemf` reads and writes 3MF projects in
+  OrcaSlicer's layout (objects and parts in `3D/Objects/`, `Metadata/model_settings.config`,
+  `project_settings.config`, painted facets kept as Orca's encoded strings).
 - `crates/import` — the model readers (mesh formats and STEP/IGES/SAT with their B-rep kernel),
   vendored from CosmicDMS; keep fixes in step with it.
 - `crates/engine` — the slicer: `slicing` (mesh → layer shapes), `walls`, `plan` (top /

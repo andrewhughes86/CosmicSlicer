@@ -73,6 +73,9 @@ pub fn file_menu(ui: &mut Ui, session: &mut Session, actions: &mut Vec<Action>) 
         if menu_item(ui, "Export G-code", "", true) {
             actions.push(Action::ExportGcode);
         }
+        if menu_item(ui, "Export G-code of all plates", "", any) {
+            actions.push(Action::ExportAllGcode);
+        }
         menu_item(ui, "Export toolpaths as OBJ", "", false);
         if menu_item(ui, "Export printer preset", "", true) {
             actions.push(Action::ExportPreset(CosmicSlicer_config::TabKind::Printer, 0));
@@ -237,6 +240,19 @@ pub fn object_menu(ui: &mut Ui, session: &mut Session, id: u64, actions: &mut Ve
     }
     if menu_item(ui, "Clone", &ctrl("K"), true) {
         session.clone_selected();
+    }
+    let instances = session.model.instances_of(id).len();
+    if menu_item(ui, "Add instance", "+", true) {
+        session.add_instance();
+    }
+    if menu_item(ui, "Remove instance", "-", instances > 1) {
+        session.remove_instance();
+    }
+    if menu_item(ui, "Set as an individual object", "", instances > 1) {
+        session.make_individual();
+    }
+    if menu_item(ui, "Arrange selection", "", true) {
+        session.arrange_in(crate::state::ArrangeScope::Selection);
     }
     if menu_item(ui, "Rename", "", true) {
         actions.push(Action::Rename(id));

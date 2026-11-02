@@ -55,6 +55,9 @@ struct ObjectEntry {
     brim_ears: Vec<CosmicSlicer_model::BrimEar>,
     #[serde(default)]
     layer_profile: Vec<(f32, f32)>,
+    /// Instances of one object share this (the session's group, renumbered on restore).
+    #[serde(default)]
+    shared: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -135,6 +138,7 @@ pub fn encode(session: &Session) -> Vec<u8> {
             ranges: o.ranges.clone(),
             brim_ears: o.brim_ears.clone(),
             layer_profile: o.layer_profile.clone(),
+            shared: o.shared,
         });
     }
     let manifest = Manifest {
@@ -234,6 +238,7 @@ pub fn decode(bytes: &[u8]) -> Result<Restored, String> {
     }
     let plates = manifest.plates.clamp(1, 100);
     let mut model = Model::new();
+    let mut groups: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
     model.plates = plates;
     for o in manifest.objects {
         let Some(mesh) = meshes.get(o.mesh) else { continue };
@@ -241,7 +246,8 @@ pub fn decode(bytes: &[u8]) -> Result<Restored, String> {
         if !(t.offset.is_finite() && t.rotation.is_finite() && t.scale.is_finite()) {
             continue;
         }
-        model.insert(Object {
+        let group = o.shared;
+        let id = model.insert(Object {
             id: 0,
             name: o.name,
             mesh: Arc::clone(mesh),
@@ -274,7 +280,14 @@ pub fn decode(bytes: &[u8]) -> Result<Restored, String> {
                 .into_iter()
                 .filter(|(z, h)| z.is_finite() && h.is_finite() && *h > 0.0)
                 .collect(),
+            shared: 0,
         });
+        if group != 0 {
+            let first = *groups.entry(group).or_insert(id);
+            if let Some(obj) = model.get_mut(id) {
+                obj.shared = first;
+            }
+        }
     }
     let mut presets = manifest.presets;
     // Selections must point at presets that exist.

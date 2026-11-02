@@ -293,7 +293,7 @@ fn tab_bar(ui: &mut Ui, session: &mut Session, t: &Tokens, choices: &mut SliceCh
         }
         let tip = if label.is_empty() { "Home" } else { label };
         if response.on_hover_text(tip).clicked() {
-            if page == Page::Preview && session.page != Page::Preview && session.sliced.is_none() {
+            if page == Page::Preview && session.page != Page::Preview && session.sliced.is_empty() {
                 actions.push(Action::Slice);
             }
             session.page = page;
@@ -309,8 +309,8 @@ fn tab_bar(ui: &mut Ui, session: &mut Session, t: &Tokens, choices: &mut SliceCh
     let slice_label = if choices.slice_all { "Slice all" } else { "Slice plate" };
     let slice_r = Rect::from_min_size(pos2(print_r.left() - 160.0, y), vec2(150.0, h));
     let can_slice = !session.model.objects.is_empty();
-    if let Some(dropdown) = split_button(ui, t, slice_r, slice_label, "slice", true, can_slice, actions, Action::Slice)
-    {
+    let slice_action = if choices.slice_all { Action::SliceAll } else { Action::Slice };
+    if let Some(dropdown) = split_button(ui, t, slice_r, slice_label, "slice", true, can_slice, actions, slice_action) {
         ui_kit::menu_below(&dropdown, t, |ui| {
             if ui.selectable_label(choices.slice_all, "Slice all").clicked() {
                 choices.slice_all = true;

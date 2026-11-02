@@ -37,7 +37,7 @@ const APPLICATION: &str = concat!("CosmicSlicer-", env!("CARGO_PKG_VERSION"));
 const THUMBNAIL: u32 = 512;
 
 /// Most plates a project may claim.
-const MAX_PLATES: usize = 100;
+pub const MAX_PLATES: usize = 100;
 
 /// Every option key and the tab it is on.
 fn tab_table(schema: &Schema) -> HashMap<&str, TabKind> {
@@ -250,10 +250,46 @@ fn plate_origin(p: usize, plates: usize, size: glam::Vec2) -> Vec3 {
     Vec3::new((p % cols) as f32 * size.x * 1.2, -((p / cols) as f32) * size.y * 1.2, 0.0)
 }
 
+/// Plate `p` drawn `size` pixels square (RGBA), as OrcaSlicer's plate thumbnails; `None`
+/// for an empty plate.
+pub fn plate_image(session: &Session, p: usize, size: u32) -> Option<Vec<u8>> {
+    let colours: Vec<[u8; 3]> = (0..session.presets.project_filaments.len())
+        .map(|i| hex_colour(&session.presets.filament_colour(session.schema, i)))
+        .collect();
+    let items: Vec<CosmicSlicer_engine::thumbnail::Item<'_>> = session
+        .model
+        .objects
+        .iter()
+        .filter(|o| o.plate == p && o.visible)
+        .flat_map(|o| {
+            let colour = colours.get(o.filament.saturating_sub(1)).copied().unwrap_or([0xF2, 0x75, 0x4E]);
+            o.solids().into_iter().map(move |(mesh, matrix)| CosmicSlicer_engine::thumbnail::Item {
+                mesh,
+                matrix,
+                colour,
+            })
+        })
+        .collect();
+    (!items.is_empty()).then(|| CosmicSlicer_engine::thumbnail::render(&items, size, size))
+}
+
 /// The session as a project.
 pub fn to_project(session: &Session) -> Project {
-    let mut objects = Vec::new();
+    let mut objects: Vec<ProjectObject> = Vec::new();
+    // Instances of one object are one object with several placements, as in OrcaSlicer.
+    let mut groups: std::collections::HashMap<u64, (usize, &Arc<Mesh>)> = std::collections::HashMap::new();
     for o in session.model.objects.iter().filter(|o| o.visible) {
+        if o.shared != 0
+            && let Some(&(k, mesh)) = groups.get(&o.shared)
+            && Arc::ptr_eq(mesh, &o.mesh)
+            && let Some(first) = objects.get_mut(k)
+        {
+            first.instances.push(Instance { matrix: o.matrix(), plate: Some(o.plate) });
+            continue;
+        }
+        if o.shared != 0 {
+            groups.insert(o.shared, (objects.len(), &o.mesh));
+        }
         let paint = o.paint.as_deref().cloned().unwrap_or_default();
         let mut parts = vec![Part {
             name: o.name.clone(),
@@ -283,9 +319,6 @@ pub fn to_project(session: &Session) -> Project {
             layer_profile: o.layer_profile.clone(),
         });
     }
-    let colours: Vec<[u8; 3]> = (0..session.presets.project_filaments.len())
-        .map(|i| hex_colour(&session.presets.filament_colour(session.schema, i)))
-        .collect();
     let plates = (0..session.model.plates.max(1))
         .map(|p| {
             let ps = session.plate_settings.get(p).cloned().unwrap_or_default();
@@ -303,26 +336,8 @@ pub fn to_project(session: &Session) -> Project {
                 2 => settings.push(("spiral_mode".into(), "false".into())),
                 _ => {}
             }
-            let items: Vec<CosmicSlicer_engine::thumbnail::Item<'_>> = session
-                .model
-                .objects
-                .iter()
-                .filter(|o| o.plate == p && o.visible)
-                .map(|o| CosmicSlicer_engine::thumbnail::Item {
-                    mesh: &o.mesh,
-                    matrix: o.matrix(),
-                    colour: colours.get(o.filament.saturating_sub(1)).copied().unwrap_or([0xF2, 0x75, 0x4E]),
-                })
-                .collect();
-            let thumbnail = (!items.is_empty())
-                .then(|| {
-                    CosmicSlicer_engine::thumbnail::png(
-                        &CosmicSlicer_engine::thumbnail::render(&items, THUMBNAIL, THUMBNAIL),
-                        THUMBNAIL,
-                        THUMBNAIL,
-                    )
-                })
-                .flatten();
+            let thumbnail = plate_image(session, p, THUMBNAIL)
+                .and_then(|rgba| CosmicSlicer_engine::thumbnail::png(&rgba, THUMBNAIL, THUMBNAIL));
             let events = ps
                 .events
                 .iter()
@@ -475,8 +490,13 @@ pub fn open(session: &Session, path: &Path) -> Result<(Restored, Vec<String>), S
             .iter()
             .map(|(lo, hi, settings)| HeightRange { lo: *lo, hi: *hi, overrides: keep(settings) })
             .collect();
+        // The first placement's mesh, shared by the others that need no baking.
+        let mut shared: Option<(Arc<Mesh>, Mat4, u64)> = None;
         for inst in &o.instances {
             let Some((local, transform, frame)) = placed(&o.name, &first.mesh, inst.matrix) else { continue };
+            let reuse =
+                shared.as_ref().filter(|(_, f, _)| f.abs_diff_eq(frame, 1e-5)).map(|(m, _, g)| (Arc::clone(m), *g));
+            let mesh = reuse.as_ref().map_or_else(|| Arc::new(local), |(m, _)| Arc::clone(m));
             let parts: Vec<Volume> = o
                 .parts
                 .iter()
@@ -501,10 +521,10 @@ pub fn open(session: &Session, path: &Path) -> Result<(Restored, Vec<String>), S
                     })
                     .unwrap_or(0)
             });
-            model.insert(Object {
+            let id = model.insert(Object {
                 id: 0,
                 name: o.name.clone(),
-                mesh: Arc::new(local),
+                mesh: Arc::clone(&mesh),
                 transform,
                 filament: o.extruder.clamp(1, filaments),
                 plate: plate.min(plates - 1),
@@ -520,7 +540,17 @@ pub fn open(session: &Session, path: &Path) -> Result<(Restored, Vec<String>), S
                     .map(|(p, r)| CosmicSlicer_model::BrimEar { at: frame.transform_point3(*p), radius: *r })
                     .collect(),
                 layer_profile: o.layer_profile.clone(),
+                shared: 0,
             });
+            if o.instances.len() > 1 {
+                let group = reuse.map_or(id, |(_, g)| g);
+                if let Some(obj) = model.get_mut(id) {
+                    obj.shared = group;
+                }
+                if shared.is_none() {
+                    shared = Some((mesh, frame, group));
+                }
+            }
         }
     }
     let plate_settings = (0..plates)
@@ -716,6 +746,9 @@ mod tests {
         assert_eq!(r.model.objects.len(), 2);
         assert_eq!(r.model.objects.iter().map(|o| o.plate).collect::<Vec<_>>(), [0, 1]);
         assert_eq!(r.model.objects[0].overrides, vec![("sparse_infill_density".to_owned(), "35%".to_owned())]);
+        // One object placed twice opens as two instances sharing one mesh.
+        let (a, b) = (&r.model.objects[0], &r.model.objects[1]);
+        assert!(a.shared != 0 && a.shared == b.shared && Arc::ptr_eq(&a.mesh, &b.mesh));
         assert_eq!(r.bed_type, 1);
         let schema = s.schema;
         assert_eq!(r.presets.project_filaments.len(), 2);

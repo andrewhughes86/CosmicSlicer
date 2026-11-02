@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use CosmicSlicer_config::{PresetBundle, Schema, TabKind, parse_points};
-use CosmicSlicer_model::{Aabb, Model, Transform, primitives};
+use CosmicSlicer_model::{Aabb, Model, Transform, arrange, primitives};
 use glam::{Vec2, Vec3};
 
 use crate::theme::Theme;
@@ -155,6 +155,10 @@ pub struct Prefs {
     pub visible_filaments: Vec<String>,
     /// The setup wizard has been completed.
     pub setup_done: bool,
+    /// Arrange: the gap between objects, mm.
+    pub arrange_spacing: f32,
+    /// Arrange: turn objects about Z where that packs better.
+    pub arrange_rotate: bool,
 }
 
 impl Default for Prefs {
@@ -172,8 +176,21 @@ impl Default for Prefs {
             installed_printers: Vec::new(),
             visible_filaments: Vec::new(),
             setup_done: false,
+            arrange_spacing: 6.0,
+            arrange_rotate: false,
         }
     }
+}
+
+/// What Arrange works on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArrangeScope {
+    /// The selected objects on the current plate, round the others there.
+    Selection,
+    /// The current plate; what does not fit goes on to new plates.
+    Plate,
+    /// Every plate that is not locked.
+    AllPlates,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,8 +255,9 @@ pub struct Session {
     pub now: f64,
     /// Bumped on every change to objects or plates, so the scene can rebuild.
     pub revision: u64,
-    /// The last finished slice; it shows only while it matches the plate and settings.
-    pub sliced: Option<crate::slicer::SliceState>,
+    /// Finished slices, one per plate at most; each shows only while it matches its plate
+    /// and the settings.
+    pub sliced: Vec<crate::slicer::SliceState>,
     /// A G-code file open in the Preview (OrcaSlicer's G-code viewer): its name and contents.
     pub viewer: Option<(String, std::sync::Arc<CosmicSlicer_engine::Sliced>)>,
     /// A slice running: progress (0 to 1) and stage, for the progress card.
@@ -256,6 +274,8 @@ pub struct Session {
     pub plate_settings: Vec<PlateSettings>,
     /// Objects just imported that look as if they are in inches, for the prompt.
     pub units_prompt: Option<Vec<u64>>,
+    /// What each group of instances shared when last in step, to see which one was edited.
+    instance_sigs: std::collections::HashMap<u64, u64>,
 }
 
 /// OrcaSlicer's "Customize current plate" settings.
@@ -313,7 +333,7 @@ impl Session {
             notices: Vec::new(),
             now: 0.0,
             revision: 1,
-            sliced: None,
+            sliced: Vec::new(),
             viewer: None,
             slicing: None,
             cancel_slice: false,
@@ -322,6 +342,7 @@ impl Session {
             dirty: false,
             clipboard: Vec::new(),
             plate_settings: vec![PlateSettings::default()],
+            instance_sigs: std::collections::HashMap::new(),
             units_prompt: None,
         }
     }
@@ -476,7 +497,7 @@ impl Session {
     fn touch(&mut self) {
         self.revision = self.revision.wrapping_add(1);
         self.dirty = true;
-        self.sliced = None;
+        self.sliced.clear();
     }
 
     pub fn can_undo(&self) -> bool {
@@ -1089,25 +1110,108 @@ impl Session {
         }
     }
 
-    /// Nudges a newly added object along X until it overlaps nothing on its plate.
+    /// Puts a newly added object where it overlaps nothing on its plate, beside what is
+    /// there, or on a new plate when its plate is full (OrcaSlicer's auto-plating).
     fn place_clear_of_others(&mut self, id: u64) {
-        let others: Vec<Aabb> = self
-            .model
-            .objects
-            .iter()
-            .filter(|o| o.id != id && self.model.get(id).is_some_and(|n| n.plate == o.plate))
-            .map(|o| o.bounds())
-            .collect();
-        for _ in 0..64 {
-            let Some(o) = self.model.get(id) else { return };
-            let b = o.bounds();
-            let hit = others
-                .iter()
-                .find(|a| a.min.x < b.max.x && b.min.x < a.max.x && a.min.y < b.max.y && b.min.y < a.max.y);
-            let Some(a) = hit else { return };
-            let shift = a.max.x - b.min.x + 5.0;
-            if let Some(o) = self.model.get_mut(id) {
-                o.transform.offset.x += shift;
+        let Some(o) = self.model.get(id) else { return };
+        let plate = o.plate;
+        let half = self.prefs.arrange_spacing.max(0.0) / 2.0;
+        let mine = arrange::outline(&o.footprint(), half);
+        let clear = self.model.objects.iter().filter(|x| x.id != id && x.plate == plate).all(|x| {
+            let other = arrange::outline(&x.footprint(), half);
+            !arrange::overlap(&mine, &other)
+        });
+        if clear && self.fits(id) {
+            return;
+        }
+        self.arrange_ids(&[id], &[plate], true, false);
+    }
+
+    // ---- instances ----
+
+    /// Adds another instance of each selected object (OrcaSlicer's "+"), sharing its mesh,
+    /// parts, paint and settings.
+    pub fn add_instance(&mut self) {
+        if self.selection.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        let mut made = Vec::new();
+        for id in self.selection.clone() {
+            if let Some(new) = self.model.add_instance(id) {
+                self.place_clear_of_others(new);
+                made.push(new);
+            }
+        }
+        self.selection = made;
+    }
+
+    /// Removes the last instance of each selected object that has more than one ("-").
+    pub fn remove_instance(&mut self) {
+        let mut doomed = Vec::new();
+        for id in &self.selection {
+            let all = self.model.instances_of(*id);
+            if all.len() > 1
+                && let Some(last) = all.last()
+                && !doomed.contains(last)
+            {
+                doomed.push(*last);
+            }
+        }
+        if doomed.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        self.model.remove(&doomed);
+        for id in self.selection.clone() {
+            if self.model.instances_of(id).len() == 1 {
+                self.model.make_individual(id);
+            }
+        }
+        self.selection.retain(|id| !doomed.contains(id));
+    }
+
+    /// Makes each selected instance an object of its own.
+    pub fn make_individual(&mut self) {
+        let ids: Vec<u64> =
+            self.selection.iter().copied().filter(|id| self.model.instances_of(*id).len() > 1).collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for id in ids {
+            self.model.make_individual(id);
+        }
+    }
+
+    /// Carries an edit to one instance over to the others: whichever instance's shared data
+    /// changed since they were last in step is copied to the rest. Run once a frame.
+    pub fn sync_instances(&mut self) {
+        let groups: Vec<u64> = {
+            let mut g: Vec<u64> = self.model.objects.iter().map(|o| o.shared).filter(|g| *g != 0).collect();
+            g.sort_unstable();
+            g.dedup();
+            g
+        };
+        self.instance_sigs.retain(|g, _| groups.contains(g));
+        for g in groups {
+            let sigs: Vec<(u64, u64)> =
+                self.model.objects.iter().filter(|o| o.shared == g).map(|o| (o.id, shared_sig(o))).collect();
+            let Some(&(_, first)) = sigs.first() else { continue };
+            let agreed = sigs.iter().all(|(_, s)| *s == first);
+            let source = if agreed {
+                None
+            } else {
+                let known = self.instance_sigs.get(&g).copied();
+                sigs.iter().find(|(_, s)| Some(*s) != known).map(|(id, _)| *id)
+            };
+            if let Some(id) = source {
+                self.model.sync_instances(id);
+                self.revision = self.revision.wrapping_add(1);
+                self.sliced.clear();
+            }
+            if let Some(o) = self.model.objects.iter().find(|o| o.shared == g) {
+                self.instance_sigs.insert(g, shared_sig(o));
             }
         }
     }
@@ -1148,16 +1252,192 @@ impl Session {
 
     /// Arranges the current plate (or every unlocked plate).
     pub fn arrange(&mut self, all_plates: bool) {
-        self.checkpoint();
-        let (lo, size) = self.bed();
-        let plates: Vec<usize> = if all_plates { (0..self.model.plates).collect() } else { vec![self.plate] };
-        let gap = 6.0;
-        for p in plates {
-            if self.locked.get(p).copied().unwrap_or(false) {
-                continue;
+        self.arrange_in(if all_plates { ArrangeScope::AllPlates } else { ArrangeScope::Plate });
+    }
+
+    /// Arranges as OrcaSlicer does: footprints packed tight round each plate's centre, clear
+    /// of excluded bed areas and the prime tower, turned if allowed; overflow to new plates.
+    pub fn arrange_in(&mut self, scope: ArrangeScope) {
+        let locked = |p: usize| self.locked.get(p).copied().unwrap_or(false);
+        let (ids, plates): (Vec<u64>, Vec<usize>) = match scope {
+            ArrangeScope::Selection => {
+                let ids: Vec<u64> = self
+                    .selection
+                    .iter()
+                    .copied()
+                    .filter(|id| self.model.get(*id).is_some_and(|o| o.plate == self.plate))
+                    .collect();
+                (ids, vec![self.plate])
             }
-            let origin = self.plate_origin(p);
-            self.model.arrange(p, origin + lo.extend(0.0), size.extend(self.printable_height()), gap);
+            ArrangeScope::Plate => {
+                let ids = self.model.objects.iter().filter(|o| o.plate == self.plate).map(|o| o.id).collect();
+                (ids, vec![self.plate])
+            }
+            ArrangeScope::AllPlates => {
+                let plates: Vec<usize> = (0..self.model.plates).filter(|p| !locked(*p)).collect();
+                let ids = self.model.objects.iter().filter(|o| plates.contains(&o.plate)).map(|o| o.id).collect();
+                (ids, plates)
+            }
+        };
+        if scope != ArrangeScope::AllPlates && locked(self.plate) {
+            self.notify(Level::Info, "This plate is locked; unlock it to arrange it.");
+            return;
+        }
+        if ids.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        self.arrange_ids(&ids, &plates, scope != ArrangeScope::Selection, self.prefs.arrange_rotate);
+    }
+
+    /// The prime tower on plate `p`, when it will have one: front-left corner (plate
+    /// coordinates) and size, its depth estimated from the flushing volumes as the engine
+    /// sizes it.
+    pub fn tower(&self, p: usize) -> Option<(Vec2, Vec2)> {
+        let value = |k: &str| self.presets.value(self.schema, TabKind::Process, 0, k);
+        if !CosmicSlicer_config::is_true(&value("enable_prime_tower")) || self.presets.project_filaments.len() < 2 {
+            return None;
+        }
+        let nth = |k: &str, default: f32| {
+            let v = value(k);
+            let list: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).collect();
+            let x = list.get(p).or(list.first()).copied().unwrap_or(default);
+            if x.is_finite() { x.clamp(-1000.0, 10_000.0) } else { default }
+        };
+        let num = |k: &str, default: f32, lo: f32, hi: f32| {
+            let x = CosmicSlicer_config::first_number(&value(k)).map_or(default, |x| x as f32);
+            if x.is_finite() { x.clamp(lo, hi) } else { default }
+        };
+        let width = num("prime_tower_width", 60.0, 5.0, 300.0);
+        let layer = num("layer_height", 0.2, 0.01, 2.0);
+        let flush = value("flush_volumes_matrix")
+            .split(',')
+            .filter_map(|x| x.trim().parse::<f32>().ok())
+            .filter(|x| x.is_finite())
+            .fold(0.0f32, f32::max)
+            .min(5_000.0);
+        let volume = flush * num("flush_multiplier", 1.0, 0.0, 10.0) + num("prime_volume", 45.0, 0.0, 2000.0);
+        let line = 0.45;
+        let depth = (volume / (layer * (width - 2.0 * line).max(line)) + 4.0 * line).clamp(5.0, 300.0);
+        Some((Vec2::new(nth("wipe_tower_x", 15.0), nth("wipe_tower_y", 220.0)), Vec2::new(width, depth)))
+    }
+
+    /// Moves plate `p`'s prime tower (its front-left corner, plate coordinates). No undo step:
+    /// a drag takes one when it starts.
+    pub fn set_tower_at(&mut self, p: usize, at: Vec2) {
+        if !at.is_finite() {
+            return;
+        }
+        for (key, v) in [("wipe_tower_x", at.x), ("wipe_tower_y", at.y)] {
+            let old = self.presets.value(self.schema, TabKind::Process, 0, key);
+            let mut list: Vec<String> = old.split(',').map(|x| x.trim().to_owned()).filter(|x| !x.is_empty()).collect();
+            let first = list.first().cloned().unwrap_or_else(|| "0".into());
+            if list.len() < self.model.plates {
+                list.resize(self.model.plates, first);
+            }
+            if let Some(slot) = list.get_mut(p) {
+                *slot = format!("{:.3}", v).trim_end_matches('0').trim_end_matches('.').to_owned();
+            }
+            self.presets.set_value(self.schema, TabKind::Process, 0, key, list.join(","));
+        }
+        self.revision = self.revision.wrapping_add(1);
+        self.sliced.clear();
+    }
+
+    /// What objects must keep clear of on plate `p`, besides other objects (plate
+    /// coordinates): the printer's excluded bed area and the prime tower with its brim.
+    fn keep_clear(&self, p: usize) -> Vec<arrange::Polygon> {
+        let mut out = Vec::new();
+        let area = self.presets.value(self.schema, TabKind::Printer, 0, "bed_exclude_area");
+        let pts: Vec<Vec2> =
+            parse_points(&area).iter().take(4096).map(|[x, y]| Vec2::new(*x as f32, *y as f32)).collect();
+        let h = arrange::hull(&pts);
+        if h.len() >= 3 {
+            out.push(h);
+        }
+        if let Some((at, size)) = self.tower(p) {
+            let brim = CosmicSlicer_config::first_number(&self.presets.value(
+                self.schema,
+                TabKind::Process,
+                0,
+                "prime_tower_brim_width",
+            ))
+            .map_or(3.0, |b| b as f32);
+            let brim = if brim.is_finite() { brim.clamp(0.0, 50.0) } else { 3.0 };
+            let (lo, hi) = (at - Vec2::splat(brim), at + size + Vec2::splat(brim));
+            out.push(vec![lo, Vec2::new(hi.x, lo.y), hi, Vec2::new(lo.x, hi.y)]);
+        }
+        out
+    }
+
+    /// Arranges objects `ids` on `plates` (in that order), round the other objects there;
+    /// with `grow`, what does not fit goes on to new plates. Callers take the undo step.
+    fn arrange_ids(&mut self, ids: &[u64], plates: &[usize], grow: bool, rotate: bool) {
+        let (lo, size) = self.bed();
+        let spacing =
+            if self.prefs.arrange_spacing.is_finite() { self.prefs.arrange_spacing.clamp(0.0, 100.0) } else { 6.0 };
+        let half = spacing / 2.0;
+        let mut beds = Vec::new();
+        for &p in plates {
+            let origin = self.plate_origin(p).truncate();
+            let mut obstacles = self.keep_clear(p);
+            for o in self.model.objects.iter().filter(|o| o.plate == p && !ids.contains(&o.id)) {
+                let h: Vec<Vec2> = o.footprint().iter().map(|v| *v - origin).collect();
+                obstacles.push(arrange::outline(&h, half));
+            }
+            beds.push(arrange::Plate { min: lo, max: lo + size, obstacles });
+        }
+        let template = arrange::Plate { min: lo, max: lo + size, obstacles: self.keep_clear(self.model.plates) };
+        let mut items = Vec::new();
+        let mut pivots = Vec::new();
+        for &id in ids {
+            let Some(o) = self.model.get(id) else { continue };
+            let origin = self.plate_origin(o.plate).truncate();
+            let h = o.footprint();
+            let (a, b) = h
+                .iter()
+                .fold((Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY)), |(a, b), v| (a.min(*v), b.max(*v)));
+            let c = if a.is_finite() && b.is_finite() { (a + b) / 2.0 } else { origin };
+            items.push(h.iter().map(|v| *v - c).collect::<Vec<Vec2>>());
+            // On its own plate, as new plates may move the plates about.
+            pivots.push((id, c - origin));
+        }
+        let max = if grow {
+            plates.len() + crate::project::MAX_PLATES.saturating_sub(self.model.plates)
+        } else {
+            plates.len()
+        };
+        let placed = arrange::arrange(&items, &beds, &template, max, arrange::Options { spacing, rotate });
+        // New plates first, so their origins are known.
+        let extra = placed.iter().flatten().map(|p| p.plate + 1).max().unwrap_or(0).saturating_sub(plates.len());
+        if extra > 0 {
+            let before: Vec<Vec3> = (0..self.model.plates).map(|p| self.plate_origin(p)).collect();
+            self.model.plates += extra;
+            self.locked.resize(self.model.plates, false);
+            self.plate_settings.resize(self.model.plates, PlateSettings::default());
+            self.shift_objects(&before);
+        }
+        let first_new = self.model.plates - extra;
+        let mut too_big = 0;
+        for ((id, pivot), place) in pivots.iter().zip(&placed) {
+            let Some(place) = place else {
+                too_big += 1;
+                continue;
+            };
+            let target =
+                plates.get(place.plate).copied().unwrap_or(first_new + place.plate.saturating_sub(plates.len()));
+            let origin = self.plate_origin(target).truncate();
+            let Some(from) = self.model.get(*id).map(|o| self.plate_origin(o.plate).truncate()) else { continue };
+            if let Some(o) = self.model.get_mut(*id) {
+                o.turn_about(place.angle, from + *pivot, origin + place.at);
+                o.plate = target;
+            }
+        }
+        if too_big > 0 {
+            self.notify(
+                Level::Warning,
+                format!("{too_big} object(s) are too large for the plate and were left where they are."),
+            );
         }
     }
 
@@ -1172,21 +1452,45 @@ impl Session {
         }
     }
 
-    /// Turns each target so its largest flat area rests on the plate. Shapes with no flat
-    /// bigger than a tenth of their surface are left as they are.
+    /// Turns each target to leave the least overhang for the most area on the plate
+    /// (OrcaSlicer's auto orient); shapes with no better side are left as they are.
     pub fn auto_orient(&mut self) {
         let targets = self.targets();
         if targets.is_empty() {
             return;
         }
-        self.checkpoint();
-        for id in targets {
-            let Some(o) = self.model.get_mut(id) else { continue };
-            if let Some(n) = o.mesh.largest_face_normal(&o.matrix()) {
-                let mut t = o.transform;
-                t.set_quat(glam::Quat::from_rotation_arc(n, Vec3::NEG_Z) * t.quat());
-                o.transform = t;
+        let angle = CosmicSlicer_config::first_number(&self.presets.value(
+            self.schema,
+            TabKind::Process,
+            0,
+            "support_threshold_angle",
+        ))
+        .map_or(30.0, |a| a as f32);
+        // 0 is OrcaSlicer's "auto": 30°.
+        let angle = if angle.is_finite() && angle > 0.0 { angle.min(89.0) } else { 30.0 };
+        let mut turns = Vec::new();
+        for &id in &targets {
+            let Some(o) = self.model.get(id) else { continue };
+            let solids = o.solids();
+            if let Some(best) = CosmicSlicer_model::orient::best_down(&solids, angle) {
+                turns.push((id, glam::Quat::from_rotation_arc(best.down, Vec3::NEG_Z)));
             }
+        }
+        if turns.is_empty() {
+            self.notify(Level::Info, "The objects already stand the best way up.");
+            return;
+        }
+        self.checkpoint();
+        for (id, q) in turns {
+            let Some(o) = self.model.get_mut(id) else { continue };
+            let before = o.bounds().centre();
+            let mut t = o.transform;
+            t.set_quat(q * t.quat());
+            o.transform = t;
+            // Turned where it stands.
+            let after = o.bounds().centre();
+            o.transform.offset.x += before.x - after.x;
+            o.transform.offset.y += before.y - after.y;
             o.drop_to_bed();
         }
     }
@@ -1401,12 +1705,32 @@ impl Session {
         if let Some((_, v)) = &self.viewer {
             return Some(std::sync::Arc::clone(v));
         }
-        self.sliced.as_ref().filter(|s| s.is_current(self)).map(|s| std::sync::Arc::clone(&s.result))
+        self.result_for(self.plate)
+    }
+
+    /// Plate `plate`'s slice, while it is current.
+    pub fn result_for(&self, plate: usize) -> Option<std::sync::Arc<CosmicSlicer_engine::Sliced>> {
+        self.sliced.iter().find(|s| s.is_current_for(self, plate)).map(|s| std::sync::Arc::clone(&s.result))
     }
 
     pub fn title(&self) -> String {
         format!("{}{}", self.project.name, if self.dirty { "*" } else { "" })
     }
+}
+
+/// A hash of what instances share, cheap enough to take every frame (meshes by identity).
+fn shared_sig(o: &CosmicSlicer_model::Object) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (std::sync::Arc::as_ptr(&o.mesh) as usize).hash(&mut h);
+    o.paint.as_ref().map(|p| std::sync::Arc::as_ptr(p) as usize).hash(&mut h);
+    for p in &o.parts {
+        (std::sync::Arc::as_ptr(&p.mesh) as usize, &p.name, p.kind, &p.overrides).hash(&mut h);
+        format!("{:?}", p.transform).hash(&mut h);
+    }
+    format!("{:?}{:?}{:?}", o.ranges, o.brim_ears, o.layer_profile).hash(&mut h);
+    (&o.name, &o.overrides, o.filament).hash(&mut h);
+    h.finish()
 }
 
 /// Plates per row in the scene.
@@ -1543,12 +1867,187 @@ mod tests {
         for &id in &ids {
             assert!(s.fits(id));
         }
-        let boxes: Vec<Aabb> = s.model.objects.iter().map(|o| o.bounds()).collect();
-        for (i, a) in boxes.iter().enumerate() {
-            for b in boxes.iter().skip(i + 1) {
-                assert!(a.max.x <= b.min.x + 1e-3 || b.max.x <= a.min.x + 1e-3);
+        assert_apart(&s, &ids);
+    }
+
+    /// No two of `ids` on the same plate overlap (their footprints, less a hair).
+    fn assert_apart(s: &Session, ids: &[u64]) {
+        let shapes: Vec<(usize, Vec<Vec2>)> =
+            ids.iter().filter_map(|id| s.model.get(*id)).map(|o| (o.plate, o.footprint())).collect();
+        for (i, (pa, a)) in shapes.iter().enumerate() {
+            for (pb, b) in shapes.iter().skip(i + 1) {
+                if pa == pb {
+                    let shrink = |p: &Vec<Vec2>| {
+                        let c = p.iter().copied().sum::<Vec2>() / p.len().max(1) as f32;
+                        p.iter().map(|v| c + (*v - c) * 0.999).collect::<Vec<Vec2>>()
+                    };
+                    assert!(!arrange::overlap(&shrink(a), &shrink(b)), "objects overlap on plate {pa}");
+                }
             }
         }
+    }
+
+    #[test]
+    fn arrange_all_packs_thirty_mixed_parts() {
+        let mut s = Session::new();
+        let shapes = ["Cube", "Cylinder", "Cone", "Sphere", "Torus"];
+        for k in 0..30 {
+            s.add_primitive(shapes[k % shapes.len()]);
+            let id = s.selection[0];
+            if let Some(o) = s.model.get_mut(id) {
+                let f = 0.4 + (k * 7 % 10) as f32 * 0.08;
+                o.transform.scale = Vec3::new(f, f * (0.6 + (k % 3) as f32 * 0.3), f);
+                o.transform.rotation.z = (k * 37 % 90) as f32;
+                o.drop_to_bed();
+            }
+        }
+        // All in a heap in the middle first.
+        let (lo, size) = s.bed();
+        let centre = lo + size / 2.0;
+        for o in &mut s.model.objects {
+            let c = o.bounds().centre();
+            o.transform.offset += Vec3::new(centre.x - c.x, centre.y - c.y, 0.0);
+        }
+        s.prefs.arrange_rotate = true;
+        let heap: Vec<Vec3> = s.model.objects.iter().map(|o| o.transform.offset).collect();
+        s.arrange(true);
+        let ids: Vec<u64> = s.model.objects.iter().map(|o| o.id).collect();
+        assert_eq!(ids.len(), 30);
+        for &id in &ids {
+            assert!(s.fits(id), "{:?}", s.model.get(id).map(|o| o.bounds()));
+        }
+        assert_apart(&s, &ids);
+        assert_eq!(s.model.plates, 1, "they fit on one plate");
+        // Undo puts the heap back.
+        s.undo();
+        assert_eq!(s.model.objects.iter().map(|o| o.transform.offset).collect::<Vec<_>>(), heap);
+    }
+
+    #[test]
+    fn what_does_not_fit_goes_on_new_plates() {
+        let mut s = Session::new();
+        for _ in 0..12 {
+            s.add_primitive("Cube");
+            let id = s.selection[0];
+            if let Some(o) = s.model.get_mut(id) {
+                o.transform.scale = Vec3::splat(3.0);
+                o.drop_to_bed();
+            }
+        }
+        s.arrange(false);
+        assert_eq!(s.model.plates, 2, "nine 60 mm cubes fill a plate");
+        let ids: Vec<u64> = s.model.objects.iter().map(|o| o.id).collect();
+        for &id in &ids {
+            assert!(s.fits(id));
+        }
+        assert_apart(&s, &ids);
+        assert_eq!(s.model.objects.iter().filter(|o| o.plate == 1).count(), 3);
+        s.undo();
+        assert_eq!(s.model.plates, 1);
+    }
+
+    #[test]
+    fn arranged_objects_keep_off_the_excluded_area_and_the_tower() {
+        let mut s = Session::new();
+        let schema = s.schema;
+        s.presets.set_value(schema, TabKind::Printer, 0, "bed_exclude_area", "0x0,80x0,80x80,0x80".into());
+        s.presets.add_filament();
+        s.presets.set_value(schema, TabKind::Process, 0, "enable_prime_tower", "1".into());
+        s.presets.set_value(schema, TabKind::Process, 0, "wipe_tower_x", "150".into());
+        s.presets.set_value(schema, TabKind::Process, 0, "wipe_tower_y", "150".into());
+        for _ in 0..8 {
+            s.add_primitive("Cylinder");
+        }
+        s.arrange(false);
+        let tower = s.tower(0);
+        assert!(tower.is_some_and(|(at, size)| at == Vec2::splat(150.0) && size.x == 60.0 && size.y > 5.0));
+        let keep = s.keep_clear(0);
+        assert_eq!(keep.len(), 2);
+        for o in &s.model.objects {
+            let f = o.footprint();
+            assert!(keep.iter().all(|k| !arrange::overlap(k, &f)), "{:?}", o.bounds());
+            assert!(s.fits(o.id));
+        }
+        // The tower is dragged on plate 0 only; the slice of plate 0 puts it there.
+        s.add_plate();
+        s.set_tower_at(0, Vec2::new(20.0, 120.0));
+        assert_eq!(s.tower(0).map(|t| t.0), Some(Vec2::new(20.0, 120.0)));
+        assert_eq!(s.tower(1).map(|t| t.0), Some(Vec2::splat(150.0)));
+        let job = crate::slicer::job(&s, 0);
+        assert_eq!(job.process.get(schema, "wipe_tower_x"), "20");
+    }
+
+    #[test]
+    fn instances_share_their_settings_and_save_as_one_object() {
+        let (mut s, id) = cube_session();
+        s.selection = vec![id];
+        s.add_instance();
+        let copy = s.selection[0];
+        assert_ne!(copy, id);
+        assert_eq!(s.model.instances_of(id).len(), 2);
+        let (a, b) = (s.model.get(id).map(|o| o.bounds()), s.model.get(copy).map(|o| o.bounds()));
+        assert!(a.zip(b).is_some_and(|(a, b)| a.max.x <= b.min.x
+            || b.max.x <= a.min.x
+            || a.max.y <= b.min.y
+            || b.max.y <= a.min.y));
+        // An edit to one, by any route, reaches the other on the next frame.
+        s.sync_instances();
+        s.set_override(copy, "wall_loops", "5");
+        s.sync_instances();
+        assert!(s.model.get(id).is_some_and(|o| o.overrides.iter().any(|(k, v)| k == "wall_loops" && v == "5")));
+        // Each keeps its own placement.
+        s.set_transform(
+            id,
+            Transform {
+                rotation: Vec3::new(0.0, 0.0, 45.0),
+                ..s.model.get(id).map(|o| o.transform).unwrap_or_default()
+            },
+        );
+        s.sync_instances();
+        assert!(s.model.get(copy).is_some_and(|o| o.transform.rotation.z == 0.0));
+        // Saved as one object placed twice.
+        let p = crate::project::to_project(&s);
+        assert_eq!(p.objects.len(), 1);
+        assert_eq!(p.objects.first().map(|o| o.instances.len()), Some(2));
+        // Set apart, they no longer share.
+        s.selection = vec![copy];
+        s.make_individual();
+        assert_eq!(s.model.instances_of(id), vec![id]);
+        s.set_override(copy, "wall_loops", "2");
+        s.sync_instances();
+        assert!(s.model.get(id).is_some_and(|o| o.overrides.iter().any(|(k, v)| k == "wall_loops" && v == "5")));
+        // "-" removes the last instance.
+        s.selection = vec![id];
+        s.add_instance();
+        s.selection = vec![id];
+        s.remove_instance();
+        assert_eq!(s.model.instances_of(id), vec![id]);
+        assert_eq!(s.model.objects.len(), 2);
+    }
+
+    #[test]
+    fn auto_orient_stands_a_cone_on_its_base() {
+        let mut s = Session::new();
+        s.add_primitive("Cone");
+        let id = s.selection[0];
+        if let Some(o) = s.model.get_mut(id) {
+            o.transform.rotation.x = 180.0;
+            o.drop_to_bed();
+        }
+        s.auto_orient();
+        let o = s.model.get(id);
+        // The base (local Z 0) is down now: the point (local top) is the highest point.
+        assert!(o.is_some_and(|o| {
+            let top = o
+                .mesh
+                .vertices
+                .iter()
+                .map(|v| o.matrix().transform_point3(*v))
+                .fold(Vec3::splat(f32::NEG_INFINITY), |a, b| if b.z > a.z { b } else { a });
+            (top.z - o.bounds().max.z).abs() < 1e-3
+                && o.bounds().min.z.abs() < 1e-3
+                && o.matrix().transform_vector3(Vec3::Z).z > 0.99
+        }));
     }
 
     #[test]
