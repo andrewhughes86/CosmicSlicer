@@ -756,23 +756,34 @@ fn triangulate(ctx: &Ctx<'_>, polygons: &[Vec<Uv>], flip: bool) -> Result<Vec<[D
     let (lo, hi) = all().fold(([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]), |(lo, hi), p| {
         ([lo[0].min(p.uv[0]), lo[1].min(p.uv[1])], [hi[0].max(p.uv[0]), hi[1].max(p.uv[1])])
     });
-    // Scale u and v so parameter distances match surface distances on average.
-    let mut su = 0.0;
-    let mut sv = 0.0;
+    // Scale u and v by the parameter step the tolerance allows along each, from how much the
+    // surface bends that way, so the triangulation's even triangles are long where the
+    // surface runs straight. Scaled by arc length alone, a cylinder was meshed evenly at its
+    // circumferential step all over (140 000 triangles where 700 do).
+    let span = [hi[0] - lo[0], hi[1] - lo[1]];
+    let mut sag = [0.0f64; 2];
     for i in 0..5 {
         for j in 0..5 {
-            let uv = [
-                lo[0] + (hi[0] - lo[0]) * (f64::from(i) + 0.5) / 5.0,
-                lo[1] + (hi[1] - lo[1]) * (f64::from(j) + 0.5) / 5.0,
-            ];
-            let (du, dv) = if ctx.swapped { ctx.s.derivatives(uv[1], uv[0]) } else { ctx.s.derivatives(uv[0], uv[1]) };
-            let (du, dv) = if ctx.swapped { (dv, du) } else { (du, dv) };
-            su += du.length();
-            sv += dv.length();
+            let uv = [lo[0] + span[0] * (f64::from(i) + 0.5) / 5.0, lo[1] + span[1] * (f64::from(j) + 0.5) / 5.0];
+            let mid = ctx.eval(uv);
+            for (d, worst) in sag.iter_mut().enumerate() {
+                let (mut a, mut b) = (uv, uv);
+                a[d] -= span[d] / 16.0;
+                b[d] += span[d] / 16.0;
+                let dev = ((ctx.eval(a) + ctx.eval(b)) / 2.0 - mid).length();
+                if dev.is_finite() {
+                    *worst = worst.max(dev);
+                }
+            }
         }
     }
-    let su = if su > 1.0e-12 { su / 25.0 } else { 1.0 };
-    let sv = if sv > 1.0e-12 { sv / 25.0 } else { 1.0 };
+    // A chord's sag grows with the square of its length: the step with a sag of `tol`.
+    let scale = |d: usize| {
+        let whole = span[d].max(1.0e-12);
+        let step = whole / 8.0 * (ctx.tol / sag[d].max(1.0e-300)).sqrt();
+        1.0 / step.clamp(whole * 1.0e-6, whole)
+    };
+    let (su, sv) = (scale(0), scale(1));
     let scaled = |uv: [f64; 2]| [uv[0] * su, uv[1] * sv];
     let unscale = |x: f64, y: f64| [x / su, y / sv];
     let scaled_polys: Vec<Vec<[f64; 2]>> = polygons.iter().map(|p| p.iter().map(|q| scaled(q.uv)).collect()).collect();
@@ -832,7 +843,10 @@ fn triangulate(ctx: &Ctx<'_>, polygons: &[Vec<Uv>], flip: bool) -> Result<Vec<[D
                 }
             }
         }
-        // Split edges and triangles that stray from the surface.
+        // Split edges and triangles that stray from the surface. A boundary that crosses
+        // itself (damaged edges) cannot be honoured however fine the mesh: a small budget,
+        // or the triangles straddling it are split until the face limit.
+        let limit = if constrained { MAX_FACE_VERTICES } else { (pos.len() * 4).clamp(10_000, MAX_FACE_VERTICES) };
         for _ in 0..MAX_PASSES {
             let mut add: Vec<[f64; 2]> = Vec::new();
             let mut seen: HashSet<[u64; 2]> = HashSet::new();
@@ -866,7 +880,7 @@ fn triangulate(ctx: &Ctx<'_>, polygons: &[Vec<Uv>], flip: bool) -> Result<Vec<[D
                     add.push(c);
                 }
             }
-            if add.is_empty() || pos.len() + add.len() > MAX_FACE_VERTICES {
+            if add.is_empty() || pos.len() + add.len() > limit {
                 break;
             }
             let mut added = false;

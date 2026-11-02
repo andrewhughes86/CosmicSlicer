@@ -147,29 +147,16 @@ fn base_seed() -> u64 {
 pub fn run(name: &str, samples: &[Vec<u8>], read: &dyn Fn(&[u8])) -> Vec<String> {
     let mut failures = Vec::new();
     for (k, sample) in samples.iter().enumerate() {
-        let seed = base_seed() ^ (k as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ fnv(name);
+        let seed = seed_for(name, k);
         let mut rng = Rng::new(seed);
         for i in 0..=iterations() {
             let input = if i == 0 { sample.clone() } else { mutate(sample, &mut rng) };
-            // Left behind if the process is killed mid-case (out of memory): the culprit.
-            let running = running_dir().join(format!("{name}-{k}-case{i}-seed{seed:#x}.bin"));
-            let _ = std::fs::write(&running, &input);
-            let before = peak_rss_mb();
-            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(&input))).is_ok();
-            let grew = match (before, peak_rss_mb()) {
-                (Some(a), Some(b)) if b > a.max(MAX_PEAK_MB) => Some(b),
-                _ => None,
-            };
-            let _ = std::fs::remove_file(&running);
-            if !ok || grew.is_some() {
-                let path = std::env::temp_dir().join(format!("cosmicslicer-fuzz-{name}-{k}-{i}.bin"));
-                let _ = std::fs::write(&path, &input);
-                let what = match grew {
-                    Some(mb) => format!("took the process to {mb} MB"),
-                    None => "panicked".to_owned(),
-                };
-                failures
-                    .push(format!("{name}: sample {k}, seed {seed:#x}, case {i} {what}; input in {}", path.display()));
+            let case = format!("{name}-{k}-case{i}-seed{seed:#x}");
+            if let Some(f) = guard(&case, &input, &mut || {
+                read(&input);
+                Ok(())
+            }) {
+                failures.push(f);
                 if failures.len() > 5 {
                     break;
                 }
@@ -178,6 +165,48 @@ pub fn run(name: &str, samples: &[Vec<u8>], read: &dyn Fn(&[u8])) -> Vec<String>
     }
     failures
 }
+
+/// The seed of sample `k` of the fuzz run `name`.
+pub fn seed_for(name: &str, k: usize) -> u64 {
+    base_seed() ^ (k as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ fnv(name)
+}
+
+/// Runs one case, described by `input` (the bytes, or text saying how to rebuild it). The
+/// case fails when `f` panics or returns an error, takes more than `MAX_CASE_SECS` or takes
+/// the process past `MAX_PEAK_MB`; the failure names the case and where its input was saved.
+/// While it runs the input sits in `<tmp>/cosmicslicer-fuzz/<case>.bin`: left behind if the
+/// process is killed (out of memory), it names the culprit.
+pub fn guard(case: &str, input: &[u8], f: &mut dyn FnMut() -> Result<(), String>) -> Option<String> {
+    let running = running_dir().join(format!("{case}.bin"));
+    let _ = std::fs::write(&running, input);
+    let before = peak_rss_mb();
+    let start = std::time::Instant::now();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut *f));
+    let secs = start.elapsed().as_secs_f64();
+    let grew = match (before, peak_rss_mb()) {
+        (Some(a), Some(b)) if b > a.max(MAX_PEAK_MB) => Some(b),
+        _ => None,
+    };
+    let _ = std::fs::remove_file(&running);
+    if secs > 1.0 {
+        let path = std::env::temp_dir().join(format!("cosmicslicer-fuzz-slow-{case}.bin"));
+        let _ = std::fs::write(&path, input);
+        eprintln!("slow fuzz case: {case} took {secs:.1} s; input in {}", path.display());
+    }
+    let what = match (result, grew) {
+        (Err(_), _) => "panicked".to_owned(),
+        (Ok(Err(e)), _) => format!("failed: {e}"),
+        (Ok(Ok(())), Some(mb)) => format!("took the process to {mb} MB"),
+        (Ok(Ok(())), None) if secs > MAX_CASE_SECS => format!("took {secs:.0} s"),
+        (Ok(Ok(())), None) => return None,
+    };
+    let path = std::env::temp_dir().join(format!("cosmicslicer-fuzz-{case}.bin"));
+    let _ = std::fs::write(&path, input);
+    Some(format!("{case} {what}; input in {}", path.display()))
+}
+
+/// A case slower than this fails (debug builds; nothing small should come near it).
+const MAX_CASE_SECS: f64 = 60.0;
 
 /// A case that takes the process's peak memory past this fails: no file of a few MB needs it.
 const MAX_PEAK_MB: u64 = 512;

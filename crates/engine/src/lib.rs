@@ -955,6 +955,8 @@ fn support_marks(o: &JobObject, placed: &Placed, layers: &[LayerZ], cancelled: &
 }
 
 #[cfg(test)]
+mod fuzz_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
     use CosmicSlicer_model::primitives;

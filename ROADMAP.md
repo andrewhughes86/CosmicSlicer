@@ -473,6 +473,21 @@ English); attachments in autosaves (they live in the project file).
 - From session 10: mesh booleans between parts (union, difference, intersection) and repair
   of self-intersections.
 
+Done so far (2026-11-02):
+- A mutation fuzzer that runs with the normal tests (`import::fuzz`; cargo-fuzz needs
+  nightly): every model reader and the zip/gzip layers, each part of a 3MF project, the
+  G-code viewer, the engine with random values for any setting (half from the options it
+  reads) and with broken meshes (moved, merged, dropped and flipped triangles, bad indices,
+  non-finite coordinates). A case fails on a panic, `SliceError::Bug`, a minute or 512 MB.
+- Found and fixed: SAT loops whose damaged pointers never close (4 GB), a record number
+  overflow, `brep::orient_outward` gridding sliver triangles (1.5 GB), and CAD surfaces
+  meshed evenly at their tightest bend: the trimmer's parameter space is now scaled by the
+  step the tolerance allows in each direction (a cylinder 140 000 → 1 430 triangles, a real
+  STEP part 10 104 → 3 334 at the same volume). Port these to CosmicDMS, which the import
+  crate is vendored from.
+- `tools/capped.sh` runs cargo in a memory-capped scope with logs in `target/diag/` (a
+  runaway test once took VS Code down).
+
 ## 19 · Parity with OrcaSlicer
 - A reference set (calibration cube, Benchy, thin walls, overhang test, multi-part, multi-colour,
   large and small parts) sliced by both with the same profiles.

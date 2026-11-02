@@ -1315,4 +1315,32 @@ mod tests {
         assert!(read(b"not a zip").is_err());
         Ok(())
     }
+
+    /// Each part of a project damaged at random inside a sound archive (damage to the archive
+    /// itself mostly stops at its checksums), and the whole file: a project or an error.
+    #[test]
+    fn damaged_parts_read_or_say_why() -> ModelResult<()> {
+        use CosmicSlicer_import::fuzz;
+        let good = write(&sample())?;
+        let z = Zip::open(&good).map_err(import_error)?;
+        let parts: Vec<(String, Vec<u8>)> = z.names().filter_map(|n| Some((n.to_owned(), z.read(n).ok()?))).collect();
+        assert!(parts.len() >= 4);
+        let mut failures = fuzz::run("3mf", std::slice::from_ref(&good), &|b| {
+            let _ = read(b);
+        });
+        for (k, (name, bytes)) in parts.iter().enumerate() {
+            let label = format!("3mf-{}", name.replace(['/', '.'], "_"));
+            failures.extend(fuzz::run(&label, std::slice::from_ref(bytes), &|b| {
+                let mut files = parts.clone();
+                if let Some(f) = files.get_mut(k) {
+                    f.1 = b.to_vec();
+                }
+                if let Ok(zipped) = zip::write(&files) {
+                    let _ = read(&zipped);
+                }
+            }));
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+        Ok(())
+    }
 }

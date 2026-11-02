@@ -39,6 +39,7 @@ name = "CosmicSlicer-engine"
 version = "0.1.0"
 dependencies = [
  "CosmicSlicer-config",
+ "CosmicSlicer-import",
  "CosmicSlicer-model",
  "glam",
  "i_overlay",

@@ -107,9 +107,11 @@ fn every_reader_survives_damaged_files() {
     let mut failures = Vec::new();
     for (format, bytes) in samples() {
         let name = format!("{format:?}");
+        let start = std::time::Instant::now();
         failures.extend(fuzz::run(&name, &[bytes], &|b| {
             let _ = crate::read_model(b, format, Options::default(), &|_| None);
         }));
+        eprintln!("{name}: {:.1} s", start.elapsed().as_secs_f64());
     }
     // The zip and gzip layers on their own.
     failures.extend(fuzz::run("zip", &[three_mf()], &|b| {
@@ -124,19 +126,34 @@ fn every_reader_survives_damaged_files() {
 }
 
 /// Replays one saved case: `COSMICSLICER_FUZZ_REPLAY=<tmp>/cosmicslicer-fuzz/Sat-0-case139-….bin`
-/// (the file name starts with the format). Does nothing without it.
+/// or a failure's `<tmp>/cosmicslicer-fuzz-Sat-…bin` (the name gives the format). Does nothing without it.
 #[test]
 fn replay() {
     let Some(path) = std::env::var_os("COSMICSLICER_FUZZ_REPLAY") else { return };
     let path = std::path::PathBuf::from(path);
     let bytes = std::fs::read(&path).unwrap_or_default();
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let name = name.strip_prefix("cosmicslicer-fuzz-").unwrap_or(name);
+    let name = name.strip_prefix("slow-").unwrap_or(name);
     let format = samples().into_iter().map(|(f, _)| f).find(|f| name.starts_with(&format!("{f:?}-")));
     let start = std::time::Instant::now();
     match format {
         Some(format) => {
             let r = crate::read_model(&bytes, format, Options::default(), &|_| None);
-            let r = r.map(|m| format!("{} triangles, {:?}", m.mesh.triangles().len(), m.warnings));
+            let r = r.map(|m| {
+                let (p, t) = (m.mesh.positions(), m.mesh.triangles());
+                let at = |i: u32| p.get(i as usize).map_or(glam::DVec3::ZERO, |v| v.as_dvec3());
+                let volume: f64 = t.iter().map(|t| at(t[0]).dot(at(t[1]).cross(at(t[2])))).sum::<f64>() / 6.0;
+                let mut edges = std::collections::HashMap::new();
+                for t in t {
+                    for k in 0..3 {
+                        let (a, b) = (t[k], t[(k + 1) % 3]);
+                        *edges.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+                    }
+                }
+                let open = edges.values().filter(|n| **n != 2).count();
+                format!("{} triangles, volume {volume:.6e}, {open} open edges, {:?}", t.len(), m.warnings)
+            });
             eprintln!("{format:?}: {r:?} in {:?}", start.elapsed());
         }
         None => eprintln!("no format for {name}"),
