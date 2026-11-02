@@ -9,7 +9,7 @@
 //! entity id and topology and geometry records a pattern pointer; both are skipped. Subtypes
 //! (`{ … }`) are numbered as they appear so `{ ref n }` finds its definition.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::geom::brep::{Axes, Curve, Surface};
 use crate::geom::nurbs::{NurbsCurve, NurbsSurface};
@@ -22,6 +22,8 @@ use crate::{ImportError, Imported, Options, Soup, Units};
 const MAX_RECORDS: usize = 5_000_000;
 /// Most coedges followed around one loop, and loops on one face.
 const MAX_LOOP: usize = 100_000;
+/// Most boundary points on one face.
+const MAX_FACE_POINTS: usize = 2_000_000;
 /// Most control points in one spline.
 const MAX_POLES: usize = 4_000_000;
 
@@ -281,18 +283,19 @@ impl Sat {
         Some(pts)
     }
 
-    /// A face's boundary loops as point rings.
+    /// A face's boundary loops as point rings. Each loop and coedge is taken once: damaged
+    /// pointers can make rings that never come back to their start.
     fn loops(&mut self, face: i64) -> Vec<Vec<DVec3>> {
         let mut out = Vec::new();
         let mut lp = self.ptr(face, 1);
-        let mut seen = 0usize;
-        while lp >= 0 && seen < MAX_LOOP {
-            seen += 1;
+        let (mut loops_seen, mut coedges_seen) = (HashSet::new(), HashSet::new());
+        let mut points = 0usize;
+        while lp >= 0 && loops_seen.len() < MAX_LOOP && loops_seen.insert(lp) {
             let first = self.ptr(lp, 1);
             let mut ring: Vec<DVec3> = Vec::new();
             let mut co = first;
             let mut steps = 0usize;
-            while co >= 0 && steps < MAX_LOOP {
+            while co >= 0 && steps < MAX_LOOP && points < MAX_FACE_POINTS && coedges_seen.insert(co) {
                 steps += 1;
                 let edge = self.ptr(co, 3);
                 if let Some(mut pts) = self.edge(edge) {
@@ -302,6 +305,7 @@ impl Sat {
                     if pts.len() > 1 {
                         pts.pop();
                     }
+                    points += pts.len();
                     ring.extend(pts);
                 }
                 co = self.ptr(co, 0);
@@ -579,7 +583,7 @@ pub fn read(bytes: &[u8], options: Options) -> Result<Imported, ImportError> {
             }
             _ => next,
         };
-        next = id + 1;
+        next = id.saturating_add(1);
         let Some(Tok::Word(kind)) = toks.first().cloned() else { continue };
         toks.remove(0);
         for (k, t) in toks.iter().enumerate() {
@@ -677,4 +681,4 @@ pub fn read(bytes: &[u8], options: Options) -> Result<Imported, ImportError> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -130,91 +130,102 @@ pub fn warnings(t: &Tessellated, total: usize) -> Vec<String> {
 /// face out of the solid: a point just off each face along its normal is tested for being
 /// inside the model by counting crossings along the three axes (majority vote). On an open
 /// surface set the count is meaningless but harmless.
+///
+/// The probes (one per face) are gridded, not the triangles: a sliver triangle spanning the
+/// model would sit in thousands of cells, and a few hundred thousand of them once took GBs.
+/// Each triangle visits the probes in the cells it covers, or all of them when that is fewer.
 pub fn orient_outward(faces: &mut [Vec<[DVec3; 3]>], unknown: &[bool]) {
     if !unknown.iter().any(|u| *u) {
         return;
     }
-    let all: Vec<[DVec3; 3]> = faces.iter().flatten().copied().collect();
-    if all.is_empty() {
-        return;
-    }
-    let (lo, hi) = all
+    let (lo, hi) = faces
         .iter()
         .flatten()
+        .flatten()
         .fold((DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY)), |(a, b), p| (a.min(*p), b.max(*p)));
+    if !(lo.is_finite() && hi.is_finite()) {
+        return;
+    }
     let size = (hi - lo).length().max(1.0e-9);
-    let n = ((all.len() as f64).sqrt() / 2.0).clamp(8.0, 512.0) as usize;
-    // Per axis: a grid over the other two coordinates holding triangle indices.
-    let grids: Vec<(usize, usize, Vec<Vec<u32>>)> = (0..3)
-        .map(|k| {
-            let (a, b) = ((k + 1) % 3, (k + 2) % 3);
-            let mut cells = vec![Vec::new(); n * n];
-            let cell = |v: f64, i: usize| {
-                (((v - lo[i]) / (hi[i] - lo[i]).max(1.0e-12) * n as f64).floor().max(0.0) as usize).min(n - 1)
-            };
-            for (t, tri) in all.iter().enumerate() {
-                let (mut ia0, mut ia1, mut ib0, mut ib1) = (n, 0, n, 0);
-                for p in tri {
-                    let (ca, cb) = (cell(p[a], a), cell(p[b], b));
-                    ia0 = ia0.min(ca);
-                    ia1 = ia1.max(ca);
-                    ib0 = ib0.min(cb);
-                    ib1 = ib1.max(cb);
-                }
-                for i in ia0..=ia1 {
-                    for j in ib0..=ib1 {
-                        if let Some(c) = cells.get_mut(i * n + j) {
-                            c.push(t as u32);
-                        }
-                    }
-                }
-            }
-            (a, b, cells)
+    // One probe per face of unknown side: just off its largest triangle, along its normal.
+    let probes: Vec<(usize, DVec3)> = faces
+        .iter()
+        .zip(unknown)
+        .enumerate()
+        .filter(|(_, (_, u))| **u)
+        .filter_map(|(i, (face, _))| {
+            let area = |t: &[DVec3; 3]| (t[1] - t[0]).cross(t[2] - t[0]).length();
+            let big = face.iter().max_by(|x, y| area(x).total_cmp(&area(y)))?;
+            let normal = (big[1] - big[0]).cross(big[2] - big[0]).try_normalize()?;
+            Some((i, (big[0] + big[1] + big[2]) / 3.0 + normal * size * 1.0e-5))
         })
         .collect();
-    let inside = |p: DVec3| -> bool {
-        let mut votes = 0;
-        for (k, (a, b, cells)) in grids.iter().enumerate() {
-            let cell = |v: f64, i: usize| {
-                (((v - lo[i]) / (hi[i] - lo[i]).max(1.0e-12) * n as f64).floor().max(0.0) as usize).min(n - 1)
-            };
-            let Some(list) = cells.get(cell(p[*a], *a) * n + cell(p[*b], *b)) else { continue };
-            let mut count = 0;
-            for &t in list {
-                let Some(tri) = all.get(t as usize) else { continue };
-                let q = |v: DVec3| (v[*a] - p[*a], v[*b] - p[*b]);
+    if probes.is_empty() {
+        return;
+    }
+    let n = ((probes.len() as f64).sqrt().ceil()).clamp(1.0, 512.0) as usize;
+    let cell = |v: f64, i: usize| {
+        (((v - lo[i]) / (hi[i] - lo[i]).max(1.0e-12) * n as f64).floor().max(0.0) as usize).min(n - 1)
+    };
+    // Crossings above each probe, per axis.
+    let mut crossings = vec![[0u32; 3]; probes.len()];
+    for k in 0..3 {
+        let (a, b) = ((k + 1) % 3, (k + 2) % 3);
+        let mut cells: Vec<Vec<u32>> = vec![Vec::new(); n * n];
+        for (pi, (_, p)) in probes.iter().enumerate() {
+            if let Some(c) = cells.get_mut(cell(p[a], a) * n + cell(p[b], b)) {
+                c.push(pi as u32);
+            }
+        }
+        for tri in faces.iter().flatten() {
+            let mut test = |pi: u32| {
+                let Some((_, p)) = probes.get(pi as usize) else { return };
+                let q = |v: DVec3| (v[a] - p[a], v[b] - p[b]);
                 let (p0, p1, p2) = (q(tri[0]), q(tri[1]), q(tri[2]));
-                // The origin inside the projected triangle, by edge signs (half-open on ties).
+                // The probe inside the projected triangle, by edge signs (half-open on ties).
                 let edge = |u: (f64, f64), w: (f64, f64)| u.0 * w.1 - u.1 * w.0;
                 let (d0, d1, d2) = (edge(p0, p1), edge(p1, p2), edge(p2, p0));
                 let all_pos = d0 > 0.0 && d1 > 0.0 && d2 > 0.0;
                 let all_neg = d0 < 0.0 && d1 < 0.0 && d2 < 0.0;
                 if !(all_pos || all_neg) {
-                    continue;
+                    return;
                 }
                 let area = d0 + d1 + d2;
                 // Height of the crossing along the axis, by barycentric weights.
                 let h = (d1 * tri[0][k] + d2 * tri[1][k] + d0 * tri[2][k]) / area;
-                if h > p[k] {
-                    count += 1;
+                if h > p[k]
+                    && let Some(c) = crossings.get_mut(pi as usize).and_then(|c| c.get_mut(k))
+                {
+                    *c += 1;
+                }
+            };
+            let (mut ia0, mut ia1, mut ib0, mut ib1) = (n, 0, n, 0);
+            for p in tri {
+                let (ca, cb) = (cell(p[a], a), cell(p[b], b));
+                ia0 = ia0.min(ca);
+                ia1 = ia1.max(ca);
+                ib0 = ib0.min(cb);
+                ib1 = ib1.max(cb);
+            }
+            let covered = (ia1.saturating_sub(ia0) + 1) * (ib1.saturating_sub(ib0) + 1);
+            if covered >= probes.len() {
+                (0..probes.len() as u32).for_each(&mut test);
+            } else {
+                for i in ia0..=ia1 {
+                    for j in ib0..=ib1 {
+                        for &pi in cells.get(i * n + j).map_or(&[][..], Vec::as_slice) {
+                            test(pi);
+                        }
+                    }
                 }
             }
-            if count % 2 == 1 {
-                votes += 1;
-            }
         }
-        votes >= 2
-    };
-    for (face, _) in faces.iter_mut().zip(unknown).filter(|(_, u)| **u) {
-        let Some(big) = face.iter().max_by(|x, y| {
-            let area = |t: &[DVec3; 3]| (t[1] - t[0]).cross(t[2] - t[0]).length();
-            area(x).total_cmp(&area(y))
-        }) else {
-            continue;
-        };
-        let Some(normal) = (big[1] - big[0]).cross(big[2] - big[0]).try_normalize() else { continue };
-        let c = (big[0] + big[1] + big[2]) / 3.0;
-        if inside(c + normal * size * 1.0e-5) {
+    }
+    for ((face, _), counts) in probes.iter().zip(&crossings) {
+        let votes = counts.iter().filter(|c| *c % 2 == 1).count();
+        if votes >= 2
+            && let Some(face) = faces.get_mut(*face)
+        {
             for t in face.iter_mut() {
                 t.swap(1, 2);
             }

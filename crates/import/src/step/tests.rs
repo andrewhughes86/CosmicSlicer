@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 
 /// Writes Part 21 instances, numbering them.
 #[derive(Default)]
-struct W {
+pub(crate) struct W {
     body: String,
     n: u64,
 }
@@ -62,7 +62,7 @@ impl W {
     }
 
     /// Units (`unit` is a length unit instance) and a representation of `items`.
-    fn rep(&mut self, kind: &str, items: &[u64], unit: u64) -> u64 {
+    pub(crate) fn rep(&mut self, kind: &str, items: &[u64], unit: u64) -> u64 {
         let angle = self.add("( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) )");
         let ctx = self.add(&format!(
             "( GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNIT_ASSIGNED_CONTEXT((#{unit},#{angle})) REPRESENTATION_CONTEXT('','') )"
@@ -71,11 +71,11 @@ impl W {
         self.add(&format!("{kind}('',({}),#{ctx})", list.join(",")))
     }
 
-    fn mm(&mut self) -> u64 {
+    pub(crate) fn mm(&mut self) -> u64 {
         self.add("( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) )")
     }
 
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         format!(
             "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('AUTOMOTIVE_DESIGN'));\nENDSEC;\nDATA;\n{}ENDSEC;\nEND-ISO-10303-21;\n",
             self.body
@@ -83,7 +83,7 @@ impl W {
     }
 
     /// A box from `lo` to `hi` as a solid; returns the MANIFOLD_SOLID_BREP.
-    fn cuboid(&mut self, lo: [f64; 3], hi: [f64; 3]) -> u64 {
+    pub(crate) fn cuboid(&mut self, lo: [f64; 3], hi: [f64; 3]) -> u64 {
         let corner = |i: usize| {
             [
                 if i & 1 == 0 { lo[0] } else { hi[0] },
@@ -130,7 +130,7 @@ impl W {
 
     /// A cylinder of radius `r` from z = 0 to `h`; `seam` adds a seam edge (one loop on the
     /// side face) instead of two circle loops.
-    fn cylinder(&mut self, r: f64, h: f64, seam: bool) -> u64 {
+    pub(crate) fn cylinder(&mut self, r: f64, h: f64, seam: bool) -> u64 {
         let (v1, v2) = (self.vertex([r, 0.0, 0.0]), self.vertex([r, 0.0, h]));
         let a1 = self.axis([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]);
         let a2 = self.axis([0.0, 0.0, h], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]);

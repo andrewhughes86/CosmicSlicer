@@ -93,6 +93,12 @@ OrcaSlicer's crashes are the reason this exists.
 
 ## Before finishing
 `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo test --workspace`. CI (`.github/workflows/ci.yml`) runs the same on Linux, Windows and
+`cargo test --workspace`. On a developer's machine run cargo through `tools/capped.sh`
+(e.g. `tools/capped.sh cargo test -j 1 -p CosmicSlicer-import`): it runs in its own
+memory-capped systemd scope (`CAP`, default 2G), so a runaway test is killed instead of the
+editor, and logs output and memory to `target/diag/`. The model readers' fuzz test
+(`import::fuzz`) leaves a case's input in `<tmp>/cosmicslicer-fuzz/` while it runs, so an
+out-of-memory kill names its culprit; replay one with `COSMICSLICER_FUZZ_REPLAY=<file>`
+(test `fuzz_tests::replay`). CI (`.github/workflows/ci.yml`) runs the same on Linux, Windows and
 macOS, plus the real app on a software GPU (slice, export, crash, restore, panic report). Check UI changes with screenshot runs, which save nothing:
 `cargo run -- --add Cube --tab preview --screenshot out.png` (see `--help`).

@@ -3,19 +3,19 @@
 use super::*;
 
 /// Writes the fixed-column sections.
-struct W {
+pub(crate) struct W {
     d: Vec<String>,
     p: Vec<String>,
     units: (i32, &'static str),
 }
 
 impl W {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { d: Vec::new(), p: Vec::new(), units: (2, "2HMM") }
     }
 
     /// Adds an entity; `dependent` marks it physically dependent. Returns its DE number.
-    fn add(&mut self, kind: i32, params: &str, form: i32, transform: usize, dependent: bool) -> usize {
+    pub(crate) fn add(&mut self, kind: i32, params: &str, form: i32, transform: usize, dependent: bool) -> usize {
         let de = self.d.len() + 1;
         let first = self.p.len() + 1;
         let text = format!("{kind},{params};");
@@ -45,7 +45,7 @@ impl W {
         de
     }
 
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         let g = format!(
             "1H,,1H;,4Htest,8Htest.igs,4Htest,3H1.0,32,38,6,308,15,4Htest,1.,{},{},1,1.,15H20261025.120000,0.001,1000.,4Hauth,3Horg,11,0;",
             self.units.0, self.units.1

@@ -18,6 +18,9 @@
 pub mod amf;
 pub mod collada;
 pub mod dxf;
+pub mod fuzz;
+#[cfg(test)]
+mod fuzz_tests;
 pub mod geom;
 pub mod gltf;
 pub mod iges;

@@ -1019,4 +1019,4 @@ pub fn read(bytes: &[u8], options: Options) -> Result<Imported, ImportError> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

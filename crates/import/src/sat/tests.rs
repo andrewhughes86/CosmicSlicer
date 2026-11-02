@@ -25,7 +25,7 @@ fn read_text(text: &str) -> Result<Imported, ImportError> {
 
 /// The cylinder example of the SAT format document (release 4.0, inches, a transform that turns
 /// the cylinder's axis to Y and moves it 10 along it).
-const CYLINDER: &str = "400 0 1 0
+pub(crate) const CYLINDER: &str = "400 0 1 0
 11 Scheme AIDE 11 ACIS 4.0 NT 24 Mon Apr 12 13:59:03 1998
 25.4 1e-06 1e-10
 -0 body $1 $2 $-1 $3 #
@@ -260,5 +260,21 @@ fn units_and_hostile_files() {
         CYLINDER.get(..CYLINDER.len() / 2).unwrap_or_default(),
     ] {
         assert!(read_text(text).is_err(), "{text}");
+    }
+}
+
+/// Damaged pointers that make coedge or loop rings never come back to their start (found by
+/// the fuzzer: the walk once went round until it had taken 4 GB) are each followed once.
+#[test]
+fn rings_that_never_close_stop() {
+    let open_ring = CYLINDER.replace("-14 loop $-1", "-14 loop0$-1");
+    let mut lines: Vec<&str> = CYLINDER.lines().collect();
+    for _ in 0..8 {
+        lines.insert(13, "-9 loop $-1 $ $12 $5 $-1 $13 forward single #");
+    }
+    for text in [open_ring, lines.join("\n")] {
+        let start = std::time::Instant::now();
+        let _ = read_text(&text);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
     }
 }
