@@ -748,12 +748,24 @@ impl<'a> Writer<'a> {
         }
     }
 
-    /// Prints paths nearest first, reversing open lines when their far end is nearer.
-    fn print_nearest(&mut self, mut paths: Vec<Path>, object: Option<usize>, depth: Option<usize>) {
-        while !paths.is_empty() {
+    /// Prints paths nearest first, reversing open lines when their far end is nearer. Ordered
+    /// groups print whole, in their order, from wherever the first of them is reached.
+    fn print_nearest(&mut self, paths: Vec<Path>, object: Option<usize>, depth: Option<usize>) {
+        let mut groups: Vec<Vec<Path>> = Vec::new();
+        let mut free: Vec<Path> = Vec::with_capacity(paths.len());
+        for p in paths {
+            if p.group == 0 {
+                free.push(p);
+            } else if let Some(g) = groups.iter_mut().find(|g| g.first().is_some_and(|f| f.group == p.group)) {
+                g.push(p);
+            } else {
+                groups.push(vec![p]);
+            }
+        }
+        loop {
             let here = self.pos.truncate();
             let mut best = (f64::INFINITY, 0usize, false);
-            for (i, p) in paths.iter().enumerate() {
+            for (i, p) in free.iter().enumerate() {
                 if p.closed {
                     let d = p.points.iter().map(|q| q.distance_squared(here)).fold(f64::INFINITY, f64::min);
                     if d < best.0 {
@@ -767,12 +779,29 @@ impl<'a> Writer<'a> {
                     }
                 }
             }
-            let mut p = paths.swap_remove(best.1);
-            if best.2 {
-                p.reverse();
+            let nearest_group = groups
+                .iter()
+                .enumerate()
+                .filter_map(|(i, g)| g.first().and_then(|p| p.start()).map(|s| (s.distance_squared(here), i)))
+                .min_by(|a, b| a.0.total_cmp(&b.0));
+            match nearest_group {
+                Some((d, gi)) if d <= best.0 => {
+                    let g = groups.swap_remove(gi);
+                    for mut p in g {
+                        self.place_seam(&mut p, object, depth);
+                        self.extrude(&p);
+                    }
+                }
+                _ if free.is_empty() => break,
+                _ => {
+                    let mut p = free.swap_remove(best.1);
+                    if best.2 {
+                        p.reverse();
+                    }
+                    self.place_seam(&mut p, object, depth);
+                    self.extrude(&p);
+                }
             }
-            self.place_seam(&mut p, object, depth);
-            self.extrude(&p);
         }
     }
 

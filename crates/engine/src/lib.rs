@@ -12,10 +12,12 @@
 #![allow(non_snake_case)]
 
 pub mod arcs;
+pub mod fuzzy;
 pub mod gcode;
 pub mod gcodeview;
 pub mod geom;
 pub mod infill;
+pub mod lightning;
 pub mod macros;
 pub mod medial;
 pub mod motion;
@@ -637,6 +639,8 @@ mod tests {
             overrides: Vec::new(),
         }]);
         for (k, v) in std::env::var("SLICE_SET").unwrap_or_default().split(';').filter_map(|kv| kv.split_once('=')) {
+            // Printer keys (printable_height, …) as well as process ones.
+            j.printer.set(k.trim(), v.trim());
             j.process.set(k.trim(), v.trim());
         }
         let started = std::time::Instant::now();

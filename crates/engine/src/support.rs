@@ -111,13 +111,14 @@ pub fn paths(sl: &SupportLayers, i: usize, s: &Settings, first_layer: bool, z: f
                 speed: if first_layer { s.speeds.first_layer } else { s.speeds.support },
                 flow: 1.0,
                 overhang: Vec::new(),
+                group: 0,
             });
         }
         let inside = geom::offset(base, -w, Join::Round);
         let density = (w / s.support.spacing).clamp(0.05, 1.0);
         // On the plate, solid support sticks better.
         let density = if first_layer { (density * 2.0).min(1.0) } else { density };
-        let kind = infill::Kind::Lines { dirs: 1, alternate: false, cubic: false };
+        let kind = infill::Kind::Rectilinear { alternate: false };
         for l in infill::fill(&inside, kind, w, density, 0.0, i, z) {
             out.push(Path {
                 role: Role::Support,
@@ -127,12 +128,13 @@ pub fn paths(sl: &SupportLayers, i: usize, s: &Settings, first_layer: bool, z: f
                 speed: if first_layer { s.speeds.first_layer } else { s.speeds.support },
                 flow: 1.0,
                 overhang: Vec::new(),
+                group: 0,
             });
         }
     }
     if let Some(iface) = sl.interface.get(i).filter(|f| !f.is_empty()) {
         let density = (w / (s.support.interface_spacing + w)).clamp(0.1, 1.0);
-        let kind = infill::Kind::Lines { dirs: 1, alternate: false, cubic: false };
+        let kind = infill::Kind::Rectilinear { alternate: false };
         for l in infill::fill(iface, kind, w, density, FRAC_PI_2, i, z) {
             out.push(Path {
                 role: Role::SupportInterface,
@@ -142,6 +144,7 @@ pub fn paths(sl: &SupportLayers, i: usize, s: &Settings, first_layer: bool, z: f
                 speed: s.speeds.support_interface,
                 flow: 1.0,
                 overhang: Vec::new(),
+                group: 0,
             });
         }
     }

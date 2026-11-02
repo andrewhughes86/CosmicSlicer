@@ -49,7 +49,9 @@ pub struct Settings {
     pub seams: Seams,
     /// Overhangs steeper than this (degrees from vertical) are filled out into cones.
     pub printable_overhang: Option<f64>,
-    pub ironing: bool,
+    pub infill: InfillOpts,
+    pub ironing: Ironing,
+    pub fuzzy: Fuzzy,
     pub z_offset: f64,
     pub max_print_height: f64,
 }
@@ -100,6 +102,161 @@ impl RelSpeed {
             RelSpeed::Percent(p) => (base * p / 100.0).clamp(1.0, 2000.0),
         }
     }
+}
+
+/// One step of a rotation template ("0,30,60", "+5#5"): an angle offset (radians) or a turn
+/// by it, held for `layers` layers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TemplateStep {
+    pub angle: f64,
+    pub relative: bool,
+    pub layers: usize,
+}
+
+/// Reads an OrcaSlicer rotation template: comma-separated degrees, `+`/`-` for a turn rather
+/// than an angle, `#n` to hold a step for n layers. Unreadable steps are skipped.
+pub fn parse_template(text: &str) -> Vec<TemplateStep> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .take(1000)
+        .filter_map(|t| {
+            let (value, layers) = match t.split_once('#') {
+                Some((v, n)) => (v.trim(), n.trim().parse::<usize>().ok()?.clamp(1, 10_000)),
+                None => (t, 1),
+            };
+            let relative = value.starts_with('+') || value.starts_with('-');
+            let angle = value.parse::<f64>().ok().filter(|v| v.is_finite())?;
+            Some(TemplateStep { angle: angle.to_radians(), relative, layers })
+        })
+        .collect()
+}
+
+/// The angle offset a template gives layer `layer` (0 with no template).
+pub fn template_angle(steps: &[TemplateStep], layer: usize) -> f64 {
+    let cycle: usize = steps.iter().map(|s| s.layers).sum();
+    if cycle == 0 {
+        return 0.0;
+    }
+    // Turns add up over every layer so far, angles set it outright.
+    let mut angle = 0.0;
+    let mut seen = 0usize;
+    'outer: loop {
+        for st in steps {
+            if seen > layer {
+                break 'outer;
+            }
+            angle = if st.relative { angle + st.angle } else { st.angle };
+            seen += st.layers;
+        }
+        if seen > layer || seen == 0 {
+            break;
+        }
+    }
+    angle
+}
+
+/// How hard OrcaSlicer's "ensure vertical shell thickness" works.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerticalShell {
+    None,
+    Critical,
+    Moderate,
+    All,
+}
+
+/// Infill and surface options beyond patterns and densities.
+#[derive(Clone, Debug)]
+pub struct InfillOpts {
+    /// mm; 0 for no anchors.
+    pub anchor: f64,
+    /// Lateral lattice angles from vertical, radians.
+    pub lattice: [f64; 2],
+    pub shift_step: f64,
+    pub skin: crate::infill::Skin,
+    pub sparse_template: Vec<TemplateStep>,
+    pub solid_template: Vec<TemplateStep>,
+    /// Sparse regions smaller than this (mm²) are printed solid.
+    pub min_sparse_area: f64,
+    pub vertical_shell: VerticalShell,
+    pub top_density: f64,
+    pub bottom_density: f64,
+    pub top_flow: f64,
+    pub bottom_flow: f64,
+    pub solid_flow: f64,
+    pub sparse_flow: f64,
+    /// Sparse infill printed every few layers at up to this height, mm.
+    pub combination: Option<f64>,
+    pub extra_overhang_perimeters: bool,
+    /// Lightning branches lean in by this much a layer, radians.
+    pub lightning_prune: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IroningKind {
+    None,
+    /// Every top surface.
+    Top,
+    /// Only the object's topmost layer.
+    Topmost,
+    /// Every solid surface.
+    Solid,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Ironing {
+    pub kind: IroningKind,
+    pub concentric: bool,
+    pub spacing: f64,
+    pub inset: f64,
+    /// Radians: from the top surface's direction, or outright when `fixed`.
+    pub angle: f64,
+    pub fixed: bool,
+    /// Of a full line at the ironing spacing.
+    pub flow: f64,
+    pub speed: f64,
+}
+
+/// Which walls get fuzzy skin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FuzzyWhere {
+    None,
+    /// Outer walls of the outside only.
+    External,
+    /// Outer walls of holes only.
+    Holes,
+    /// Every outer wall.
+    All,
+    /// Every wall.
+    AllWalls,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Noise {
+    Classic,
+    Perlin,
+    Billow,
+    Ridged,
+    Voronoi,
+    Ripple,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Fuzzy {
+    pub on: FuzzyWhere,
+    /// mm either side.
+    pub thickness: f64,
+    pub point_distance: f64,
+    pub first_layer: bool,
+    pub noise: Noise,
+    /// Feature size of coherent noise, mm.
+    pub scale: f64,
+    pub octaves: usize,
+    pub persistence: f64,
+    pub ripples_per_layer: usize,
+    /// Fraction of a ripple each layer moves along.
+    pub ripple_offset: f64,
+    pub ripple_layers: usize,
 }
 
 /// Where gap fill goes in solid infill (OrcaSlicer's `gap_fill_target`).
@@ -483,6 +640,87 @@ impl Settings {
         };
         let default_accel = accel("default_acceleration", 500.0);
         let support_type = r.text("support_type");
+        let sparse_w = widths.sparse;
+        let anchor = match (r.mm_or_percent("infill_anchor", sparse_w), r.mm_or_percent("infill_anchor_max", sparse_w))
+        {
+            (Some(a), Some(m)) => a.min(m).min(1000.0),
+            _ => 0.0,
+        };
+        let infill = InfillOpts {
+            anchor,
+            lattice: [
+                r.range("lateral_lattice_angle_1", -45.0, -80.0, 80.0).to_radians(),
+                r.range("lateral_lattice_angle_2", 45.0, -80.0, 80.0).to_radians(),
+            ],
+            shift_step: r.range("infill_shift_step", 0.4, 0.0, 100.0),
+            skin: crate::infill::Skin {
+                depth: r.range("skin_infill_depth", 2.0, 0.0, 100.0),
+                density: r.range("skin_infill_density", 25.0, 1.0, 100.0) / 100.0,
+                skeleton: r.range("skeleton_infill_density", 25.0, 1.0, 100.0) / 100.0,
+            },
+            sparse_template: parse_template(&r.text("sparse_infill_rotate_template")),
+            solid_template: parse_template(&r.text("solid_infill_rotate_template")),
+            min_sparse_area: r.range("minimum_sparse_infill_area", 15.0, 0.0, 10_000.0),
+            vertical_shell: match r.text("ensure_vertical_shell_thickness").as_str() {
+                "none" => VerticalShell::None,
+                "ensure_critical_only" => VerticalShell::Critical,
+                "ensure_moderate" => VerticalShell::Moderate,
+                _ => VerticalShell::All,
+            },
+            top_density: r.range("top_surface_density", 100.0, 10.0, 100.0) / 100.0,
+            bottom_density: r.range("bottom_surface_density", 100.0, 10.0, 100.0) / 100.0,
+            top_flow: r.range("top_solid_infill_flow_ratio", 1.0, 0.1, 2.0),
+            bottom_flow: r.range("bottom_solid_infill_flow_ratio", 1.0, 0.1, 2.0),
+            solid_flow: r.range("internal_solid_infill_flow_ratio", 1.0, 0.1, 2.0),
+            sparse_flow: r.range("sparse_infill_flow_ratio", 1.0, 0.1, 2.0),
+            combination: r
+                .flag("infill_combination")
+                .then(|| r.mm_or_percent("infill_combination_max_layer_height", nozzle).unwrap_or(nozzle))
+                .map(|h| h.min(nozzle)),
+            extra_overhang_perimeters: r.flag("extra_perimeters_on_overhangs"),
+            lightning_prune: r.range("lightning_prune_angle", 45.0, 0.0, 85.0).to_radians(),
+        };
+        let ironing = Ironing {
+            kind: match r.text("ironing_type").as_str() {
+                "top" => IroningKind::Top,
+                "topmost" => IroningKind::Topmost,
+                "solid" => IroningKind::Solid,
+                _ => IroningKind::None,
+            },
+            concentric: r.text("ironing_pattern") == "concentric",
+            spacing: r.range("ironing_spacing", 0.1, 0.01, 2.0),
+            inset: r.range("ironing_inset", 0.0, 0.0, 10.0),
+            angle: r.num("ironing_angle", 0.0).to_radians(),
+            fixed: r.flag("ironing_angle_fixed"),
+            flow: r.range("ironing_flow", 10.0, 0.0, 100.0) / 100.0,
+            speed: r.speed("ironing_speed", 20.0),
+        };
+        let fuzzy = Fuzzy {
+            on: match r.text("fuzzy_skin").as_str() {
+                "external" => FuzzyWhere::External,
+                "hole" => FuzzyWhere::Holes,
+                "all" => FuzzyWhere::All,
+                "allwalls" => FuzzyWhere::AllWalls,
+                _ => FuzzyWhere::None,
+            },
+            thickness: r.range("fuzzy_skin_thickness", 0.2, 0.0, 5.0),
+            point_distance: r.range("fuzzy_skin_point_distance", 0.3, 0.05, 50.0),
+            first_layer: r.flag("fuzzy_skin_first_layer"),
+            noise: match r.text("fuzzy_skin_noise_type").as_str() {
+                "perlin" => Noise::Perlin,
+                "billow" => Noise::Billow,
+                "ridgedmulti" => Noise::Ridged,
+                "voronoi" => Noise::Voronoi,
+                "ripple" => Noise::Ripple,
+                _ => Noise::Classic,
+            },
+            scale: r.range("fuzzy_skin_scale", 1.0, 0.01, 1000.0),
+            octaves: r.count("fuzzy_skin_octaves", 4, 10).max(1),
+            persistence: r.range("fuzzy_skin_persistence", 0.5, 0.01, 1.0),
+            ripples_per_layer: r.count("fuzzy_skin_ripples_per_layer", 15, 10_000).max(1),
+            ripple_offset: r.range("fuzzy_skin_ripple_offset", 50.0, 0.0, 100.0) / 100.0,
+            ripple_layers: r.count("fuzzy_skin_layers_between_ripple_offset", 1, 10_000).max(1),
+        };
         let bridge_speed = speeds.bridge;
         let walls = Walls {
             arachne: r.text("wall_generator") != "classic",
@@ -699,7 +937,9 @@ impl Settings {
                 .flag("make_overhang_printable")
                 .then(|| r.range("make_overhang_printable_angle", 55.0, 0.0, 90.0))
                 .filter(|a| *a < 89.9),
-            ironing: !r.text("ironing_type").starts_with("no"),
+            infill,
+            ironing,
+            fuzzy,
             z_offset: r.range("z_offset", 0.0, -5.0, 5.0),
             max_print_height: r.range("printable_height", 250.0, 1.0, 10_000.0),
         }
@@ -801,6 +1041,18 @@ mod tests {
         assert_eq!(s.wall_loops, 0);
         assert!(s.speeds.outer > 0.0 && s.speeds.outer.is_finite());
         assert!(s.widths.inner <= s.nozzle * 3.0);
+    }
+
+    #[test]
+    fn rotation_templates_read_like_orca() {
+        let t = parse_template("0, 30,60");
+        let deg = |l: usize| template_angle(&t, l).to_degrees().round();
+        assert_eq!([deg(0), deg(1), deg(2), deg(3)], [0.0, 30.0, 60.0, 0.0]);
+        let turns = parse_template("+5#2");
+        let deg = |l: usize| template_angle(&turns, l).to_degrees().round();
+        assert_eq!([deg(0), deg(1), deg(2), deg(3), deg(4)], [5.0, 5.0, 10.0, 10.0, 15.0]);
+        assert!(parse_template("x, ,#").is_empty());
+        assert_eq!(template_angle(&[], 7), 0.0);
     }
 
     #[test]

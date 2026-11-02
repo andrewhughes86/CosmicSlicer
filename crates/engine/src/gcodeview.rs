@@ -99,20 +99,26 @@ pub fn read(text: &str, s: &Settings, fil: &[Filament]) -> Viewed {
     let mut marked = false;
     let mut new_layer = false;
     let mut marked_z: Option<f64> = None;
-    let close_layer =
-        |layers: &mut Vec<PreviewLayer>, preview: &Preview, start: (usize, usize, usize), z: f64, h: f64| {
-            if preview.segments.len() > start.0 {
-                layers.push(PreviewLayer {
-                    z: z as f32,
-                    height: h as f32,
-                    segments: start.0..preview.segments.len(),
-                    travels: start.1..preview.travels.len(),
-                    seams: 0..0,
-                    retractions: start.2..preview.retractions.len(),
-                    time: 0.0,
-                });
-            }
-        };
+    let mut layer_extruded = false;
+    let close_layer = |layers: &mut Vec<PreviewLayer>,
+                       preview: &Preview,
+                       start: (usize, usize, usize),
+                       z: f64,
+                       h: f64,
+                       extruded: bool| {
+        // A layer counts when it extrudes, even past the Preview's segment cap.
+        if extruded || preview.segments.len() > start.0 {
+            layers.push(PreviewLayer {
+                z: z as f32,
+                height: h as f32,
+                segments: start.0..preview.segments.len(),
+                travels: start.1..preview.travels.len(),
+                seams: 0..0,
+                retractions: start.2..preview.retractions.len(),
+                time: 0.0,
+            });
+        }
+    };
     for (n, raw) in text.lines().enumerate() {
         if n >= MAX_LINES {
             warnings.push("The file is too long; only its start is shown.".into());
@@ -239,11 +245,12 @@ pub fn read(text: &str, s: &Settings, fil: &[Filament]) -> Viewed {
                     if starts {
                         let z = if marked { marked_z.unwrap_or(pos.z) } else { pos.z };
                         let h = height.unwrap_or(if layer_z.is_finite() { z - layer_z } else { z }).max(0.01);
-                        close_layer(&mut layers, &preview, layer_start, layer_z, h);
+                        close_layer(&mut layers, &preview, layer_start, layer_z, h, layer_extruded);
                         layer_start = (preview.segments.len(), preview.travels.len(), preview.retractions.len());
                         layer_z = z;
                         new_layer = false;
                     }
+                    layer_extruded = true;
                     let fd = fil.get(tool).map_or(1.75, |f| f.diameter);
                     let volume = de * std::f64::consts::PI * (fd / 2.0).powi(2);
                     let h = height.unwrap_or(s.layer_height).max(0.01);
@@ -305,7 +312,7 @@ pub fn read(text: &str, s: &Settings, fil: &[Filament]) -> Viewed {
             _ => {}
         }
     }
-    close_layer(&mut layers, &preview, layer_start, layer_z, height.unwrap_or(s.layer_height));
+    close_layer(&mut layers, &preview, layer_start, layer_z, height.unwrap_or(s.layer_height), layer_extruded);
     if truncated {
         warnings.push("The file has more moves than the Preview draws; the top is cut off.".into());
     }

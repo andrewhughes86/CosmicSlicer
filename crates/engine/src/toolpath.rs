@@ -106,6 +106,9 @@ pub struct Path {
     /// Walls: how far each segment (from point `i` to the next) overhangs the layer below,
     /// 0 (not) to 5 (95 % or more of the line width). Empty when none does.
     pub overhang: Vec<u8>,
+    /// Paths sharing a non-zero group print one after another in the order given (monotonic
+    /// infill, overhang perimeters), not nearest first.
+    pub group: u32,
 }
 
 impl Path {
@@ -119,7 +122,13 @@ impl Path {
 
     /// A path with no overhang marks.
     pub fn new(role: Role, points: Vec<DVec2>, closed: bool, width: f64, speed: f64, flow: f64) -> Path {
-        Path { role, points, closed, width, speed, flow, overhang: Vec::new() }
+        Path { role, points, closed, width, speed, flow, overhang: Vec::new(), group: 0 }
+    }
+
+    /// A new group id, unique in this run.
+    pub fn new_group() -> u32 {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed).max(1)
     }
 
     /// The overhang degree of segment `i`.
