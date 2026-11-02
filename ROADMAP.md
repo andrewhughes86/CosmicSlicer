@@ -16,6 +16,7 @@ end of every session (no crashes, tests and clippy clean, smoke tests cover new 
 | 7 | Infill and surfaces | Every Orca infill pattern as its own generator (incl. lightning, adaptive/support/quarter cubic, 3D and lateral honeycomb, lateral lattice, cross hatch, TPMS-D/FK, Hilbert, Archimedean, octagram, zig-zag variants, monotonic line), gyroid solved per layer as waves, anchors, infill combination, rotation templates, small-area filter, vertical shell thickness, top surface flow/density, extra perimeters on overhangs, ironing, fuzzy skin |
 | 8 | Supports | Grid and snug normal supports, tree supports (organic, slim, strong, hybrid) with trunk brims, top and bottom interfaces with every Orca pattern, top/bottom/xy/first-layer gaps, on build plate only, critical regions only, enforce layers, rafts, per-object brims (outer, inner, both, mouse ears), support enforcer/blocker volumes and painted support in the engine |
 | 9 | Project files and import | 3MF projects in OrcaSlicer's layout (plates, objects and copies, per-object and per-plate settings, presets by name with edits, painted data, thumbnails), Orca / Bambu / plain 3MF opened; CosmicDMS's readers vendored (STEP, IGES, SAT, AMF, PLY, OFF, glTF, COLLADA, VRML, X3D, 3DS, DXF), zip archives, multi-object 3MF import, inches prompt, recent projects with thumbnails |
+| 10 | Object model | Parts, modifiers, negative volumes, support enforcers/blockers and height ranges on objects (model, engine, 3MF, autosave); object list as a tree with Orca's add-part/modifier menus (primitive or file), split to parts, assemble, drag to reorder, per-part and per-range settings; mesh repair on import with a report |
 
 ## Order, and why
 Get a user's own printer printing well and safely first (profiles, correct motion G-code,
@@ -44,7 +45,7 @@ CI comes early because the Windows and macOS builds are not yet checked by anyth
 | 19 | Parity check against OrcaSlicer on a reference set | 6–14 |
 | 20 | Packaging and release for all three platforms | 3, 18 |
 
-11 more sessions. Session 13 can come earlier; 17 can be split up and done between others.
+10 more sessions. Session 13 can come earlier; 17 can be split up and done between others.
 
 ---
 
@@ -189,15 +190,35 @@ load the geometry only. Check both directions with real files (session 19).
 Moved on: modifier, negative and support parts (left out with a warning; session 10), colour
 OBJ (session 12), SVG import (session 11, with emboss).
 
-## 10 · Object model
-- Objects with parts, modifiers, negative volumes, support enforcers/blockers; instances.
-- Orca's object list: tree, per-object / per-part / per-height-range settings, drag to reorder,
-  context menus (add part/modifier from file or primitive, split to parts, assemble).
-- Mesh repair on import (normals, holes, self-intersections) with a report.
-- Mesh boolean (union, difference, intersection) between parts.
-- Engine: regions per part and modifier, settings resolved per region and height range.
+## 10 · Object model — done
+- Objects carry more volumes (`model::Volume`): parts, modifiers, negative volumes and support
+  enforcers/blockers, each with its placement in the object and its own settings, and height
+  ranges (`model::HeightRange`). Bounds, arrange, drop to bed, picking and STL export count the
+  parts; autosave and 3MF projects keep them (Orca's part subtypes; ranges in
+  `Metadata/layer_config_ranges.xml`).
+- Engine: parts join the object's slices and negative volumes cut them; modifiers and parts
+  with settings split each island's fill into pieces filled by their own settings (the last
+  listed wins), and a height range sets its layers' settings whole, walls included
+  (`plan::LayerRegions`); enforcer/blocker volumes feed supports.
+- Object list as a tree: fold, volumes and ranges under their object with Orca's icons, drag
+  to reorder; context menus add a part, negative volume, modifier, support enforcer or blocker
+  from a primitive or a file, a height range, split to parts, assemble; a volume's type can be
+  changed. Picking a volume or range shows its settings in the Process panel's Objects mode,
+  with its position and scale or its heights. Modifiers and the rest draw see-through.
+- Mesh repair on import: degenerate triangles, reversed triangles (and inside-out pieces),
+  holes up to 500 edges closed; a notice says what was fixed and what stays open.
+- `--add-volume kind:primitive` for screenshot runs.
 
-**Done when:** a modifier cube changing infill inside part of a model slices exactly there.
+**Done when** is met by the engine test `a_modifier_changes_the_infill_exactly_inside_it`: a 60 %
+modifier in a 10 % cube fills its middle 4–9 times as densely while a strip just outside stays
+sparse.
+
+Moved on: modifiers and per-part settings change the fill only; wall settings change through
+height ranges but not yet inside modifiers (session 19). Volumes move from their panel, not the
+canvas gizmos, and those edits are not undoable step by step (session 11, with the gizmo work).
+Mesh booleans between parts and repair of self-intersections (session 18). OrcaSlicer's shared
+instances: copies are separate objects here (session 14, with plates). Painted facets on volumes
+other than the main mesh are not kept (session 11).
 
 ## 11 · Prepare tools
 - Cut: planar cut with connectors (plug, dowel, snap), keep/flip parts, cut to parts.
@@ -206,6 +227,8 @@ OBJ (session 12), SVG import (session 11, with emboss).
   (circle, sphere, fill, gap fill, smart fill), and the engine consuming them; painted brims
   (from session 8).
 - Lay on face with face highlighting, scale to fit, drop to bed per tool.
+- From session 10: move, rotate and scale volumes with the canvas gizmos (undoable), and keep
+  painted facets on volumes other than the main mesh.
 
 **Done when:** every toolbar button works; no "arrives later" notes remain in Prepare.
 
@@ -233,6 +256,7 @@ OBJ (session 12), SVG import (session 11, with emboss).
 - Auto orient minimising overhang and support (Orca's method).
 - Plates: drag objects between plates, plate thumbnails, per-plate names/types/sequence used by
   the engine, slice all plates, export all plates, plate list strip.
+- From session 10: OrcaSlicer's shared instances (one object, several placements).
 
 **Done when:** "Arrange all" packs 30 mixed parts like Orca and nothing overlaps.
 
@@ -276,6 +300,8 @@ and the Device page follows both prints.
   detail; budgets measured on a reference set and checked in CI.
 - Soak test: hours of scripted UI actions (load, edit, slice, undo, switch pages) on all three
   platforms with no panic recovered and no memory growth.
+- From session 10: mesh booleans between parts (union, difference, intersection) and repair
+  of self-intersections.
 
 ## 19 · Parity with OrcaSlicer
 - A reference set (calibration cube, Benchy, thin walls, overhang test, multi-part, multi-colour,
@@ -285,6 +311,7 @@ and the Device page follows both prints.
 - Test prints on your printers.
 - From session 6: Arachne's wall-count transitions where a part narrows but still has room for
   walls; `make_overhang_printable_hole_size`; `scarf_overhang_threshold`.
+- From session 10: wall settings inside modifiers and parts (Orca's per-region perimeters).
 
 ## 20 · Packaging and release
 - Windows installer (MSI) with file associations; macOS `.app` (universal) as a DMG; Linux

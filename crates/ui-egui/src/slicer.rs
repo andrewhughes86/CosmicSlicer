@@ -10,7 +10,10 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use glam::{Mat4, Vec3};
 
 use CosmicSlicer_config::TabKind;
-use CosmicSlicer_engine::{Job, JobObject, Progress, SliceError, Sliced, SupportPaint};
+use CosmicSlicer_engine::{
+    Job, JobObject, JobVolume, Progress, SliceError, Sliced, SupportPaint, SupportVolume, VolumeKind,
+};
+use CosmicSlicer_model::PartKind;
 
 use crate::state::{BED_TYPES, Session};
 
@@ -83,7 +86,41 @@ pub fn job(session: &Session, plate: usize) -> Job {
                 matrix: to_printer * o.matrix(),
                 extruder: o.filament.saturating_sub(1),
                 overrides: o.overrides.clone(),
-                support_volumes: Vec::new(),
+                support_volumes: o
+                    .parts
+                    .iter()
+                    .filter_map(|v| {
+                        let kind = match v.kind {
+                            PartKind::SupportEnforcer => SupportPaint::Enforce,
+                            PartKind::SupportBlocker => SupportPaint::Block,
+                            _ => return None,
+                        };
+                        Some(SupportVolume {
+                            kind,
+                            mesh: Arc::clone(&v.mesh),
+                            matrix: to_printer * o.matrix() * v.matrix(),
+                        })
+                    })
+                    .collect(),
+                volumes: o
+                    .parts
+                    .iter()
+                    .filter_map(|v| {
+                        let kind = match v.kind {
+                            PartKind::Normal => VolumeKind::Part,
+                            PartKind::Modifier => VolumeKind::Modifier,
+                            PartKind::Negative => VolumeKind::Negative,
+                            _ => return None,
+                        };
+                        Some(JobVolume {
+                            kind,
+                            mesh: Arc::clone(&v.mesh),
+                            matrix: to_printer * o.matrix() * v.matrix(),
+                            overrides: v.overrides.clone(),
+                        })
+                    })
+                    .collect(),
+                ranges: o.ranges.iter().map(|r| (f64::from(r.lo), f64::from(r.hi), r.overrides.clone())).collect(),
                 support_paint: o
                     .paint
                     .as_deref()

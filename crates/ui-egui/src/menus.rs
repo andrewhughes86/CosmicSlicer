@@ -8,7 +8,7 @@ use crate::state::{Page, Session};
 use crate::ui_kit::{menu_check, menu_item};
 use crate::viewport::View;
 use CosmicSlicer_config::TabKind;
-use CosmicSlicer_model::primitives;
+use CosmicSlicer_model::{PartKind, primitives};
 
 /// Ctrl on Windows and Linux, ⌘ on macOS, as shortcut text.
 pub fn ctrl(key: &str) -> String {
@@ -258,6 +258,12 @@ pub fn object_menu(ui: &mut Ui, session: &mut Session, id: u64, actions: &mut Ve
     if menu_item(ui, "Split to objects", "", true) {
         session.split_selected();
     }
+    if menu_item(ui, "Split to parts", "", true) {
+        session.split_to_parts();
+    }
+    if menu_item(ui, "Assemble", "", session.selection.len() > 1) {
+        session.assemble();
+    }
     ui.menu_button("Change filament", |ui| {
         let n = session.presets.project_filaments.len();
         for f in 1..=n {
@@ -270,16 +276,30 @@ pub fn object_menu(ui: &mut Ui, session: &mut Session, id: u64, actions: &mut Ve
         }
     });
     ui.separator();
-    ui.menu_button("Add part", |ui| {
-        for (name, _) in primitives::ALL {
-            menu_item(ui, name, "", false);
-        }
-    });
-    ui.menu_button("Add modifier", |ui| {
-        for (name, _) in primitives::ALL {
-            menu_item(ui, name, "", false);
-        }
-    });
+    for (label, kind) in [
+        ("Add part", PartKind::Normal),
+        ("Add negative volume", PartKind::Negative),
+        ("Add modifier", PartKind::Modifier),
+        ("Add support enforcer", PartKind::SupportEnforcer),
+        ("Add support blocker", PartKind::SupportBlocker),
+    ] {
+        ui.menu_button(label, |ui| {
+            if menu_item(ui, "Load…", "", true) {
+                actions.push(Action::AddVolumeFile(id, kind));
+                ui.close();
+            }
+            ui.separator();
+            for (name, _) in primitives::ALL {
+                if menu_item(ui, name, "", true) {
+                    session.add_volume(id, kind, name);
+                    ui.close();
+                }
+            }
+        });
+    }
+    if menu_item(ui, "Height range modifier", "", true) {
+        session.add_range(id);
+    }
     if menu_item(ui, "Export as one STL", "", true) {
         actions.push(Action::ExportStl);
     }

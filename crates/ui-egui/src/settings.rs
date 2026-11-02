@@ -6,7 +6,7 @@ use egui::{Color32, RichText, Sense, Ui, vec2};
 use CosmicSlicer_config::{Entry, Group, Mode, OptionDef, OptionType, Page, TabKind};
 
 use crate::icons;
-use crate::state::{Level, Session};
+use crate::state::{Level, Session, Sub};
 use crate::theme::{Tokens, parse_hex, to_hex};
 
 /// Which values a form edits.
@@ -17,17 +17,43 @@ pub struct Target {
     pub filament: usize,
     /// An object's own overrides, in the sidebar's Objects mode.
     pub object: Option<u64>,
+    /// One of that object's volumes or height ranges.
+    pub sub: Option<Sub>,
 }
 
 impl Target {
     pub fn new(kind: TabKind) -> Self {
-        Self { kind, filament: 0, object: None }
+        Self { kind, filament: 0, object: None, sub: None }
+    }
+}
+
+/// The overrides `target` edits, when it edits an object's.
+fn overrides(session: &Session, target: Target) -> Option<&Vec<(String, String)>> {
+    let o = session.model.get(target.object?)?;
+    match target.sub {
+        None => Some(&o.overrides),
+        Some(Sub::Volume(i)) => o.parts.get(i).map(|v| &v.overrides),
+        Some(Sub::Range(i)) => o.ranges.get(i).map(|r| &r.overrides),
+    }
+}
+
+fn overrides_mut(session: &mut Session, target: Target) -> Option<&mut Vec<(String, String)>> {
+    let o = session.model.get_mut(target.object?)?;
+    match target.sub {
+        None => Some(&mut o.overrides),
+        Some(Sub::Volume(i)) => o.parts.get_mut(i).map(|v| &mut v.overrides),
+        Some(Sub::Range(i)) => o.ranges.get_mut(i).map(|r| &mut r.overrides),
     }
 }
 
 fn read(session: &Session, target: Target, key: &str) -> String {
-    if let Some(id) = target.object
-        && let Some((_, v)) = session.model.get(id).and_then(|o| o.overrides.iter().find(|(k, _)| k == key))
+    // A volume's or range's own value, then the object's, then the preset's.
+    if let Some((_, v)) = overrides(session, target).and_then(|o| o.iter().find(|(k, _)| k == key)) {
+        return v.clone();
+    }
+    if target.sub.is_some()
+        && let Some((_, v)) =
+            overrides(session, Target { sub: None, ..target }).and_then(|o| o.iter().find(|(k, _)| k == key))
     {
         return v.clone();
     }
@@ -36,18 +62,18 @@ fn read(session: &Session, target: Target, key: &str) -> String {
 
 fn edited(session: &Session, target: Target, key: &str) -> bool {
     match target.object {
-        Some(id) => session.model.get(id).is_some_and(|o| o.overrides.iter().any(|(k, _)| k == key)),
+        Some(_) => overrides(session, target).is_some_and(|o| o.iter().any(|(k, _)| k == key)),
         None => session.presets.is_edited(target.kind, target.filament, key),
     }
 }
 
 fn write(session: &mut Session, target: Target, key: &str, value: String) {
     match target.object {
-        Some(id) => {
-            if let Some(o) = session.model.get_mut(id) {
-                match o.overrides.iter_mut().find(|(k, _)| k == key) {
+        Some(_) => {
+            if let Some(o) = overrides_mut(session, target) {
+                match o.iter_mut().find(|(k, _)| k == key) {
                     Some(slot) => slot.1 = value,
-                    None => o.overrides.push((key.to_owned(), value)),
+                    None => o.push((key.to_owned(), value)),
                 }
             }
             session.dirty = true;
@@ -63,9 +89,9 @@ fn write(session: &mut Session, target: Target, key: &str, value: String) {
 
 fn revert(session: &mut Session, target: Target, key: &str) {
     match target.object {
-        Some(id) => {
-            if let Some(o) = session.model.get_mut(id) {
-                o.overrides.retain(|(k, _)| k != key);
+        Some(_) => {
+            if let Some(o) = overrides_mut(session, target) {
+                o.retain(|(k, _)| k != key);
             }
         }
         None => session.presets.revert(target.kind, target.filament, key),

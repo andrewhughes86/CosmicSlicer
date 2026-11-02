@@ -387,6 +387,29 @@ impl CosmicSlicerApp {
                 None => eprintln!("--tab: there is no page called {name}"),
             },
             Step::Primitive(name) => self.session.add_primitive(&name),
+            Step::Volume(spec) => {
+                use CosmicSlicer_model::PartKind;
+                let Some(id) = self.session.model.objects.last().map(|o| o.id) else { return };
+                let (kind, shape) = spec.split_once(':').unwrap_or((spec.as_str(), "cube"));
+                let kind = match kind.to_ascii_lowercase().as_str() {
+                    "range" => {
+                        self.session.add_range(id);
+                        return;
+                    }
+                    "part" => PartKind::Normal,
+                    "modifier" => PartKind::Modifier,
+                    "negative" => PartKind::Negative,
+                    "enforcer" => PartKind::SupportEnforcer,
+                    "blocker" => PartKind::SupportBlocker,
+                    other => {
+                        eprintln!("--add-volume: unknown kind {other}");
+                        return;
+                    }
+                };
+                if self.session.add_volume(id, kind, shape).is_none() {
+                    eprintln!("--add-volume: there is no primitive called {shape}");
+                }
+            }
             Step::Open(path) => actions.push(Action::ImportPath(path)),
             Step::Arrange => self.session.arrange(false),
             Step::SelectAll => self.session.select_all(),
@@ -586,8 +609,8 @@ impl CosmicSlicerApp {
             return;
         };
         let objects: Vec<_> = self.session.model.objects.iter().filter(|o| o.visible).collect();
-        let meshes: Vec<(&CosmicSlicer_model::Mesh, glam::Mat4)> =
-            objects.iter().map(|o| (o.mesh.as_ref(), o.matrix())).collect();
+        // Every printed part, where it stands.
+        let meshes: Vec<(&CosmicSlicer_model::Mesh, glam::Mat4)> = objects.iter().flat_map(|o| o.solids()).collect();
         match CosmicSlicer_model::stl::write_binary(&path, &meshes) {
             Ok(()) => self.session.notify(Level::Info, format!("Exported {}", path.display())),
             Err(e) => self.session.notify(Level::Error, e.to_string()),
@@ -609,6 +632,15 @@ impl CosmicSlicerApp {
                 }
             }
             Action::OpenProjectPath(path) => self.open_project(&path),
+            Action::AddVolumeFile(id, kind) => {
+                let picked = rfd::FileDialog::new()
+                    .set_title(format!("Load {}", kind.label().to_lowercase()))
+                    .add_filter("Supported files", &CosmicSlicer_model::import_extensions())
+                    .pick_file();
+                if let Some(path) = picked {
+                    s.add_volume_file(id, kind, &path);
+                }
+            }
             Action::SaveProject => match s.project.path.clone().filter(|p| is_3mf(p)) {
                 Some(path) => self.save_project(&path),
                 None => self.save_project_as(),
@@ -1157,6 +1189,13 @@ mod smoke {
             app.session.add_primitive(name);
         }
         app.session.presets.add_filament();
+        // One object with every kind of volume and a height range, for the object list.
+        if let Some(id) = app.session.model.objects.first().map(|o| o.id) {
+            for kind in CosmicSlicer_model::PartKind::ALL {
+                app.session.add_volume(id, kind, "Cube");
+            }
+            app.session.add_range(id);
+        }
         app
     }
 
@@ -1171,6 +1210,18 @@ mod smoke {
             for page in [Page::Home, Page::Prepare, Page::Preview, Page::Device, Page::MultiDevice, Page::Project] {
                 app.session.page = page;
                 frames(&mut app, &ctx, 3);
+            }
+            // A volume and a height range picked, in the Process panel's Objects mode.
+            if let Some(id) = app.session.model.objects.first().map(|o| o.id) {
+                app.session.page = Page::Prepare;
+                for sub in [crate::state::Sub::Volume(1), crate::state::Sub::Range(0), crate::state::Sub::Volume(99)] {
+                    app.session.selection = vec![id];
+                    app.sidebar.sub = Some((id, sub));
+                    app.sidebar.scope = 1;
+                    frames(&mut app, &ctx, 2);
+                }
+                app.sidebar.folded.push(id);
+                frames(&mut app, &ctx, 1);
             }
             // A project name too long for the title bar.
             app.session.project.name = "A very long project name ".repeat(12);

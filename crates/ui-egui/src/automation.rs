@@ -17,6 +17,9 @@ pub enum Step {
     Tab(String),
     /// Add a primitive (Cube, Cylinder, ...).
     Primitive(String),
+    /// Add a volume to the last object: "modifier:cube", "part:sphere", "negative:cylinder",
+    /// "enforcer:cube", "blocker:cube", or "range" for a height range.
+    Volume(String),
     /// Import a model file.
     Open(PathBuf),
     /// Arrange the current plate.

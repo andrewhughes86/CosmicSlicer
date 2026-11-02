@@ -226,7 +226,7 @@ impl Dialogs {
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width() - 12.0);
-                            let target = Target { kind: ed.kind, filament: ed.filament, object: None };
+                            let target = Target { kind: ed.kind, filament: ed.filament, object: None, sub: None };
                             if !ed.search.trim().is_empty() {
                                 let q = ed.search.clone();
                                 settings::search_results(ui, session, t, ed.kind, &q, target, advanced);

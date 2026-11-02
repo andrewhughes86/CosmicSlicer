@@ -4,6 +4,12 @@
 //! Two passes: the first finds every island's walls and fill regions; between them come the
 //! things that need several layers at once (lightning trees, combined infill); the second
 //! lays the paths.
+//!
+//! Parts with their own settings and modifiers split an island's fill into pieces, each filled
+//! by its own settings (the last listed wins where they overlap); a height range sets a whole
+//! layer's settings, walls included.
+
+use std::sync::Arc;
 
 use rayon::prelude::*;
 
@@ -96,11 +102,51 @@ fn paths_of(lines: Vec<infill::Line>, role: Role, width: f64, speed: f64, flow: 
         .collect()
 }
 
+/// One layer's settings where they differ from the object's.
+#[derive(Clone, Debug, Default)]
+pub struct LayerRegions {
+    /// The whole layer's settings (a height range), when not the object's.
+    pub base: Option<Arc<Settings>>,
+    /// Areas filled by other settings (parts, modifiers), later ones winning.
+    pub pieces: Vec<(Vec<Shape>, Arc<Settings>)>,
+}
+
+/// One piece of an island's fill and the settings it is filled by (`None`: the layer's).
+struct Piece {
+    regions: Regions,
+    area: Vec<Shape>,
+    settings: Option<Arc<Settings>>,
+}
+
 /// An island after the first pass: its walls and fill regions.
 struct Walled {
     outline: Shape,
     walled: walls::Walled,
-    regions: Option<Regions>,
+    pieces: Vec<Piece>,
+}
+
+/// `area` split by the pieces' areas, last first; what is left over is the layer's own.
+fn split_fill(
+    area: &[Shape],
+    pieces: &[(Vec<Shape>, Arc<Settings>)],
+    w: f64,
+) -> Vec<(Vec<Shape>, Option<Arc<Settings>>)> {
+    let mut rest = area.to_vec();
+    let mut out = Vec::new();
+    for (zone, rs) in pieces.iter().rev() {
+        if rest.is_empty() {
+            break;
+        }
+        let piece = geom::without_slivers(geom::boolean(&rest, zone, Op::Intersect), w * w);
+        if !piece.is_empty() {
+            rest = geom::without_slivers(geom::boolean(&rest, zone, Op::Difference), w * w);
+            out.push((piece, Some(Arc::clone(rs))));
+        }
+    }
+    if !rest.is_empty() {
+        out.push((rest, None));
+    }
+    out
 }
 
 /// Where gap fill goes in solid infill: the region less its narrow strips, and the gap fill
@@ -276,8 +322,8 @@ fn lightning_lines(
             let (Some(here), Some(up)) = (sparse.get(i), walled.get(i + 1)) else { return Vec::new() };
             let solid_above: Vec<Shape> = up
                 .iter()
-                .filter_map(|w| w.regions.as_ref())
-                .flat_map(|r| r.top.iter().chain(&r.bottom).chain(&r.solid).cloned())
+                .flat_map(|w| &w.pieces)
+                .flat_map(|p| p.regions.top.iter().chain(&p.regions.bottom).chain(&p.regions.solid).cloned())
                 .collect();
             if solid_above.is_empty() || here.is_empty() {
                 return Vec::new();
@@ -291,6 +337,7 @@ fn lightning_lines(
 }
 
 /// What one layer's fills need from the layers round it.
+#[derive(Clone)]
 struct Around<'a> {
     i: usize,
     layer: &'a LayerZ,
@@ -307,6 +354,7 @@ pub fn object(
     slices: &[Vec<Shape>],
     layers: &[LayerZ],
     s: &Settings,
+    regions: &[LayerRegions],
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Vec<Vec<Island>> {
     // Spiral vase: one wall, solid bottom, nothing else.
@@ -326,6 +374,9 @@ pub fn object(
                 return Vec::new();
             }
             let (Some(slice), Some(layer)) = (slices.get(i), layers.get(i)) else { return Vec::new() };
+            let lr = regions.get(i);
+            let s = lr.and_then(|r| r.base.as_deref()).unwrap_or(s);
+            let pieces = lr.map_or(&[][..], |r| r.pieces.as_slice());
             let first = i == 0;
             // "Only one wall on top": top layers (nothing above) get just the outer wall.
             let top_layer = slices.get(i + 1).is_none_or(Vec::is_empty);
@@ -336,9 +387,16 @@ pub fn object(
                 .map(|island| {
                     let walled = walls::walls(island, s, layer.height, first, loops, 1.0);
                     let solid_w = if first { s.widths.first_layer } else { s.widths.solid };
-                    let regions = (!walled.infill_area.is_empty())
-                        .then(|| classify(&walled.infill_area, slices, i, s, solid_w, shell));
-                    Walled { outline: island.clone(), walled, regions }
+                    let pieces = split_fill(&walled.infill_area, pieces, solid_w)
+                        .into_iter()
+                        .map(|(area, settings)| {
+                            let rs = settings.as_deref().unwrap_or(s);
+                            let w = if first { rs.widths.first_layer } else { rs.widths.solid };
+                            let regions = classify(&area, slices, i, rs, w, shell);
+                            Piece { regions, area, settings }
+                        })
+                        .collect();
+                    Walled { outline: island.clone(), walled, pieces }
                 })
                 .collect()
         })
@@ -346,7 +404,7 @@ pub fn object(
     // Each layer's sparse infill, which solid infill over it has to bridge.
     let sparse: Vec<Vec<Shape>> = walled
         .iter()
-        .map(|layer| layer.iter().filter_map(|w| w.regions.as_ref()).flat_map(|r| r.sparse.iter().cloned()).collect())
+        .map(|layer| layer.iter().flat_map(|w| &w.pieces).flat_map(|p| p.regions.sparse.iter().cloned()).collect())
         .collect();
     let lightning = (infill::kind_of(&s.sparse_pattern) == Kind::Lightning && s.density > 0.0)
         .then(|| lightning_lines(&walled, &sparse, layers, s, cancelled));
@@ -360,6 +418,7 @@ pub fn object(
                 return Vec::new();
             }
             let (Some(layer_walled), Some(layer)) = (walled.get(i), layers.get(i)) else { return Vec::new() };
+            let s = regions.get(i).and_then(|r| r.base.as_deref()).unwrap_or(s);
             let below = i.checked_sub(1).and_then(|b| slices.get(b));
             let around = Around {
                 i,
@@ -391,8 +450,16 @@ pub fn object(
                         }
                     }
                     let mut out = Island { outline: w.outline.clone(), walls, fills: w.walled.gaps.clone() };
-                    if let Some(r) = &w.regions {
-                        fills(&mut out.fills, r, &w.walled.infill_area, s, &around);
+                    for p in &w.pieces {
+                        match p.settings.as_deref() {
+                            None => fills(&mut out.fills, &p.regions, &p.area, s, &around),
+                            // Their own settings: no lightning trees or combined infill from the
+                            // object's.
+                            Some(rs) => {
+                                let own = Around { lightning: None, combined: None, ..around.clone() };
+                                fills(&mut out.fills, &p.regions, &p.area, rs, &own);
+                            }
+                        }
                     }
                     out
                 })
@@ -719,7 +786,7 @@ mod tests {
         let placed = slicing::Placed::new(&primitives::cube(20.0), &Mat4::from_translation(Vec3::new(10.0, 10.0, 0.0)));
         let layers = slicing::layer_heights(placed.top(), s.first_layer_height, s.layer_height);
         let slices = slicing::slice(&placed, &layers, &never);
-        let plan = object(&slices, &layers, &s, &never);
+        let plan = object(&slices, &layers, &s, &[], &never);
         let roles =
             |i: usize| -> Vec<Role> { plan[i].iter().flat_map(|isl| isl.fills.iter().map(|p| p.role)).collect() };
         assert!(roles(0).contains(&Role::BottomSurface));
@@ -749,7 +816,7 @@ mod tests {
         let placed = slicing::Placed::new(&primitives::cube(20.0), &Mat4::from_translation(Vec3::new(10.0, 10.0, 0.0)));
         let layers = slicing::layer_heights(placed.top(), s.first_layer_height, s.layer_height);
         let slices = slicing::slice(&placed, &layers, &never);
-        let plan = object(&slices, &layers, &s, &never);
+        let plan = object(&slices, &layers, &s, &[], &never);
         let has = |i: usize, r: Role| plan[i].iter().flat_map(|isl| isl.fills.iter()).any(|p| p.role == r);
         // The first solid layer under the top skin sits on sparse infill.
         let bridged = (51..plan.len()).find(|&i| has(i, Role::InternalBridge));
@@ -767,7 +834,7 @@ mod tests {
         let mut slices: Vec<Vec<Shape>> = vec![vec![geom::rectangle(glam::DVec2::ZERO, glam::DVec2::splat(10.0))]; 10];
         slices.extend(vec![vec![geom::rectangle(glam::DVec2::ZERO, glam::DVec2::new(20.0, 10.0))]; 5]);
         let layers = slicing::layer_heights(3.0, 0.2, 0.2);
-        let plan = object(&slices, &layers, &s, &never);
+        let plan = object(&slices, &layers, &s, &[], &never);
         let marked =
             |i: usize| plan[i].iter().flat_map(|isl| isl.walls.iter().flatten()).any(|p| p.overhang.contains(&5));
         assert!(marked(10) && !marked(9) && !marked(11));

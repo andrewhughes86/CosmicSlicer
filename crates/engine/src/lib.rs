@@ -65,6 +65,34 @@ pub struct JobObject {
     pub support_volumes: Vec<SupportVolume>,
     /// Painted support: triangles of `mesh` and what each asks for.
     pub support_paint: Vec<(u32, SupportPaint)>,
+    /// More parts, modifiers and negative volumes, placed like `matrix`.
+    pub volumes: Vec<JobVolume>,
+    /// Settings by height, millimetres above the plate.
+    pub ranges: Vec<HeightSettings>,
+}
+
+/// Settings for the layers between two heights: (from, to, settings).
+pub type HeightSettings = (f64, f64, Vec<(String, String)>);
+
+/// What a volume of an object does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VolumeKind {
+    /// Prints, with the object (and its own settings inside it, when it has any).
+    Part,
+    /// Changes the settings inside it.
+    Modifier,
+    /// Cuts the object away inside it.
+    Negative,
+}
+
+/// A part, modifier or negative volume of an object.
+#[derive(Clone)]
+pub struct JobVolume {
+    pub kind: VolumeKind,
+    pub mesh: Arc<Mesh>,
+    /// Placement in printer coordinates.
+    pub matrix: Mat4,
+    pub overrides: Vec<(String, String)>,
 }
 
 /// What a support volume or painted facet asks for.
@@ -229,7 +257,22 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
     let mut warnings = Vec::new();
 
     let placed: Vec<Placed> = job.objects.iter().map(|o| Placed::new(&o.mesh, &o.matrix)).collect();
-    let top = placed.iter().map(Placed::top).fold(0.0, f64::max);
+    let volumes: Vec<Vec<Placed>> =
+        job.objects.iter().map(|o| o.volumes.iter().map(|v| Placed::new(&v.mesh, &v.matrix)).collect()).collect();
+    // How tall each object is with its parts.
+    let heights_of: Vec<f64> = placed
+        .iter()
+        .zip(&volumes)
+        .zip(&job.objects)
+        .map(|((p, vs), o)| {
+            vs.iter()
+                .zip(&o.volumes)
+                .filter(|(_, v)| v.kind == VolumeKind::Part)
+                .map(|(vp, _)| vp.top())
+                .fold(p.top(), f64::max)
+        })
+        .collect();
+    let top = heights_of.iter().copied().fold(0.0, f64::max);
     if top <= 0.0 {
         return Err(SliceError::Nothing);
     }
@@ -253,7 +296,22 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
     let mut object_marks: Vec<Marks> = Vec::new();
     for (oi, (p, o)) in placed.iter().zip(&job.objects).enumerate() {
         progress.set(0.05 + 0.25 * oi as f64 / objects, "Slicing mesh");
-        let slices = slicing::slice(p, &layers, &cancelled);
+        let mut slices = slicing::slice(p, &layers, &cancelled);
+        // The other volumes: parts join the object, negative volumes cut it.
+        let vslices: Vec<Vec<Vec<Shape>>> = volumes
+            .get(oi)
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .map(|vp| slicing::slice(vp, &layers, &cancelled))
+            .collect();
+        for kind in [VolumeKind::Part, VolumeKind::Negative] {
+            for (_, vs) in o.volumes.iter().zip(&vslices).filter(|(v, _)| v.kind == kind) {
+                for (layer, cut) in slices.iter_mut().zip(vs).filter(|(_, c)| !c.is_empty()) {
+                    let op = if kind == VolumeKind::Part { Op::Union } else { Op::Difference };
+                    *layer = geom::boolean(layer, cut, op);
+                }
+            }
+        }
         if cancelled() {
             return Err(SliceError::Cancelled);
         }
@@ -263,12 +321,12 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
             cfg.set(k.clone(), v.clone());
         }
         let os = Settings::read(schema, &cfg);
-        let mut slices = slices;
+        let regions = layer_regions(schema, &cfg, o, &layers, &vslices);
         if let Some(angle) = os.printable_overhang {
             let heights: Vec<f64> = layers.iter().map(|l| l.height).collect();
             overhang::make_printable(&mut slices, &heights, angle);
         }
-        let islands = plan::object(&slices, &layers, &os, &cancelled);
+        let islands = plan::object(&slices, &layers, &os, &regions, &cancelled);
         if cancelled() {
             return Err(SliceError::Cancelled);
         }
@@ -321,11 +379,11 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
         let objects: Vec<skirt::BrimObject<'_>> = object_slices
             .iter()
             .zip(&object_settings)
-            .zip(&placed)
-            .map(|((sl, os), p)| skirt::BrimObject {
+            .zip(&heights_of)
+            .map(|((sl, os), h)| skirt::BrimObject {
                 footprint: sl.first().map_or(&[][..], Vec::as_slice),
                 settings: os,
-                height: p.top(),
+                height: *h,
             })
             .collect();
         skirt::brims(&objects)
@@ -463,6 +521,60 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
     Ok(Sliced { gcode: out.gcode, preview: out.preview, stats: out.stats, warnings, colours })
 }
 
+/// Each layer's settings where an object's height ranges, parts and modifiers change them.
+fn layer_regions(
+    schema: &Schema,
+    cfg: &Config,
+    o: &JobObject,
+    layers: &[LayerZ],
+    volume_slices: &[Vec<Vec<Shape>>],
+) -> Vec<plan::LayerRegions> {
+    let zones: Vec<usize> = o
+        .volumes
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.kind == VolumeKind::Modifier || (v.kind == VolumeKind::Part && !v.overrides.is_empty()))
+        .map(|(k, _)| k)
+        .collect();
+    if o.ranges.is_empty() && zones.is_empty() {
+        return Vec::new();
+    }
+    // Settings for each mix of height ranges and volume, read once.
+    let mut cache: std::collections::HashMap<(Vec<usize>, Option<usize>), Arc<Settings>> = Default::default();
+    let mut settings = |active: &[usize], volume: Option<usize>| -> Arc<Settings> {
+        let key = (active.to_vec(), volume);
+        let made = cache.entry(key).or_insert_with(|| {
+            let mut c = cfg.clone();
+            for (k, v) in active.iter().filter_map(|r| o.ranges.get(*r)).flat_map(|r| &r.2) {
+                c.set(k.clone(), v.clone());
+            }
+            for (k, v) in volume.and_then(|i| o.volumes.get(i)).into_iter().flat_map(|v| &v.overrides) {
+                c.set(k.clone(), v.clone());
+            }
+            Arc::new(Settings::read(schema, &c))
+        });
+        Arc::clone(made)
+    };
+    layers
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let z = l.slice_z();
+            let active: Vec<usize> =
+                o.ranges.iter().enumerate().filter(|(_, r)| z >= r.0 && z < r.1).map(|(k, _)| k).collect();
+            let base = (!active.is_empty()).then(|| settings(&active, None));
+            let pieces = zones
+                .iter()
+                .filter_map(|&k| {
+                    let area = volume_slices.get(k)?.get(i)?;
+                    (!area.is_empty()).then(|| (area.clone(), settings(&active, Some(k))))
+                })
+                .collect();
+            plan::LayerRegions { base, pieces }
+        })
+        .collect()
+}
+
 /// Support enforcers and blockers per layer.
 type Marks = (Vec<Vec<Shape>>, Vec<Vec<Shape>>);
 
@@ -524,6 +636,8 @@ mod tests {
             overrides: Vec::new(),
             support_volumes: Vec::new(),
             support_paint: Vec::new(),
+            volumes: Vec::new(),
+            ranges: Vec::new(),
         }
     }
 
@@ -637,6 +751,124 @@ mod tests {
                 assert!(!out.warnings.iter().any(|w| w.contains("support")), "{:?}", out.warnings);
             }
         }
+    }
+
+    /// Sparse infill extruded (mm of line) per mm² inside and outside the box `lo`–`hi`, from
+    /// the G-code.
+    fn infill_density(gcode: &str, lo: [f64; 2], hi: [f64; 2]) -> (f64, f64) {
+        let (mut inside, mut outside) = (0.0, 0.0);
+        let (mut x, mut y) = (0.0f64, 0.0f64);
+        let mut sparse = false;
+        for line in gcode.lines() {
+            if let Some(t) = line.strip_prefix(";TYPE:") {
+                sparse = t == "Sparse infill";
+                continue;
+            }
+            if !line.starts_with("G1 ") {
+                continue;
+            }
+            let get =
+                |c: char| line.split_whitespace().find_map(|w| w.strip_prefix(c)).and_then(|v| v.parse::<f64>().ok());
+            let (nx, ny) = (get('X').unwrap_or(x), get('Y').unwrap_or(y));
+            if sparse && get('E').is_some_and(|e| e > 0.0) {
+                let len = ((nx - x).powi(2) + (ny - y).powi(2)).sqrt();
+                let (mx, my) = ((nx + x) / 2.0, (ny + y) / 2.0);
+                if mx > lo[0] && mx < hi[0] && my > lo[1] && my < hi[1] {
+                    inside += len;
+                } else {
+                    outside += len;
+                }
+            }
+            (x, y) = (nx, ny);
+        }
+        (inside, outside)
+    }
+
+    #[test]
+    fn a_modifier_changes_the_infill_exactly_inside_it() {
+        // A 30 mm cube at 10 %, with a 12 mm modifier at 60 % in one corner, through its height.
+        let mut cube30 = cube(Vec3::new(100.0, 100.0, 0.0), 30.0);
+        cube30.volumes.push(JobVolume {
+            kind: VolumeKind::Modifier,
+            mesh: Arc::new(primitives::cube(12.0)),
+            matrix: Mat4::from_translation(Vec3::new(101.0, 101.0, -1.0)) * Mat4::from_scale(Vec3::new(1.0, 1.0, 3.0)),
+            overrides: vec![("sparse_infill_density".into(), "60%".into())],
+        });
+        let mut j = job(vec![cube30]);
+        j.process.set("sparse_infill_density", "10%");
+        let Some(out) = sliced(&j) else { return };
+        // Line per mm² in a box.
+        let density =
+            |lo: [f64; 2], hi: [f64; 2]| infill_density(&out.gcode, lo, hi).0 / ((hi[0] - lo[0]) * (hi[1] - lo[1]));
+        // Well inside the modifier (101–113), just outside it, and far from it.
+        let inside = density([103.0, 103.0], [111.0, 111.0]);
+        let beside = density([114.0, 103.0], [117.0, 111.0]);
+        let far = density([118.0, 118.0], [127.0, 127.0]);
+        assert!(far > 0.0, "{far}");
+        let ratio = inside / far;
+        assert!(ratio > 4.0 && ratio < 9.0, "inside {inside} far {far}: ratio {ratio}");
+        assert!(beside < far * 1.6, "beside {beside} far {far}");
+    }
+
+    #[test]
+    fn parts_join_and_negative_volumes_cut() {
+        let solid = |volumes: Vec<JobVolume>| {
+            let mut c = cube(Vec3::new(100.0, 100.0, 0.0), 10.0);
+            c.volumes = volumes;
+            let mut j = job(vec![c]);
+            j.process.set("sparse_infill_density", "100%");
+            sliced(&j).map(|o| o.stats.volume_mm3[0]).unwrap_or(0.0)
+        };
+        let plain = solid(vec![]);
+        let vol = |kind, at: Vec3, size: f32| JobVolume {
+            kind,
+            mesh: Arc::new(primitives::cube(size)),
+            matrix: Mat4::from_translation(at),
+            overrides: Vec::new(),
+        };
+        // A second 10 mm cube beside it doubles it; a 5 mm hole takes an eighth.
+        let joined = solid(vec![vol(VolumeKind::Part, Vec3::new(110.0, 100.0, 0.0), 10.0)]);
+        let cut = solid(vec![vol(VolumeKind::Negative, Vec3::new(100.0, 100.0, 5.0), 5.0)]);
+        assert!((joined / plain - 2.0).abs() < 0.12, "{joined} vs {plain}");
+        assert!((cut / plain - 7.0 / 8.0).abs() < 0.06, "{cut} vs {plain}");
+    }
+
+    #[test]
+    fn a_height_range_sets_its_layers() {
+        let mut c = cube(Vec3::new(100.0, 100.0, 0.0), 20.0);
+        c.ranges.push((5.0, 10.0, vec![("sparse_infill_density".into(), "70%".into())]));
+        let mut j = job(vec![c]);
+        j.process.set("sparse_infill_density", "10%");
+        let Some(out) = sliced(&j) else { return };
+        // Sparse infill per layer: the layers in the range carry far more.
+        let mut per_layer: Vec<f64> = Vec::new();
+        let mut sparse = false;
+        let mut layer = 0usize;
+        let (mut x, mut y) = (0.0f64, 0.0f64);
+        for line in out.gcode.lines() {
+            if line.starts_with(";LAYER_CHANGE") {
+                layer += 1;
+            }
+            if let Some(t) = line.strip_prefix(";TYPE:") {
+                sparse = t == "Sparse infill";
+            }
+            if !line.starts_with("G1 ") {
+                continue;
+            }
+            let get =
+                |c: char| line.split_whitespace().find_map(|w| w.strip_prefix(c)).and_then(|v| v.parse::<f64>().ok());
+            let (nx, ny) = (get('X').unwrap_or(x), get('Y').unwrap_or(y));
+            if sparse && get('E').is_some_and(|e| e > 0.0) {
+                if per_layer.len() < layer + 1 {
+                    per_layer.resize(layer + 1, 0.0);
+                }
+                per_layer[layer] += ((nx - x).powi(2) + (ny - y).powi(2)).sqrt();
+            }
+            (x, y) = (nx, ny);
+        }
+        // Layer k (1-based) prints at 0.2 k mm: 30 is 6 mm, 70 is 14 mm.
+        let (inside, outside) = (per_layer.get(30).copied().unwrap_or(0.0), per_layer.get(70).copied().unwrap_or(0.0));
+        assert!(inside > outside * 4.0, "{inside} vs {outside}");
     }
 
     #[test]
@@ -824,6 +1056,8 @@ mod tests {
             overrides: Vec::new(),
             support_volumes: Vec::new(),
             support_paint: Vec::new(),
+            volumes: Vec::new(),
+            ranges: Vec::new(),
         }
     }
 
@@ -896,6 +1130,8 @@ mod tests {
             overrides: Vec::new(),
             support_volumes: Vec::new(),
             support_paint: Vec::new(),
+            volumes: Vec::new(),
+            ranges: Vec::new(),
         }]);
         for (k, v) in std::env::var("SLICE_SET").unwrap_or_default().split(';').filter_map(|kv| kv.split_once('=')) {
             // Printer keys (printable_height, …) as well as process ones.

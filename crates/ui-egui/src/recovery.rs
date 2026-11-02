@@ -22,7 +22,7 @@ use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
 use CosmicSlicer_config::PresetBundle;
-use CosmicSlicer_model::{Mesh, Model, Object, Transform};
+use CosmicSlicer_model::{HeightRange, Mesh, Model, Object, PartKind, Transform, Volume};
 
 use crate::state::{PlateSettings, ProjectInfo, Session};
 use crate::store;
@@ -47,6 +47,19 @@ struct ObjectEntry {
     overrides: Vec<(String, String)>,
     #[serde(default)]
     paint: Option<CosmicSlicer_model::Paint>,
+    #[serde(default)]
+    parts: Vec<PartEntry>,
+    #[serde(default)]
+    ranges: Vec<HeightRange>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PartEntry {
+    name: String,
+    kind: PartKind,
+    mesh: usize,
+    transform: Transform,
+    overrides: Vec<(String, String)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -79,17 +92,32 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
+/// Where `m` is in the list of meshes to write, adding it the first time.
+fn mesh_index<'a>(m: &'a Arc<Mesh>, index: &mut HashMap<usize, usize>, meshes: &mut Vec<&'a Mesh>) -> usize {
+    *index.entry(Arc::as_ptr(m) as usize).or_insert_with(|| {
+        meshes.push(m.as_ref());
+        meshes.len() - 1
+    })
+}
+
 /// The session as snapshot bytes. Meshes shared by copies are written once.
 pub fn encode(session: &Session) -> Vec<u8> {
     let mut index: HashMap<usize, usize> = HashMap::new();
     let mut meshes: Vec<&Mesh> = Vec::new();
     let mut objects = Vec::new();
     for o in &session.model.objects {
-        let key = Arc::as_ptr(&o.mesh) as usize;
-        let mesh = *index.entry(key).or_insert_with(|| {
-            meshes.push(o.mesh.as_ref());
-            meshes.len() - 1
-        });
+        let mesh = mesh_index(&o.mesh, &mut index, &mut meshes);
+        let parts = o
+            .parts
+            .iter()
+            .map(|p| PartEntry {
+                name: p.name.clone(),
+                kind: p.kind,
+                mesh: mesh_index(&p.mesh, &mut index, &mut meshes),
+                transform: p.transform,
+                overrides: p.overrides.clone(),
+            })
+            .collect();
         objects.push(ObjectEntry {
             name: o.name.clone(),
             mesh,
@@ -99,6 +127,8 @@ pub fn encode(session: &Session) -> Vec<u8> {
             visible: o.visible,
             overrides: o.overrides.clone(),
             paint: o.paint.as_deref().cloned(),
+            parts,
+            ranges: o.ranges.clone(),
         });
     }
     let manifest = Manifest {
@@ -215,6 +245,23 @@ pub fn decode(bytes: &[u8]) -> Result<Restored, String> {
             visible: o.visible,
             overrides: o.overrides,
             paint: o.paint.map(Arc::new),
+            parts: o
+                .parts
+                .into_iter()
+                .filter(|p| {
+                    p.transform.offset.is_finite() && p.transform.rotation.is_finite() && p.transform.scale.is_finite()
+                })
+                .filter_map(|p| {
+                    Some(Volume {
+                        name: p.name,
+                        kind: p.kind,
+                        mesh: Arc::clone(meshes.get(p.mesh)?),
+                        transform: p.transform,
+                        overrides: p.overrides,
+                    })
+                })
+                .collect(),
+            ranges: o.ranges.into_iter().filter(|r| r.lo.is_finite() && r.hi.is_finite()).collect(),
         });
     }
     let mut presets = manifest.presets;

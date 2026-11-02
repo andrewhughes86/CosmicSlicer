@@ -41,6 +41,13 @@ impl Page {
     }
 }
 
+/// A volume or height range of an object, as the object list selects it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sub {
+    Volume(usize),
+    Range(usize),
+}
+
 /// The plate surfaces OrcaSlicer offers ("Plate type"); their filament temperatures are the
 /// `*_plate_temp` options.
 pub const BED_TYPES: &[(&str, &str)] = &[
@@ -436,7 +443,17 @@ impl Session {
                 let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("Object").to_owned();
                 let mut ids = Vec::new();
                 let mut triangles = 0;
-                for o in file.objects {
+                let mut fixed = CosmicSlicer_model::repair::Report::default();
+                for mut o in file.objects {
+                    let r = CosmicSlicer_model::repair::repair(&mut o.mesh);
+                    fixed.degenerate += r.degenerate;
+                    fixed.flipped += r.flipped;
+                    fixed.holes_closed += r.holes_closed;
+                    fixed.open_edges += r.open_edges;
+                    if r.degenerate + r.holes_closed > 0 {
+                        // Triangles moved; painted facets no longer line up.
+                        o.paint = None;
+                    }
                     let rel = o.mesh.bounds().centre() - group.centre();
                     let at = centre + Vec3::new(rel.x, rel.y, 0.0);
                     let name = if single { file_name.clone() } else { o.name };
@@ -460,6 +477,10 @@ impl Session {
                         "An object is laid over the boundary of the plate or exceeds the height limit.",
                     );
                 }
+                if fixed.changed() || fixed.open_edges > 0 {
+                    let level = if fixed.open_edges > 0 { Level::Warning } else { Level::Info };
+                    self.notify(level, fixed.describe());
+                }
                 if triangles > HUGE_MESH {
                     self.notify(
                         Level::Warning,
@@ -477,6 +498,153 @@ impl Session {
             }
             Err(e) => self.notify(Level::Error, e.to_string()),
         }
+    }
+
+    /// A primitive or model to add to object `id` as a volume of `kind`, sized to the object
+    /// and placed at its middle. Returns the new volume's index.
+    fn add_volume_mesh(
+        &mut self,
+        id: u64,
+        kind: CosmicSlicer_model::PartKind,
+        name: &str,
+        mesh: CosmicSlicer_model::Mesh,
+        fit: bool,
+    ) -> Option<usize> {
+        let o = self.model.get(id)?;
+        let local = o.mesh.bounds();
+        let at = local.centre();
+        let mut mesh = mesh;
+        if fit {
+            // Half the object's size, as OrcaSlicer sizes a new modifier.
+            let want = (local.size().max_element() * 0.5).max(5.0);
+            let have = mesh.bounds().size().max_element().max(1e-3);
+            for v in &mut mesh.vertices {
+                *v *= want / have;
+            }
+        }
+        self.checkpoint();
+        let index = self.model.add_volume(id, name, kind, mesh, at)?;
+        self.selection = vec![id];
+        Some(index)
+    }
+
+    /// Adds primitive `primitive` to object `id` as a volume of `kind`.
+    pub fn add_volume(&mut self, id: u64, kind: CosmicSlicer_model::PartKind, primitive: &str) -> Option<usize> {
+        let mesh = primitives::by_name(primitive)?;
+        let name = format!("{} {}", kind.label(), primitive.to_lowercase());
+        self.add_volume_mesh(id, kind, &name, mesh, true)
+    }
+
+    /// Adds the model in `path` to object `id` as a volume of `kind`, at its own size.
+    pub fn add_volume_file(&mut self, id: u64, kind: CosmicSlicer_model::PartKind, path: &Path) -> Option<usize> {
+        match CosmicSlicer_model::load(path) {
+            Ok(file) => {
+                let mut mesh = CosmicSlicer_model::Mesh::default();
+                for o in file.objects {
+                    let base = mesh.vertices.len() as u32;
+                    mesh.vertices.extend(o.mesh.vertices);
+                    mesh.triangles.extend(o.mesh.triangles.iter().map(|t| t.map(|i| i + base)));
+                }
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("Part").to_owned();
+                self.add_volume_mesh(id, kind, &name, mesh, false)
+            }
+            Err(e) => {
+                self.notify(Level::Error, e.to_string());
+                None
+            }
+        }
+    }
+
+    pub fn remove_volume(&mut self, id: u64, index: usize) {
+        self.checkpoint();
+        self.model.remove_volume(id, index);
+    }
+
+    pub fn set_volume_kind(&mut self, id: u64, index: usize, kind: CosmicSlicer_model::PartKind) {
+        self.checkpoint();
+        if let Some(v) = self.model.get_mut(id).and_then(|o| o.parts.get_mut(index)) {
+            v.kind = kind;
+        }
+        if let Some(o) = self.model.get_mut(id) {
+            o.drop_to_bed();
+        }
+    }
+
+    /// Moves or scales a volume within its object, as its panel is dragged.
+    pub fn set_volume_transform(&mut self, id: u64, index: usize, t: Transform) {
+        if !(t.offset.is_finite() && t.rotation.is_finite() && t.scale.is_finite() && t.scale.min_element() > 0.0) {
+            return;
+        }
+        if let Some(v) = self.model.get_mut(id).and_then(|o| o.parts.get_mut(index)) {
+            v.transform = t;
+        }
+        if let Some(o) = self.model.get_mut(id) {
+            o.drop_to_bed();
+        }
+        self.touch();
+    }
+
+    /// Splits each selected object into parts of itself.
+    pub fn split_to_parts(&mut self) {
+        self.checkpoint();
+        let mut single = 0;
+        for id in self.selection.clone() {
+            if self.model.split_to_parts(id) < 2 {
+                single += 1;
+            }
+        }
+        if single > 0 {
+            self.notify(Level::Info, "The object is a single piece; there is nothing to split.");
+        }
+    }
+
+    /// Joins the selected objects into one object of several parts.
+    pub fn assemble(&mut self) {
+        if self.selection.len() < 2 {
+            return;
+        }
+        self.checkpoint();
+        if let Some(id) = self.model.assemble(&self.selection.clone()) {
+            self.selection = vec![id];
+        }
+    }
+
+    /// Adds a height range over the middle third of object `id`.
+    pub fn add_range(&mut self, id: u64) -> Option<usize> {
+        let b = self.model.get(id)?.bounds();
+        let h = b.size().z;
+        self.checkpoint();
+        let o = self.model.get_mut(id)?;
+        let (lo, hi) = ((h / 3.0 * 10.0).round() / 10.0, (h * 2.0 / 3.0 * 10.0).round() / 10.0);
+        o.ranges.push(CosmicSlicer_model::HeightRange { lo, hi: hi.max(lo + 0.1), overrides: Vec::new() });
+        Some(o.ranges.len() - 1)
+    }
+
+    pub fn remove_range(&mut self, id: u64, index: usize) {
+        self.checkpoint();
+        if let Some(o) = self.model.get_mut(id)
+            && index < o.ranges.len()
+        {
+            o.ranges.remove(index);
+        }
+    }
+
+    /// Sets a height range's ends, kept in order.
+    pub fn set_range(&mut self, id: u64, index: usize, lo: f32, hi: f32) {
+        if !(lo.is_finite() && hi.is_finite()) {
+            return;
+        }
+        if let Some(r) = self.model.get_mut(id).and_then(|o| o.ranges.get_mut(index)) {
+            r.lo = lo.max(0.0).min(hi);
+            r.hi = hi.max(r.lo + 0.01);
+        }
+        self.touch();
+    }
+
+    /// Moves object `id` to place `to` in the list.
+    pub fn reorder(&mut self, id: u64, to: usize) {
+        self.checkpoint();
+        self.model.reorder(id, to);
     }
 
     /// Puts `path` at the top of the recent files.

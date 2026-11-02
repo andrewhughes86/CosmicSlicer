@@ -201,6 +201,14 @@ impl Viewport {
             {
                 best = Some((obj.id, dist, tri));
             }
+            // Its other parts select it too (with no face of the main mesh to lay down).
+            for p in obj.parts.iter().filter(|p| p.kind.is_solid()) {
+                if let Some((dist, _)) = p.mesh.ray_hit(&(obj.matrix() * p.matrix()), o, d)
+                    && best.is_none_or(|b| dist < b.1)
+                {
+                    best = Some((obj.id, dist, usize::MAX));
+                }
+            }
         }
         best
     }
@@ -324,10 +332,16 @@ impl Viewport {
         }
         let shown: Vec<&CosmicSlicer_model::Object> =
             if result.is_some() { Vec::new() } else { self.shown(session, page).collect() };
-        let meshes: Vec<(usize, &CosmicSlicer_model::Mesh)> =
-            shown.iter().map(|o| (Arc::as_ptr(&o.mesh) as usize, o.mesh.as_ref())).collect();
+        let meshes: Vec<(usize, &CosmicSlicer_model::Mesh)> = shown
+            .iter()
+            .flat_map(|o| {
+                std::iter::once(&o.mesh)
+                    .chain(o.parts.iter().map(|p| &p.mesh))
+                    .map(|m| (Arc::as_ptr(m) as usize, m.as_ref()))
+            })
+            .collect();
         gpu.sync_meshes(&meshes);
-        let draws = shown
+        let mut draws: Vec<ObjectDraw> = shown
             .iter()
             .map(|o| {
                 let selected = session.selection.contains(&o.id);
@@ -349,6 +363,37 @@ impl Viewport {
                 }
             })
             .collect();
+        // The other volumes: parts in the object's colour, the rest see-through, drawn last.
+        let mut glass = Vec::new();
+        for o in &shown {
+            let selected = session.selection.contains(&o.id);
+            for p in &o.parts {
+                let colour = match p.kind {
+                    CosmicSlicer_model::PartKind::Normal => {
+                        let mut c = linear(object_colour(session, o.filament));
+                        c[3] = 1.0;
+                        c
+                    }
+                    CosmicSlicer_model::PartKind::Modifier => [0.55, 0.55, 0.6, 0.35],
+                    CosmicSlicer_model::PartKind::Negative => [0.15, 0.15, 0.18, 0.45],
+                    CosmicSlicer_model::PartKind::SupportEnforcer => [0.2, 0.45, 0.95, 0.4],
+                    CosmicSlicer_model::PartKind::SupportBlocker => [0.95, 0.25, 0.2, 0.4],
+                };
+                let draw = ObjectDraw {
+                    mesh: Arc::as_ptr(&p.mesh) as usize,
+                    model: o.matrix() * p.matrix(),
+                    color: colour,
+                    highlight: if page == Page::Prepare && selected { 0.3 } else { 0.0 },
+                    outside: false,
+                };
+                if p.kind.is_solid() {
+                    draws.push(draw);
+                } else if page == Page::Prepare {
+                    glass.push(draw);
+                }
+            }
+        }
+        draws.extend(glass);
         gpu.set_draws(draws);
         let mut overlay_geometry = FlatGeometry::default();
         if let Some(r) = &result {

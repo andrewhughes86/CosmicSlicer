@@ -8,6 +8,7 @@
 pub mod mesh;
 pub mod obj;
 pub mod primitives;
+pub mod repair;
 pub mod stl;
 pub mod threemf;
 
@@ -77,6 +78,12 @@ fn load_bytes(name: &str, bytes: &[u8], out: &mut LoadedFile) -> ModelResult<()>
             // Each object (and each copy of it) on its own, as placed.
             let p = threemf::read(bytes)?;
             out.warnings.extend(p.warnings);
+            let others = p.objects.iter().flat_map(|o| &o.parts).filter(|p| !p.kind.is_solid()).count();
+            if others > 0 {
+                out.warnings.push(format!(
+                    "{others} modifier, negative or support volume(s) were left out; open the file as a project to keep them"
+                ));
+            }
             for o in &p.objects {
                 let (mesh, paint) = o.merged();
                 for inst in &o.instances {
@@ -143,6 +150,90 @@ pub fn load(path: &Path) -> ModelResult<LoadedFile> {
     Ok(out)
 }
 
+/// What a part of an object is (OrcaSlicer's volume types).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PartKind {
+    #[default]
+    Normal,
+    Modifier,
+    Negative,
+    SupportEnforcer,
+    SupportBlocker,
+}
+
+impl PartKind {
+    pub fn orca(self) -> &'static str {
+        match self {
+            PartKind::Normal => "normal_part",
+            PartKind::Modifier => "modifier_part",
+            PartKind::Negative => "negative_part",
+            PartKind::SupportEnforcer => "support_enforcer",
+            PartKind::SupportBlocker => "support_blocker",
+        }
+    }
+
+    pub fn from_orca(s: &str) -> PartKind {
+        match s {
+            "modifier_part" => PartKind::Modifier,
+            "negative_part" | "negative_volume" => PartKind::Negative,
+            "support_enforcer" => PartKind::SupportEnforcer,
+            "support_blocker" => PartKind::SupportBlocker,
+            _ => PartKind::Normal,
+        }
+    }
+}
+
+impl PartKind {
+    pub const ALL: [PartKind; 5] =
+        [PartKind::Normal, PartKind::Negative, PartKind::Modifier, PartKind::SupportEnforcer, PartKind::SupportBlocker];
+
+    /// As OrcaSlicer's object list names it.
+    pub fn label(self) -> &'static str {
+        match self {
+            PartKind::Normal => "Part",
+            PartKind::Modifier => "Modifier",
+            PartKind::Negative => "Negative volume",
+            PartKind::SupportEnforcer => "Support enforcer",
+            PartKind::SupportBlocker => "Support blocker",
+        }
+    }
+
+    /// Whether it adds to the printed shape (normal parts) rather than changing settings or
+    /// supports inside it.
+    pub fn is_solid(self) -> bool {
+        self == PartKind::Normal
+    }
+}
+
+/// One more volume of an object besides its main mesh: a part, or a modifier, negative
+/// volume or support enforcer/blocker.
+#[derive(Clone, Debug)]
+pub struct Volume {
+    pub name: String,
+    pub kind: PartKind,
+    /// In the object's own frame (the frame its main mesh is in) before `transform`.
+    pub mesh: Arc<Mesh>,
+    /// Placement within the object.
+    pub transform: Transform,
+    /// Settings inside this volume (parts and modifiers).
+    pub overrides: Vec<(String, String)>,
+}
+
+impl Volume {
+    pub fn matrix(&self) -> Mat4 {
+        self.transform.matrix()
+    }
+}
+
+/// Settings for the layers between two heights (OrcaSlicer's "height range modifier").
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HeightRange {
+    /// Millimetres above the plate.
+    pub lo: f32,
+    pub hi: f32,
+    pub overrides: Vec<(String, String)>,
+}
+
 /// Placement of an object on the plate: scale, then rotate, then move.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Transform {
@@ -192,6 +283,10 @@ pub struct Object {
     pub overrides: Vec<(String, String)>,
     /// Painted supports, seams and colours, by triangle of `mesh`.
     pub paint: Option<Arc<Paint>>,
+    /// More parts, modifiers, negative volumes and support enforcers/blockers.
+    pub parts: Vec<Volume>,
+    /// Settings by height.
+    pub ranges: Vec<HeightRange>,
 }
 
 impl Object {
@@ -199,9 +294,21 @@ impl Object {
         self.transform.matrix()
     }
 
-    /// Bounds on the plate after the transform.
+    /// Bounds on the plate after the transform: the main mesh and the other parts that print.
     pub fn bounds(&self) -> Aabb {
-        self.mesh.bounds_transformed(&self.matrix())
+        let m = self.matrix();
+        self.parts
+            .iter()
+            .filter(|p| p.kind.is_solid())
+            .fold(self.mesh.bounds_transformed(&m), |b, p| b.union(&p.mesh.bounds_transformed(&(m * p.matrix()))))
+    }
+
+    /// Every printed mesh with its placement on the plate.
+    pub fn solids(&self) -> Vec<(&Mesh, Mat4)> {
+        let m = self.matrix();
+        std::iter::once((self.mesh.as_ref(), m))
+            .chain(self.parts.iter().filter(|p| p.kind.is_solid()).map(|p| (p.mesh.as_ref(), m * p.matrix())))
+            .collect()
     }
 
     /// Size on the plate after the transform.
@@ -246,6 +353,8 @@ impl Model {
             visible: true,
             overrides: Vec::new(),
             paint: None,
+            parts: Vec::new(),
+            ranges: Vec::new(),
         };
         object.drop_to_bed();
         self.objects.push(object);
@@ -286,7 +395,118 @@ impl Model {
     }
 
     pub fn triangle_count(&self) -> usize {
-        self.objects.iter().map(|o| o.mesh.triangle_count()).sum()
+        self.objects
+            .iter()
+            .map(|o| o.mesh.triangle_count() + o.parts.iter().map(|p| p.mesh.triangle_count()).sum::<usize>())
+            .sum()
+    }
+
+    /// Adds a volume to object `id`, `mesh` centred at `at` in the object's frame; returns
+    /// its index.
+    pub fn add_volume(
+        &mut self,
+        id: u64,
+        name: impl Into<String>,
+        kind: PartKind,
+        mesh: Mesh,
+        at: Vec3,
+    ) -> Option<usize> {
+        let o = self.get_mut(id)?;
+        let mesh = mesh.centred();
+        let lift = mesh.bounds().size().z / 2.0;
+        o.parts.push(Volume {
+            name: name.into(),
+            kind,
+            mesh: Arc::new(mesh),
+            transform: Transform { offset: at - Vec3::new(0.0, 0.0, lift), ..Default::default() },
+            overrides: Vec::new(),
+        });
+        if kind.is_solid() {
+            o.drop_to_bed();
+        }
+        Some(o.parts.len() - 1)
+    }
+
+    pub fn remove_volume(&mut self, id: u64, index: usize) {
+        if let Some(o) = self.get_mut(id)
+            && index < o.parts.len()
+        {
+            o.parts.remove(index);
+            o.drop_to_bed();
+        }
+    }
+
+    /// Splits object `id`'s main mesh into its separate pieces, as parts of the same object.
+    /// Returns how many parts it then has.
+    pub fn split_to_parts(&mut self, id: u64) -> usize {
+        let Some(o) = self.get_mut(id) else { return 0 };
+        let mut pieces = o.mesh.split();
+        if pieces.len() < 2 {
+            return pieces.len();
+        }
+        // The largest piece stays the main mesh.
+        pieces.sort_by_key(|p| std::cmp::Reverse(p.triangle_count()));
+        let mut it = pieces.into_iter();
+        if let Some(main) = it.next() {
+            o.mesh = Arc::new(main);
+            o.paint = None;
+        }
+        for (k, piece) in it.enumerate() {
+            o.parts.push(Volume {
+                name: format!("{} part {}", o.name, k + 2),
+                kind: PartKind::Normal,
+                mesh: Arc::new(piece),
+                transform: Transform::default(),
+                overrides: Vec::new(),
+            });
+        }
+        o.parts.len() + 1
+    }
+
+    /// Joins objects `ids` into the first of them, the others becoming its parts where they
+    /// stand. Returns the joined object's id.
+    pub fn assemble(&mut self, ids: &[u64]) -> Option<u64> {
+        let (&first, rest) = ids.split_first()?;
+        let inverse = self.get(first)?.matrix().inverse();
+        let mut taken = Vec::new();
+        for id in rest {
+            if *id == first {
+                continue;
+            }
+            let Some(o) = self.get(*id).cloned() else { continue };
+            let m = inverse * o.matrix();
+            let mut t = Transform::default();
+            let (scale, rot, offset) = m.to_scale_rotation_translation();
+            t.offset = offset;
+            t.scale = scale;
+            t.set_quat(rot);
+            taken.push(Volume {
+                name: o.name.clone(),
+                kind: PartKind::Normal,
+                mesh: o.mesh,
+                transform: t,
+                overrides: o.overrides,
+            });
+            for mut p in o.parts {
+                let m = inverse * o.transform.matrix() * p.matrix();
+                let (scale, rot, offset) = m.to_scale_rotation_translation();
+                p.transform = Transform { offset, scale, ..Default::default() };
+                p.transform.set_quat(rot);
+                taken.push(p);
+            }
+            self.remove(&[*id]);
+        }
+        let o = self.get_mut(first)?;
+        o.parts.extend(taken);
+        Some(first)
+    }
+
+    /// Moves object `id` to position `to` in the list.
+    pub fn reorder(&mut self, id: u64, to: usize) {
+        let Some(from) = self.objects.iter().position(|o| o.id == id) else { return };
+        let o = self.objects.remove(from);
+        let to = to.min(self.objects.len());
+        self.objects.insert(to, o);
     }
 
     /// Lays the objects of `plate` out in rows across a `bed` sized plate, `gap` apart,
@@ -359,6 +579,37 @@ mod tests {
                 assert!(apart, "{a:?} overlaps {b:?}");
             }
         }
+    }
+
+    #[test]
+    fn parts_split_assemble_and_count_in_the_bounds() {
+        let mut m = Model::new();
+        let a = m.add("a", primitives::cube(10.0), Vec3::new(50.0, 50.0, 0.0), 0);
+        let b = m.add("b", primitives::cube(10.0), Vec3::new(80.0, 50.0, 0.0), 0);
+        let before = m.get(a).map(Object::bounds);
+        // A modifier does not change the bounds; a part does.
+        m.add_volume(a, "mod", PartKind::Modifier, primitives::cube(30.0), Vec3::ZERO);
+        assert_eq!(m.get(a).map(Object::bounds), before);
+        assert_eq!(m.assemble(&[a, b]), Some(a));
+        assert_eq!(m.objects.len(), 1);
+        let o = m.get(a);
+        assert!(
+            o.is_some_and(|o| o.parts.len() == 2 && (o.bounds().size().x - 40.0).abs() < 1e-3),
+            "{:?}",
+            o.map(Object::bounds)
+        );
+        // Two separate cubes in one mesh split into two parts.
+        let mut two = primitives::cube(5.0);
+        let off = two.vertices.len() as u32;
+        two.vertices.extend(primitives::cube(5.0).vertices.iter().map(|v| *v + Vec3::new(10.0, 0.0, 0.0)));
+        let tris: Vec<[u32; 3]> = primitives::cube(5.0).triangles.iter().map(|t| t.map(|i| i + off)).collect();
+        two.triangles.extend(tris);
+        let c = m.add("two", two, Vec3::new(50.0, 100.0, 0.0), 0);
+        assert_eq!(m.split_to_parts(c), 2);
+        assert!(m.get(c).is_some_and(|o| (o.bounds().size().x - 15.0).abs() < 1e-3));
+        // Reordering.
+        m.reorder(c, 0);
+        assert_eq!(m.objects.first().map(|o| o.id), Some(c));
     }
 
     #[test]

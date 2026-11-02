@@ -53,6 +53,8 @@ pub enum Action {
     SaveProjectAs,
     Import,
     ImportPath(PathBuf),
+    /// Pick a model file to add to an object as a volume of the kind given.
+    AddVolumeFile(u64, CosmicSlicer_model::PartKind),
     ExportStl,
     ExportGcode,
     Quit,

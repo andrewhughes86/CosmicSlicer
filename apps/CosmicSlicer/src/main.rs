@@ -19,6 +19,9 @@ const USAGE: &str = "usage: CosmicSlicer [model.stl ...] [options]
   model.stl / model.obj   import these models
   --tab <page>            open on Home, Prepare, Preview, Device, Multi-device or Project
   --add <primitive>       add a Cube, Cylinder, Sphere, Cone, Disc or Torus (repeatable)
+  --add-volume <kind:primitive>
+                          add a part, modifier, negative, enforcer or blocker to the last
+                          object (e.g. modifier:cube), or a height range (range)
   --arrange               arrange the plate
   --select-all            select every object
   --theme <dark|light>    use this theme
@@ -53,6 +56,7 @@ fn main() -> ExitCode {
         let step = match arg.as_str() {
             "--tab" => value("--tab").map(Step::Tab),
             "--add" => value("--add").map(Step::Primitive),
+            "--add-volume" => value("--add-volume").map(Step::Volume),
             "--theme" => value("--theme").map(Step::Theme),
             "--dialog" => value("--dialog").map(Step::Dialog),
             "--tool" => value("--tool").map(Step::Tool),

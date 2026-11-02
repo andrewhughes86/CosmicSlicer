@@ -8,9 +8,10 @@ use CosmicSlicer_config::{Preset, TabKind};
 use crate::Action;
 use crate::icons;
 use crate::settings::{self, Target};
-use crate::state::{BED_TYPES, Session};
+use crate::state::{BED_TYPES, Session, Sub};
 use crate::theme::{Tokens, ink_on, parse_hex, to_hex};
 use crate::ui_kit;
+use CosmicSlicer_model::PartKind;
 
 /// Sidebar state that is not part of the project.
 #[derive(Default)]
@@ -24,6 +25,21 @@ pub struct Sidebar {
     pub objects_open: bool,
     /// An object being renamed in the list, and the new name so far.
     pub renaming: Option<(u64, String)>,
+    /// The volume or height range picked in the object list, for its own settings.
+    pub sub: Option<(u64, Sub)>,
+    /// Objects whose parts are folded away.
+    pub folded: Vec<u64>,
+}
+
+/// The icon OrcaSlicer's object list shows for a volume of `kind`.
+pub fn kind_icon(kind: PartKind) -> &'static str {
+    match kind {
+        PartKind::Normal => "menu_add_part",
+        PartKind::Modifier => "menu_add_modifier",
+        PartKind::Negative => "menu_add_negative",
+        PartKind::SupportEnforcer => "menu_support_enforcer",
+        PartKind::SupportBlocker => "menu_support_blocker",
+    }
 }
 
 impl Sidebar {
@@ -341,7 +357,14 @@ fn objects(ui: &mut Ui, sb: &mut Sidebar, session: &mut Session, t: &Tokens, act
         return;
     }
     let row_h = 24.0;
-    let height = ((count.max(1)) as f32 * (row_h + 2.0) + 30.0).min(190.0);
+    // Rows: each object, and its volumes and ranges unless folded.
+    let rows: usize = session
+        .model
+        .objects
+        .iter()
+        .map(|o| 1 + if sb.folded.contains(&o.id) { 0 } else { o.parts.len() + o.ranges.len() })
+        .sum();
+    let height = ((rows.max(1)) as f32 * (row_h + 2.0) + 30.0).min(260.0);
     egui::Frame::new().inner_margin(egui::Margin::symmetric(6, 4)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
@@ -366,28 +389,44 @@ fn objects(ui: &mut Ui, sb: &mut Sidebar, session: &mut Session, t: &Tokens, act
                     );
                 }
                 let ids: Vec<u64> = session.model.objects.iter().map(|o| o.id).collect();
-                for id in ids {
-                    object_row(ui, sb, session, t, id, row_h, actions);
+                for (place, id) in ids.into_iter().enumerate() {
+                    object_row(ui, sb, session, t, id, place, row_h, actions);
+                    if !sb.folded.contains(&id) {
+                        sub_rows(ui, sb, session, t, id, row_h);
+                    }
                 }
             },
         );
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn object_row(
     ui: &mut Ui,
     sb: &mut Sidebar,
     session: &mut Session,
     t: &Tokens,
     id: u64,
+    place: usize,
     h: f32,
     actions: &mut Vec<Action>,
 ) {
     let Some(o) = session.model.get(id) else { return };
     let (name, plate, filament, visible) = (o.name.clone(), o.plate, o.filament, o.visible);
+    let has_subs = !o.parts.is_empty() || !o.ranges.is_empty();
     let fits = session.fits(id);
-    let selected = session.selection.contains(&id);
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
+    let selected = session.selection.contains(&id) && sb.sub.is_none_or(|(sid, _)| sid != id);
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click_and_drag());
+    // Drag an object onto another to move it there in the list.
+    response.dnd_set_drag_payload(id);
+    if let Some(moved) = response.dnd_release_payload::<u64>()
+        && *moved != id
+    {
+        session.reorder(*moved, place);
+    }
+    if response.dnd_hover_payload::<u64>().is_some() {
+        ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(2.0, t.accent));
+    }
     if selected {
         ui.painter().rect_filled(rect, 3.0, t.accent.gamma_multiply(0.22));
     } else if response.hovered() {
@@ -396,6 +435,28 @@ fn object_row(
     let mut child = ui.new_child(
         egui::UiBuilder::new().max_rect(rect.shrink2(vec2(4.0, 0.0))).layout(Layout::left_to_right(Align::Center)),
     );
+    if has_subs {
+        let folded = sb.folded.contains(&id);
+        let (r, fold) = child.allocate_exact_size(vec2(14.0, 18.0), Sense::click());
+        // A small triangle: right when folded, down when open.
+        let c = r.center();
+        let pts = if folded {
+            vec![c + vec2(-3.0, -5.0), c + vec2(4.0, 0.0), c + vec2(-3.0, 5.0)]
+        } else {
+            vec![c + vec2(-5.0, -3.0), c + vec2(5.0, -3.0), c + vec2(0.0, 4.0)]
+        };
+        let colour = if fold.hovered() { t.accent } else { t.text_muted };
+        child.painter().add(egui::Shape::convex_polygon(pts, colour, Stroke::NONE));
+        if fold.clicked() {
+            if folded {
+                sb.folded.retain(|f| *f != id);
+            } else {
+                sb.folded.push(id);
+            }
+        }
+    } else {
+        child.add_space(18.0);
+    }
     let eye = if visible { "im_visible" } else { "im_hidden" };
     if icons::button(&mut child, eye, t, 20.0, false, if visible { "Hide" } else { "Show" }).clicked() {
         session.toggle_visible(id);
@@ -460,6 +521,7 @@ fn object_row(
             session.selection = vec![id];
             session.plate = plate;
         }
+        sb.sub = None;
     }
     if response.secondary_clicked() && !selected {
         session.selection = vec![id];
@@ -551,7 +613,12 @@ fn process(ui: &mut Ui, sb: &mut Sidebar, session: &mut Session, t: &Tokens, act
     ui.painter().hline(ui.available_rect_before_wrap().x_range(), ui.cursor().top(), Stroke::new(1.0, t.border));
     let target = if sb.scope == 1 {
         match session.selection.first() {
-            Some(id) => Target { kind: TabKind::Process, filament: 0, object: Some(*id) },
+            Some(id) => Target {
+                kind: TabKind::Process,
+                filament: 0,
+                object: Some(*id),
+                sub: sb.sub.filter(|(sid, _)| sid == id).map(|(_, s)| s),
+            },
             None => {
                 body(ui, |ui| {
                     ui.label(
@@ -568,7 +635,7 @@ fn process(ui: &mut Ui, sb: &mut Sidebar, session: &mut Session, t: &Tokens, act
         egui::Frame::new().inner_margin(egui::Margin { left: 8, right: 12, top: 0, bottom: 12 }).show(ui, |ui| {
             ui.set_width(ui.available_width());
             if let Some(id) = target.object {
-                object_overrides(ui, session, t, id);
+                object_overrides(ui, session, t, id, target.sub);
             }
             if !sb.search.trim().is_empty() {
                 let q = sb.search.clone();
@@ -580,13 +647,128 @@ fn process(ui: &mut Ui, sb: &mut Sidebar, session: &mut Session, t: &Tokens, act
     });
 }
 
+/// An object's volumes and height ranges, under its row.
+fn sub_rows(ui: &mut Ui, sb: &mut Sidebar, session: &mut Session, t: &Tokens, id: u64, h: f32) {
+    let Some(o) = session.model.get(id) else { return };
+    let volumes: Vec<(String, PartKind, usize)> =
+        o.parts.iter().map(|v| (v.name.clone(), v.kind, v.overrides.len())).collect();
+    let ranges: Vec<(f32, f32, usize)> = o.ranges.iter().map(|r| (r.lo, r.hi, r.overrides.len())).collect();
+    let rows =
+        volumes.into_iter().enumerate().map(|(i, (name, kind, n))| (Sub::Volume(i), kind_icon(kind), name, n)).chain(
+            ranges
+                .into_iter()
+                .enumerate()
+                .map(|(i, (lo, hi, n))| (Sub::Range(i), "param_layer_height", format!("Height {lo:.2}–{hi:.2} mm"), n)),
+        );
+    for (sub, icon, label, n) in rows.collect::<Vec<_>>() {
+        let on = sb.sub == Some((id, sub)) && session.selection.contains(&id);
+        let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), h - 2.0), Sense::click());
+        if on {
+            ui.painter().rect_filled(rect, 3.0, t.accent.gamma_multiply(0.22));
+        } else if response.hovered() {
+            ui.painter().rect_filled(rect, 3.0, t.hover_bg);
+        }
+        let mut row = ui.new_child(
+            egui::UiBuilder::new().max_rect(rect.shrink2(vec2(4.0, 0.0))).layout(Layout::left_to_right(Align::Center)),
+        );
+        row.add_space(34.0);
+        let (r, _) = row.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+        icons::paint(&row, r, icon, t, true);
+        row.add(egui::Label::new(RichText::new(label).small()).truncate());
+        if n > 0 {
+            row.label(RichText::new(format!("· {n} setting(s)")).small().color(t.text_muted));
+        }
+        if response.clicked() {
+            session.selection = vec![id];
+            sb.sub = Some((id, sub));
+            // Its settings show in the Process panel's Objects mode.
+            sb.scope = 1;
+        }
+        ui_kit::context_menu(&response, t, |ui| {
+            ui.set_min_width(200.0);
+            match sub {
+                Sub::Volume(i) => {
+                    ui.menu_button("Change type", |ui| {
+                        for kind in PartKind::ALL {
+                            if ui_kit::menu_item(ui, kind.label(), "", true) {
+                                session.set_volume_kind(id, i, kind);
+                                ui.close();
+                            }
+                        }
+                    });
+                    if ui_kit::menu_item(ui, "Delete", "", true) {
+                        session.remove_volume(id, i);
+                        sb.sub = None;
+                        ui.close();
+                    }
+                }
+                Sub::Range(i) => {
+                    if ui_kit::menu_item(ui, "Delete", "", true) {
+                        session.remove_range(id, i);
+                        sb.sub = None;
+                        ui.close();
+                    }
+                }
+            }
+        });
+    }
+}
+
 /// The selected object's own settings, in Objects mode.
-fn object_overrides(ui: &mut Ui, session: &mut Session, t: &Tokens, id: u64) {
+fn object_overrides(ui: &mut Ui, session: &mut Session, t: &Tokens, id: u64, sub: Option<Sub>) {
     let Some(o) = session.model.get(id) else { return };
     let name = o.name.clone();
-    let n = o.overrides.len();
     ui.add_space(6.0);
-    ui.label(RichText::new(format!("{name}: {n} setting(s) of its own")).strong());
+    match sub {
+        Some(Sub::Volume(i)) => {
+            let Some(v) = o.parts.get(i) else { return };
+            let (vname, kind, n, mut tr) = (v.name.clone(), v.kind, v.overrides.len(), v.transform);
+            ui.label(
+                RichText::new(format!("{vname} ({}): {n} setting(s) of its own", kind.label().to_lowercase())).strong(),
+            );
+            // Where it sits in the object.
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Position").small().color(t.text_muted));
+                for (axis, v) in ["X", "Y", "Z"].iter().zip([&mut tr.offset.x, &mut tr.offset.y, &mut tr.offset.z]) {
+                    ui.label(RichText::new(*axis).small());
+                    changed |= ui.add(egui::DragValue::new(v).speed(0.1).max_decimals(2).suffix(" mm")).changed();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Scale").small().color(t.text_muted));
+                for (axis, v) in ["X", "Y", "Z"].iter().zip([&mut tr.scale.x, &mut tr.scale.y, &mut tr.scale.z]) {
+                    ui.label(RichText::new(*axis).small());
+                    changed |=
+                        ui.add(egui::DragValue::new(v).speed(0.01).range(0.01..=100.0).max_decimals(3)).changed();
+                }
+            });
+            if changed {
+                session.set_volume_transform(id, i, tr);
+            }
+        }
+        Some(Sub::Range(i)) => {
+            let Some(r) = o.ranges.get(i) else { return };
+            let (mut lo, mut hi, n) = (r.lo, r.hi, r.overrides.len());
+            ui.label(RichText::new(format!("{name}, height range: {n} setting(s) of its own")).strong());
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("From").small().color(t.text_muted));
+                changed |=
+                    ui.add(egui::DragValue::new(&mut lo).speed(0.05).range(0.0..=10_000.0).suffix(" mm")).changed();
+                ui.label(RichText::new("to").small().color(t.text_muted));
+                changed |=
+                    ui.add(egui::DragValue::new(&mut hi).speed(0.05).range(0.0..=10_000.0).suffix(" mm")).changed();
+            });
+            if changed {
+                session.set_range(id, i, lo, hi);
+            }
+        }
+        None => {
+            let n = o.overrides.len();
+            ui.label(RichText::new(format!("{name}: {n} setting(s) of its own")).strong());
+        }
+    }
     ui.label(
         RichText::new("Changes below apply to this object only; a reset arrow returns a setting to the global value.")
             .small()

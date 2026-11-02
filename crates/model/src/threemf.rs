@@ -16,6 +16,7 @@ use CosmicSlicer_import::xml::{self, Ev};
 use CosmicSlicer_import::zip::{self, Zip};
 use glam::{Mat4, Vec3, Vec4};
 
+pub use crate::PartKind;
 use crate::{Mesh, ModelError, ModelResult};
 
 /// Most vertices or triangles in one file.
@@ -24,39 +25,6 @@ const MAX_ITEMS: usize = 50_000_000;
 const MAX_OBJECTS: usize = 100_000;
 /// Deepest nesting of components.
 const MAX_DEPTH: usize = 16;
-
-/// What a part of an object is (OrcaSlicer's volume types).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PartKind {
-    #[default]
-    Normal,
-    Modifier,
-    Negative,
-    SupportEnforcer,
-    SupportBlocker,
-}
-
-impl PartKind {
-    pub fn orca(self) -> &'static str {
-        match self {
-            PartKind::Normal => "normal_part",
-            PartKind::Modifier => "modifier_part",
-            PartKind::Negative => "negative_part",
-            PartKind::SupportEnforcer => "support_enforcer",
-            PartKind::SupportBlocker => "support_blocker",
-        }
-    }
-
-    fn from_orca(s: &str) -> PartKind {
-        match s {
-            "modifier_part" => PartKind::Modifier,
-            "negative_part" | "negative_volume" => PartKind::Negative,
-            "support_enforcer" => PartKind::SupportEnforcer,
-            "support_blocker" => PartKind::SupportBlocker,
-            _ => PartKind::Normal,
-        }
-    }
-}
 
 /// Painted facets: OrcaSlicer's encoded strings by triangle, kept as they are so they save
 /// back unchanged.
@@ -174,6 +142,8 @@ pub struct ProjectObject {
     pub parts: Vec<Part>,
     pub instances: Vec<Instance>,
     pub settings: Vec<(String, String)>,
+    /// Settings by height: (from, to, settings), millimetres.
+    pub ranges: Ranges,
 }
 
 impl ProjectObject {
@@ -506,6 +476,30 @@ fn read_model_settings(bytes: &[u8]) -> ModelResult<(HashMap<String, ObjectConfi
     Ok((objects, plates))
 }
 
+/// Settings by height, as (from, to, settings).
+pub type Ranges = Vec<(f32, f32, Vec<(String, String)>)>;
+
+/// `Metadata/layer_config_ranges.xml`: settings by height, by object id.
+fn read_ranges(bytes: &[u8]) -> ModelResult<HashMap<String, Ranges>> {
+    let root = xml::tree(bytes).map_err(import_error)?;
+    let mut out = HashMap::new();
+    for o in root.descendants("object") {
+        let Some(id) = o.attr("id") else { continue };
+        let mut list = Vec::new();
+        for r in o.children_named("range") {
+            let num = |k: &str| r.attr(k).and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| v.is_finite());
+            let (Some(lo), Some(hi)) = (num("min_z"), num("max_z")) else { continue };
+            let settings = r
+                .children_named("option")
+                .filter_map(|opt| Some((opt.attr("opt_key")?.to_owned(), opt.text.trim().to_owned())))
+                .collect();
+            list.push((lo.min(hi), lo.max(hi), settings));
+        }
+        out.insert(id.to_owned(), list);
+    }
+    Ok(out)
+}
+
 /// The model file a 3MF's relationships name as its start part.
 fn start_part(z: &Zip) -> String {
     let fallback = "3D/3dmodel.model".to_owned();
@@ -643,7 +637,8 @@ pub fn read(bytes: &[u8]) -> ModelResult<Project> {
         instances.entry(id.clone()).or_default().push(*m);
     }
     let main_scale = Mat4::from_scale(Vec3::splat(main.scale));
-    let mut dropped = 0;
+    // The file's id of each object kept, for the files that refer to objects by id.
+    let mut object_ids: Vec<String> = Vec::new();
     for id in order {
         let mut defs = Vec::new();
         collect_parts(&files, &start, &id, Mat4::IDENTITY, 0, &mut defs);
@@ -662,9 +657,6 @@ pub fn read(bytes: &[u8]) -> ModelResult<Project> {
             let (pname, kind, settings) = cfg.and_then(|c| c.parts.get(&pid)).cloned().unwrap_or_default();
             let name = pname.unwrap_or_else(|| def.name.clone());
             let (mesh, paint) = checked_mesh(def);
-            if kind != PartKind::Normal {
-                dropped += 1;
-            }
             obj.parts.push(Part { name, kind, mesh, paint, settings });
         }
         let ms = instances.remove(&id).unwrap_or_default();
@@ -676,12 +668,18 @@ pub fn read(bytes: &[u8]) -> ModelResult<Project> {
         if obj.name.is_empty() {
             obj.name = format!("Object {}", project.objects.len() + 1);
         }
+        object_ids.push(id.clone());
         project.objects.push(obj);
     }
-    if dropped > 0 {
-        project.warnings.push(format!(
-            "{dropped} modifier, negative or support part(s) were left out; parts come in a later version"
-        ));
+    if let Ok(b) = z.read("Metadata/layer_config_ranges.xml") {
+        let ranges = read_ranges(&b)?;
+        for (id, list) in ranges {
+            if let Some(k) = object_ids.iter().position(|o| *o == id)
+                && let Some(o) = project.objects.get_mut(k)
+            {
+                o.ranges = list;
+            }
+        }
     }
     project.settings = z.read("Metadata/project_settings.config").ok().and_then(|b| String::from_utf8(b).ok());
     if project.objects.is_empty() && !project.is_project() {
@@ -906,6 +904,22 @@ pub fn write(project: &Project) -> ModelResult<Vec<u8>> {
     if let Some(settings) = &project.settings {
         files.push(("Metadata/project_settings.config".into(), settings.clone().into_bytes()));
     }
+    if project.objects.iter().any(|o| !o.ranges.is_empty()) {
+        let mut r = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<objects>\n");
+        for (o, (oid, _)) in project.objects.iter().zip(&ids).filter(|(o, _)| !o.ranges.is_empty()) {
+            let _ = writeln!(r, r#" <object id="{oid}">"#);
+            for (lo, hi, settings) in &o.ranges {
+                let _ = writeln!(r, r#"  <range min_z="{}" max_z="{}">"#, fmt_f(*lo), fmt_f(*hi));
+                for (k, v) in settings {
+                    let _ = writeln!(r, r#"   <option opt_key="{}">{}</option>"#, esc(k), esc(v));
+                }
+                let _ = writeln!(r, "  </range>");
+            }
+            let _ = writeln!(r, " </object>");
+        }
+        r.push_str("</objects>\n");
+        files.push(("Metadata/layer_config_ranges.xml".into(), r.into_bytes()));
+    }
     for (p, plate) in project.plates.iter().enumerate() {
         if let Some(png) = &plate.thumbnail {
             files.push((format!("Metadata/plate_{}.png", p + 1), png.clone()));
@@ -960,6 +974,7 @@ mod tests {
                         },
                     ],
                     settings: vec![("wall_loops".into(), "4".into())],
+                    ranges: vec![(2.0, 4.5, vec![("sparse_infill_density".into(), "40%".into())])],
                 },
                 ProjectObject {
                     name: "Ball".into(),
@@ -970,6 +985,7 @@ mod tests {
                         plate: Some(0),
                     }],
                     settings: vec![],
+                    ranges: vec![],
                 },
             ],
             plates: vec![
@@ -997,6 +1013,8 @@ mod tests {
         assert_eq!(a.name, "Cube <one>");
         assert_eq!(a.extruder, 2);
         assert_eq!(a.settings, b.settings);
+        assert_eq!(a.ranges, b.ranges);
+        assert!(back.objects[1].ranges.is_empty());
         assert_eq!(a.parts.len(), 2);
         assert_eq!(a.parts[1].kind, PartKind::Modifier);
         assert_eq!(a.parts[1].settings, b.parts[1].settings);

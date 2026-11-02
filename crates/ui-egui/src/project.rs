@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use CosmicSlicer_config::{Config, Preset, PresetBundle, Schema, Slot, TabKind, userfiles};
 use CosmicSlicer_model::threemf::{self, Instance, Part, PartKind, Plate, Project, ProjectObject};
-use CosmicSlicer_model::{Mesh, Model, Object, Transform};
+use CosmicSlicer_model::{HeightRange, Mesh, Model, Object, Transform, Volume};
 use glam::{Mat4, Vec3};
 use serde_json::{Map, Value};
 
@@ -255,18 +255,30 @@ pub fn to_project(session: &Session) -> Project {
     let mut objects = Vec::new();
     for o in session.model.objects.iter().filter(|o| o.visible) {
         let paint = o.paint.as_deref().cloned().unwrap_or_default();
+        let mut parts = vec![Part {
+            name: o.name.clone(),
+            kind: PartKind::Normal,
+            mesh: (*o.mesh).clone(),
+            paint,
+            settings: Vec::new(),
+        }];
+        // The other volumes with their placement in the object baked in.
+        for v in &o.parts {
+            parts.push(Part {
+                name: v.name.clone(),
+                kind: v.kind,
+                mesh: transformed(&v.mesh, &v.matrix()),
+                paint: Default::default(),
+                settings: v.overrides.clone(),
+            });
+        }
         objects.push(ProjectObject {
             name: o.name.clone(),
             extruder: o.filament.max(1),
-            parts: vec![Part {
-                name: o.name.clone(),
-                kind: PartKind::Normal,
-                mesh: (*o.mesh).clone(),
-                paint,
-                settings: Vec::new(),
-            }],
+            parts,
             instances: vec![Instance { matrix: o.matrix(), plate: Some(o.plate) }],
             settings: o.overrides.clone(),
+            ranges: o.ranges.iter().map(|r| (r.lo, r.hi, r.overrides.clone())).collect(),
         });
     }
     let colours: Vec<[u8; 3]> = (0..session.presets.project_filaments.len())
@@ -344,29 +356,38 @@ pub fn save(session: &Session, path: &Path) -> Result<(), String> {
 
 /// One placed copy of a mesh as an object: the mesh centred as [`Model::add`] keeps it, the
 /// placement split into scale, rotation and offset (or baked into the mesh when it shears).
-fn placed(name: &str, mesh: &Mesh, matrix: Mat4) -> Option<(Mesh, Transform)> {
+/// `mesh` with `m` applied to it (turned inside out back when `m` mirrors).
+fn transformed(mesh: &Mesh, m: &Mat4) -> Mesh {
+    let mut out = mesh.clone();
+    for v in &mut out.vertices {
+        *v = m.transform_point3(*v);
+    }
+    if m.determinant() < 0.0 {
+        for tri in &mut out.triangles {
+            tri.swap(1, 2);
+        }
+    }
+    out
+}
+
+/// As [`placed`] returns it: the object's mesh, its placement, and the map from the file's
+/// object frame into the mesh's (for the object's other parts).
+type Placed = (Mesh, Transform, Mat4);
+
+fn placed(name: &str, mesh: &Mesh, matrix: Mat4) -> Option<Placed> {
     let (scale, rot, offset) = matrix.to_scale_rotation_translation();
     let rebuilt = Mat4::from_scale_rotation_translation(scale, rot, offset);
     let tolerance = 1e-3 * scale.abs().max_element().max(1.0);
-    let (mut local, mut t) = if rebuilt.abs_diff_eq(matrix, tolerance) && scale.is_finite() && scale.min_element() > 0.0
-    {
-        let mut t = Transform { offset, scale, ..Default::default() };
-        t.set_quat(rot);
-        (mesh.clone(), t)
-    } else {
-        // Shear or mirroring: bake the shape, keep the position.
-        let linear = Mat4::from_cols(matrix.x_axis, matrix.y_axis, matrix.z_axis, glam::Vec4::W);
-        let mut m = mesh.clone();
-        for v in &mut m.vertices {
-            *v = linear.transform_point3(*v);
-        }
-        if linear.determinant() < 0.0 {
-            for tri in &mut m.triangles {
-                tri.swap(1, 2);
-            }
-        }
-        (m, Transform { offset, ..Default::default() })
-    };
+    let (mut local, mut t, baked) =
+        if rebuilt.abs_diff_eq(matrix, tolerance) && scale.is_finite() && scale.min_element() > 0.0 {
+            let mut t = Transform { offset, scale, ..Default::default() };
+            t.set_quat(rot);
+            (mesh.clone(), t, Mat4::IDENTITY)
+        } else {
+            // Shear or mirroring: bake the shape, keep the position.
+            let linear = Mat4::from_cols(matrix.x_axis, matrix.y_axis, matrix.z_axis, glam::Vec4::W);
+            (transformed(mesh, &linear), Transform { offset, ..Default::default() }, linear)
+        };
     let b = local.bounds();
     if !b.is_valid() || !t.offset.is_finite() {
         log::warn!("{name}: placement is not finite; skipped");
@@ -378,7 +399,7 @@ fn placed(name: &str, mesh: &Mesh, matrix: Mat4) -> Option<(Mesh, Transform)> {
     }
     let linear = Mat4::from_scale_rotation_translation(t.scale, t.quat(), Vec3::ZERO);
     t.offset -= linear.transform_vector3(shift);
-    Some((local, t))
+    Some((local, t, Mat4::from_translation(shift) * baked))
 }
 
 /// Reads the project at `path` into what the session takes; `session` gives the presets to
@@ -413,13 +434,37 @@ pub fn open(session: &Session, path: &Path) -> Result<(Restored, Vec<String>), S
     let mut model = Model::new();
     model.plates = plates;
     let filaments = presets.project_filaments.len().max(1);
+    let keep = |list: &[(String, String)]| -> Vec<(String, String)> {
+        list.iter().filter(|(k, _)| schema.option(k).is_some()).cloned().collect()
+    };
     for o in &project.objects {
-        let (mesh, paint) = o.merged();
-        if mesh.triangle_count() == 0 {
+        // The first part that prints is the object's mesh; the rest are its volumes.
+        let Some(main) = o.parts.iter().position(|p| p.kind == PartKind::Normal) else { continue };
+        let Some(first) = o.parts.get(main) else { continue };
+        if first.mesh.triangle_count() == 0 {
             continue;
         }
+        let paint = first.paint.clone();
+        let ranges: Vec<HeightRange> = o
+            .ranges
+            .iter()
+            .map(|(lo, hi, settings)| HeightRange { lo: *lo, hi: *hi, overrides: keep(settings) })
+            .collect();
         for inst in &o.instances {
-            let Some((local, transform)) = placed(&o.name, &mesh, inst.matrix) else { continue };
+            let Some((local, transform, frame)) = placed(&o.name, &first.mesh, inst.matrix) else { continue };
+            let parts: Vec<Volume> = o
+                .parts
+                .iter()
+                .enumerate()
+                .filter(|(k, p)| *k != main && p.mesh.triangle_count() > 0)
+                .map(|(_, p)| Volume {
+                    name: p.name.clone(),
+                    kind: p.kind,
+                    mesh: Arc::new(transformed(&p.mesh, &frame)),
+                    transform: Transform::default(),
+                    overrides: keep(&p.settings),
+                })
+                .collect();
             // Files without plates: the plate the object stands on.
             let plate = inst.plate.unwrap_or_else(|| {
                 let p = transform.offset.truncate() - lo.min(glam::Vec2::ZERO);
@@ -439,8 +484,10 @@ pub fn open(session: &Session, path: &Path) -> Result<(Restored, Vec<String>), S
                 filament: o.extruder.clamp(1, filaments),
                 plate: plate.min(plates - 1),
                 visible: true,
-                overrides: o.settings.iter().filter(|(k, _)| schema.option(k).is_some()).cloned().collect(),
+                overrides: keep(&o.settings),
                 paint: (!paint.is_empty()).then(|| Arc::new(paint.clone())),
+                parts,
+                ranges: ranges.clone(),
             });
         }
     }
@@ -536,6 +583,13 @@ mod tests {
             paint.supports.push((3, "4".into()));
             o.paint = Some(Arc::new(paint));
         }
+        let first = ids.first().copied().unwrap_or(0);
+        s.add_volume(first, CosmicSlicer_model::PartKind::Modifier, "Cube");
+        s.add_volume(first, CosmicSlicer_model::PartKind::Normal, "Sphere");
+        if let Some(v) = s.model.get_mut(first).and_then(|o| o.parts.get_mut(0)) {
+            v.overrides.push(("sparse_infill_density".into(), "55%".into()));
+        }
+        s.add_range(first);
         s.plate_settings_mut(1).name = "second".into();
         s.plate_settings_mut(1).sequence = 2;
         s.plate_settings_mut(0).bed_type = Some(1);
@@ -563,6 +617,13 @@ mod tests {
             assert!(ba.min.abs_diff_eq(bb.min, 1e-3) && ba.max.abs_diff_eq(bb.max, 1e-3), "{ba:?} {bb:?}");
             assert_eq!(a.overrides, b.overrides);
             assert_eq!(a.paint, b.paint);
+            assert_eq!(a.ranges, b.ranges);
+            assert_eq!(a.parts.len(), b.parts.len());
+            for (p, q) in a.parts.iter().zip(&b.parts) {
+                assert_eq!((p.kind, &p.overrides), (q.kind, &q.overrides));
+                let (pb, qb) = (p.mesh.bounds_transformed(&p.matrix()), q.mesh.bounds_transformed(&q.matrix()));
+                assert!(pb.min.abs_diff_eq(qb.min, 1e-3) && pb.max.abs_diff_eq(qb.max, 1e-3), "{pb:?} {qb:?}");
+            }
         }
         assert_eq!(r.presets.value(schema, TabKind::Process, 0, "layer_height"), "0.12");
         assert_eq!(r.presets.value(schema, TabKind::Filament, 0, "filament_colour"), "#123456");
@@ -586,6 +647,7 @@ mod tests {
                 Instance { matrix: Mat4::from_translation(Vec3::new(400.0, 100.0, 0.0)), plate: Some(1) },
             ],
             settings: vec![("sparse_infill_density".into(), "35%".into()), ("not_an_option".into(), "x".into())],
+            ranges: vec![],
         }];
         p.plates = vec![Plate::default(), Plate { name: "two".into(), ..Default::default() }];
         p.settings = Some(
