@@ -91,6 +91,54 @@ pub fn slice(mesh: &Placed, layers: &[LayerZ], cancelled: &(dyn Fn() -> bool + S
         .collect()
 }
 
+/// Where the triangles `tris` of `mesh` lie over each layer: each triangle cut to the slab
+/// from half a layer under the layer's bottom to its top, seen from above. Painted support
+/// uses this: an overhang's painted faces cover the area it needs held.
+pub fn painted(mesh: &Placed, tris: &[u32], layers: &[LayerZ]) -> Vec<Vec<Shape>> {
+    let mut loops: Vec<Vec<Contour>> = vec![Vec::new(); layers.len()];
+    let tops: Vec<f64> = layers.iter().map(|l| l.print_z).collect();
+    for ti in tris {
+        let Some(c) = mesh.triangles.get(*ti as usize).and_then(|t| corners(mesh, t)) else { continue };
+        let lo = c.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
+        let hi = c.iter().map(|p| p.z).fold(f64::NEG_INFINITY, f64::max);
+        let first = tops.partition_point(|z| *z < lo);
+        for (i, l) in layers.iter().enumerate().skip(first) {
+            let bottom = l.print_z - l.height * 1.5;
+            if bottom > hi {
+                break;
+            }
+            let piece = clip_z(&clip_z(&c, bottom, true), l.print_z, false);
+            if piece.len() >= 3 {
+                let mut flat: Contour = piece.iter().map(|p| DVec2::new(p.x, p.y)).collect();
+                if geom::signed_area2(&flat) < 0.0 {
+                    flat.reverse();
+                }
+                if let Some(layer) = loops.get_mut(i) {
+                    layer.push(flat);
+                }
+            }
+        }
+    }
+    loops.iter().map(|l| if l.is_empty() { Vec::new() } else { geom::union_loops(l) }).collect()
+}
+
+/// The part of polygon `poly` above (`keep_above`) or below the plane at `z`.
+fn clip_z(poly: &[DVec3], z: f64, keep_above: bool) -> Vec<DVec3> {
+    let inside = |p: &DVec3| if keep_above { p.z >= z } else { p.z <= z };
+    let mut out = Vec::new();
+    for (k, a) in poly.iter().enumerate() {
+        let Some(b) = poly.get((k + 1) % poly.len()) else { continue };
+        if inside(a) {
+            out.push(*a);
+        }
+        if inside(a) != inside(b) {
+            let t = ((z - a.z) / (b.z - a.z)).clamp(0.0, 1.0);
+            out.push(*a + (*b - *a) * t);
+        }
+    }
+    out
+}
+
 fn corners(mesh: &Placed, t: &[u32; 3]) -> Option<[DVec3; 3]> {
     let v = |i: u32| mesh.vertices.get(i as usize).copied().filter(|p| p.is_finite());
     Some([v(t[0])?, v(t[1])?, v(t[2])?])

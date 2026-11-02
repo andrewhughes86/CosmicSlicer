@@ -14,6 +14,7 @@ end of every session (no crashes, tests and clippy clean, smoke tests cover new 
 | 5 | Motion and G-code | Firmware-style motion planner (estimate and M73), machine limits, per-feature accel/jerk, pressure advance, firmware retraction, wipe, sloped z-hop, travel inside parts and avoid-crossing-walls routing, arc fitting, object labels / exclude-object, thumbnails, G-code viewer with travel/retraction/seam marks |
 | 6 | Walls | Variable-width thin walls and gap fill (medial axis), precise outer wall, wall direction, overhang degrees with Orca's speeds/fan/flow, make overhangs printable, bridge direction detection, internal and thick bridges, corner-aware seams, scarf seams, seam gap, staggered inner seams, role-based wipe, wipe on loops |
 | 7 | Infill and surfaces | Every Orca infill pattern as its own generator (incl. lightning, adaptive/support/quarter cubic, 3D and lateral honeycomb, lateral lattice, cross hatch, TPMS-D/FK, Hilbert, Archimedean, octagram, zig-zag variants, monotonic line), gyroid solved per layer as waves, anchors, infill combination, rotation templates, small-area filter, vertical shell thickness, top surface flow/density, extra perimeters on overhangs, ironing, fuzzy skin |
+| 8 | Supports | Grid and snug normal supports, tree supports (organic, slim, strong, hybrid) with trunk brims, top and bottom interfaces with every Orca pattern, top/bottom/xy/first-layer gaps, on build plate only, critical regions only, enforce layers, rafts, per-object brims (outer, inner, both, mouse ears), support enforcer/blocker volumes and painted support in the engine |
 
 ## Order, and why
 Get a user's own printer printing well and safely first (profiles, correct motion G-code,
@@ -42,7 +43,7 @@ CI comes early because the Windows and macOS builds are not yet checked by anyth
 | 19 | Parity check against OrcaSlicer on a reference set | 6–14 |
 | 20 | Packaging and release for all three platforms | 3, 18 |
 
-13 more sessions. Sessions 8 and 13 can swap order; 17 can be split up and done between others.
+12 more sessions. Session 13 can come earlier; 17 can be split up and done between others.
 
 ---
 
@@ -132,14 +133,34 @@ because running it alongside the editor ran a 7 GB machine out of memory; run it
 `cargo test --release -p CosmicSlicer-engine the_gyroid -- --ignored` and check the 300 mm
 sample slices in under 20 s (session 18 at the latest).
 
-## 8 · Supports
-- Tree supports (Orca's organic and slim/strong/hybrid), snug and grid normal styles.
-- Rafts (layers, contact distance, first-layer expansion), support on build plate only,
-  bottom interface layers, independent support layer height.
-- Brim ears and painted brims; brim per object; brim/skirt per object in by-object printing.
-- Engine side of support enforcers/blockers and painted support (UI in session 11).
+## 8 · Supports — done
+- Normal supports, grid (columns closed into blocks) and snug (following the overhang), from
+  the overhang angle or, at 0°, the overlap threshold; critical regions only; remove small
+  overhangs; enforce support for the first layers; support expansion and angle.
+- Tree supports (`tree.rs`): tips on a plate-fixed grid under each overhang; branches lean by
+  the branch angle, slide off the part they would land on (looking up to 30 layers ahead),
+  keep clear of it and merge with neighbours, thickening from the tip diameter to the branch
+  diameter and then by the diameter angle. Organic, slim, strong (two walls) and hybrid
+  (columns under broad flat overhangs); wall count, with infill, trunk brim.
+- Top and bottom interface layers with their own spacing and pattern (rectilinear,
+  interlaced, grid, concentric, spiral inset); base patterns rectilinear, grid, honeycomb,
+  lightning and hollow; top, bottom, XY and first-layer gaps; on build plate only (columns
+  never stand on the part; trees that would land on it are dropped whole); support and
+  interface flow ratios.
+- Rafts: layers, contact distance (the part's first layer then prints at the normal layer
+  height), expansion, first-layer expansion and density, dense interface layers on top.
+- Brims per object with its own settings, kept off the other objects: outer, inner, outer and
+  inner, mouse ears at corners sharper than the ear angle.
+- Engine side of enforcers and blockers: volumes attached to an object and painted triangles
+  (`JobObject::support_volumes`, `support_paint`); manual support types use only these.
+- Checked on an arch, a T and a ball-on-a-stick figure with every style: each slices with
+  support and interfaces, and reads back with the same time. (Orca's own support test models
+  are not on this machine; printing them is for session 19.)
 
-**Done when:** Orca's support test set (arch, T, tree-friendly figurine) prints removable supports.
+Moved on: independent support layer height (session 13, with per-object layer stacks),
+painted brims (session 11, with the painting tools), leading-edge-only brims and brims per
+object in by-object printing (session 13), support ironing and small-perimeter support speed
+(session 19).
 
 ## 9 · Project files and import
 - 3MF read and write compatible with OrcaSlicer and Bambu Studio: plates, objects, parts,
@@ -165,7 +186,8 @@ sample slices in under 20 s (session 18 at the latest).
 - Cut: planar cut with connectors (plug, dowel, snap), keep/flip parts, cut to parts.
 - Text shape (emboss) and SVG (emboss/engrave), measure (point, edge, plane), assemble.
 - Painting brushes with per-triangle state saved in 3MF: support, seam, fuzzy skin, colour
-  (circle, sphere, fill, gap fill, smart fill), and the engine consuming them.
+  (circle, sphere, fill, gap fill, smart fill), and the engine consuming them; painted brims
+  (from session 8).
 - Lay on face with face highlighting, scale to fit, drop to bed per tool.
 
 **Done when:** every toolbar button works; no "arrives later" notes remain in Prepare.
@@ -182,6 +204,9 @@ sample slices in under 20 s (session 18 at the latest).
 ## 13 · Layer height
 - Variable layer height tool (paint smooth/adaptive), adaptive layer height, layer ranges.
 - Proper spiral vase (continuous Z, smoothing), sequential printing heights.
+- From session 8: independent support layer height (support on its own layer stack, so the
+  top gap need not be a whole number of layers), brims per object in by-object printing,
+  leading-edge-only brims.
 
 **Done when:** the variable-layer tool's curve slices as drawn and the Preview shows it.
 

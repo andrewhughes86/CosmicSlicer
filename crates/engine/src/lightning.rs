@@ -13,14 +13,14 @@ use crate::geom::{self, Join, Polyline, Shape};
 const MAX_NODES: usize = 20_000;
 
 /// Edges of a region bucketed on a grid, for nearest-edge queries.
-struct Edges {
+pub(crate) struct Edges {
     cell: f64,
     edges: Vec<(DVec2, DVec2)>,
     grid: HashMap<(i64, i64), Vec<usize>>,
 }
 
 impl Edges {
-    fn new(region: &[Shape], cell: f64) -> Edges {
+    pub(crate) fn new(region: &[Shape], cell: f64) -> Edges {
         let edges: Vec<(DVec2, DVec2)> = region
             .iter()
             .flatten()
@@ -44,7 +44,7 @@ impl Edges {
     }
 
     /// The nearest point on an edge within `reach`, and its distance.
-    fn nearest(&self, p: DVec2, reach: f64) -> Option<(f64, DVec2)> {
+    pub(crate) fn nearest(&self, p: DVec2, reach: f64) -> Option<(f64, DVec2)> {
         let (cx, cy) = ((p.x / self.cell).floor() as i64, (p.y / self.cell).floor() as i64);
         let rings = (reach / self.cell).ceil() as i64 + 1;
         let mut best: Option<(f64, DVec2)> = None;
@@ -83,7 +83,7 @@ fn closest_on_segment(p: DVec2, a: DVec2, b: DVec2) -> DVec2 {
 }
 
 /// Points on a plate-fixed grid of `spacing` inside `region`.
-fn samples(region: &[Shape], spacing: f64) -> Vec<DVec2> {
+pub(crate) fn samples(region: &[Shape], spacing: f64) -> Vec<DVec2> {
     let Some((lo, hi)) = geom::bounds(region) else { return Vec::new() };
     let (i0, i1) = ((lo.x / spacing).ceil() as i64, (hi.x / spacing).floor() as i64);
     let (j0, j1) = ((lo.y / spacing).ceil() as i64, (hi.y / spacing).floor() as i64);

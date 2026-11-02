@@ -83,6 +83,8 @@ pub fn job(session: &Session, plate: usize) -> Job {
                 matrix: to_printer * o.matrix(),
                 extruder: o.filament.saturating_sub(1),
                 overrides: o.overrides.clone(),
+                support_volumes: Vec::new(),
+                support_paint: Vec::new(),
             })
             .collect(),
         plate_name: session.plate_name(plate),

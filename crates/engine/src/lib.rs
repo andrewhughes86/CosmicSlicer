@@ -30,6 +30,7 @@ pub mod support;
 pub mod thumbnail;
 pub mod toolpath;
 pub mod travel;
+pub mod tree;
 pub mod walls;
 
 use std::sync::Arc;
@@ -46,7 +47,7 @@ pub use settings::{Filament, Settings};
 pub use toolpath::Role;
 
 use geom::{Op, Shape};
-use slicing::Placed;
+use slicing::{LayerZ, Placed};
 use toolpath::{LayerPlan, Path};
 
 /// One object to print.
@@ -60,6 +61,26 @@ pub struct JobObject {
     pub extruder: usize,
     /// Process settings this object overrides.
     pub overrides: Vec<(String, String)>,
+    /// Support enforcer and blocker volumes, placed like `matrix`.
+    pub support_volumes: Vec<SupportVolume>,
+    /// Painted support: triangles of `mesh` and what each asks for.
+    pub support_paint: Vec<(u32, SupportPaint)>,
+}
+
+/// What a support volume or painted facet asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SupportPaint {
+    Enforce,
+    Block,
+}
+
+/// A support enforcer or blocker attached to an object.
+#[derive(Clone)]
+pub struct SupportVolume {
+    pub kind: SupportPaint,
+    pub mesh: Arc<Mesh>,
+    /// Placement in printer coordinates.
+    pub matrix: Mat4,
 }
 
 /// One plate to slice.
@@ -212,16 +233,24 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
     if top <= 0.0 {
         return Err(SliceError::Nothing);
     }
-    if top > s.max_print_height + 0.01 {
-        return Err(SliceError::TooTall(top, s.max_print_height));
+    // A raft lifts the part by its layers and the contact gap; the part's first layer then
+    // prints at the normal layer height.
+    let raft_heights: Vec<f64> =
+        (0..s.raft.layers).map(|k| if k == 0 { s.first_layer_height } else { s.layer_height }).collect();
+    let lift = if raft_heights.is_empty() { 0.0 } else { raft_heights.iter().sum::<f64>() + s.raft.contact_distance };
+    if top + lift > s.max_print_height + 0.01 {
+        return Err(SliceError::TooTall(top + lift, s.max_print_height));
     }
-    let layers = slicing::layer_heights(top, s.first_layer_height, s.layer_height);
+    let first_height = if raft_heights.is_empty() { s.first_layer_height } else { s.layer_height };
+    let layers = slicing::layer_heights(top, first_height, s.layer_height);
     let n = layers.len();
     let objects = placed.len().max(1) as f64;
 
     // Each object: slices, then walls and fills.
     let mut object_slices: Vec<Vec<Vec<Shape>>> = Vec::new();
     let mut object_plans: Vec<Vec<Vec<toolpath::Island>>> = Vec::new();
+    let mut object_settings: Vec<Settings> = Vec::new();
+    let mut object_marks: Vec<Marks> = Vec::new();
     for (oi, (p, o)) in placed.iter().zip(&job.objects).enumerate() {
         progress.set(0.05 + 0.25 * oi as f64 / objects, "Slicing mesh");
         let slices = slicing::slice(p, &layers, &cancelled);
@@ -248,8 +277,15 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
         {
             warnings.push(format!("\"{}\" has nothing on the first layer; check it rests on the plate", o.name));
         }
+        let marks = support_marks(o, p, &layers, &cancelled);
+        let enforced = marks.0.iter().any(|l| !l.is_empty());
+        if enforced && !os.support.enabled {
+            warnings.push(format!("\"{}\" has support enforcers, but support is turned off", o.name));
+        }
         object_slices.push(slices);
         object_plans.push(islands);
+        object_settings.push(os);
+        object_marks.push(marks);
     }
 
     // Everything printed on each layer, for supports.
@@ -260,48 +296,90 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
             if object_slices.len() > 1 { geom::union(&parts) } else { parts }
         })
         .collect();
-    let support = support::generate(&all, &s, &cancelled);
-    if s.support.enabled && s.support.tree {
-        warnings.push("Tree supports are printed as normal supports for now.".into());
-    }
+    let heights: Vec<f64> = layers.iter().map(|l| l.height).collect();
+    let inputs: Vec<support::Input<'_>> = object_slices
+        .iter()
+        .zip(&object_settings)
+        .zip(&object_marks)
+        .map(|((slices, os), (enforce, block))| support::Input { slices, settings: os, enforce, block })
+        .collect();
+    let support = support::generate(&inputs, &all, &heights, &s, &cancelled);
     if cancelled() {
         return Err(SliceError::Cancelled);
     }
 
     progress.set(0.80, "Generating skirt & brim");
-    let footprint = all.first().cloned().unwrap_or_default();
-    let (brim, brim_area) = skirt::brim(&footprint, &s, top);
+    let part_first: Vec<Shape> =
+        all.first().cloned().unwrap_or_default().into_iter().chain(support.footprint(0)).collect();
+    let raft = support::raft(&part_first, &s);
+    // What sits on the plate: the raft's first layer, or the parts and their support.
+    let footprint = match raft.first() {
+        Some(r) => r.area.clone(),
+        None => all.first().cloned().unwrap_or_default(),
+    };
+    let (brim, brim_area) = if raft.is_empty() {
+        let objects: Vec<skirt::BrimObject<'_>> = object_slices
+            .iter()
+            .zip(&object_settings)
+            .zip(&placed)
+            .map(|((sl, os), p)| skirt::BrimObject {
+                footprint: sl.first().map_or(&[][..], Vec::as_slice),
+                settings: os,
+                height: p.top(),
+            })
+            .collect();
+        skirt::brims(&objects)
+    } else {
+        skirt::brim(&footprint, &s, top)
+    };
     let skirt_around = geom::boolean(&footprint, &brim_area, Op::Union);
-    let support_first: Vec<Shape> = support.base.first().cloned().unwrap_or_default();
-    let skirt_around = geom::boolean(&skirt_around, &support_first, Op::Union);
+    let skirt_around =
+        if raft.is_empty() { geom::boolean(&skirt_around, &support.footprint(0), Op::Union) } else { skirt_around };
 
-    let plans: Vec<LayerPlan> = layers
+    let skirt_for = |g: usize, height: f64| -> Vec<Path> {
+        let first = g == 0;
+        let mut skirt: Vec<Path> = Vec::new();
+        if g < s.skirt_height {
+            let w = if first { s.widths.first_layer } else { s.widths.outer };
+            skirt = skirt::skirt(&skirt_around, &s, w, height);
+        }
+        if first {
+            skirt.extend(brim.iter().cloned());
+        }
+        skirt
+    };
+    let mut raft_z = 0.0;
+    let mut plans: Vec<LayerPlan> = raft
         .iter()
         .enumerate()
-        .map(|(i, l)| {
-            let first = i == 0;
-            let mut skirt: Vec<Path> = Vec::new();
-            if i < s.skirt_height {
-                let w = if first { s.widths.first_layer } else { s.widths.outer };
-                skirt = skirt::skirt(&skirt_around, &s, w, l.height);
-            }
-            if first {
-                skirt.extend(brim.iter().cloned());
-            }
+        .map(|(k, r)| {
+            raft_z += r.height;
             LayerPlan {
-                print_z: l.print_z,
-                height: l.height,
-                skirt,
-                support: support::paths(&support, i, &s, first, l.print_z),
-                objects: object_plans
-                    .iter_mut()
-                    .enumerate()
-                    .filter_map(|(o, p)| p.get_mut(i).map(|isl| (o, std::mem::take(isl))))
-                    .filter(|(_, isl)| !isl.is_empty())
-                    .collect(),
+                print_z: raft_z,
+                height: r.height,
+                skirt: skirt_for(k, r.height),
+                support: support::raft_paths(r, k, &s, raft_z),
+                objects: Vec::new(),
             }
         })
         .collect();
+    let below = plans.len();
+    plans.extend(layers.iter().enumerate().map(|(i, l)| {
+        let g = below + i;
+        let first = g == 0;
+        LayerPlan {
+            print_z: l.print_z + lift,
+            height: l.height,
+            skirt: skirt_for(g, l.height),
+            support: support::paths(&support, i, &s, first, l.print_z + lift),
+            objects: object_plans
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(o, p)| p.get_mut(i).map(|isl| (o, std::mem::take(isl))))
+                .filter(|(_, isl)| !isl.is_empty())
+                .collect(),
+        }
+    }));
     if cancelled() {
         return Err(SliceError::Cancelled);
     }
@@ -331,8 +409,8 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
         first_layer_max: max,
         bed_min: lo,
         bed_max: [lo[0] + size[0], lo[1] + size[1]],
-        layer_count: n,
-        max_z: top,
+        layer_count: plans.len(),
+        max_z: top + lift,
         initial_extruder: used_extruders.first().copied().unwrap_or(0),
         used_extruders,
     };
@@ -381,11 +459,38 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
     if extruders.iter().any(|e| *e != extruders.first().copied().unwrap_or(0)) {
         warnings.push("Several filaments print without a prime tower for now; expect some colour bleed.".into());
     }
-    if base.get(schema, "raft_layers").trim() != "0" {
-        warnings.push("Rafts are not printed yet.".into());
-    }
     progress.set(1.0, "Slicing complete");
     Ok(Sliced { gcode: out.gcode, preview: out.preview, stats: out.stats, warnings, colours })
+}
+
+/// Support enforcers and blockers per layer.
+type Marks = (Vec<Vec<Shape>>, Vec<Vec<Shape>>);
+
+/// One object's support enforcers and blockers per layer, from its volumes and painted facets.
+fn support_marks(o: &JobObject, placed: &Placed, layers: &[LayerZ], cancelled: &(dyn Fn() -> bool + Sync)) -> Marks {
+    let n = layers.len();
+    let (mut enforce, mut block) = (vec![Vec::new(); n], vec![Vec::new(); n]);
+    for v in &o.support_volumes {
+        let slices = slicing::slice(&Placed::new(&v.mesh, &v.matrix), layers, cancelled);
+        let dst = if v.kind == SupportPaint::Enforce { &mut enforce } else { &mut block };
+        for (d, sh) in dst.iter_mut().zip(slices) {
+            d.extend(sh);
+        }
+    }
+    for (kind, dst) in [(SupportPaint::Enforce, &mut enforce), (SupportPaint::Block, &mut block)] {
+        let tris: Vec<u32> = o.support_paint.iter().filter(|(_, k)| *k == kind).map(|(t, _)| *t).collect();
+        if !tris.is_empty() {
+            for (d, sh) in dst.iter_mut().zip(slicing::painted(placed, &tris, layers)) {
+                d.extend(sh);
+            }
+        }
+    }
+    if o.support_volumes.len() + o.support_paint.len() > 1 {
+        for l in enforce.iter_mut().chain(block.iter_mut()).filter(|l| l.len() > 1) {
+            *l = geom::union(l);
+        }
+    }
+    (enforce, block)
 }
 
 #[cfg(test)]
@@ -417,6 +522,8 @@ mod tests {
             matrix: Mat4::from_translation(at),
             extruder: 0,
             overrides: Vec::new(),
+            support_volumes: Vec::new(),
+            support_paint: Vec::new(),
         }
     }
 
@@ -477,6 +584,154 @@ mod tests {
         let Ok(out) = out else { return };
         assert!(out.gcode.contains(";TYPE:Support"));
         assert!(out.gcode.contains(";TYPE:Bridge") || out.gcode.contains(";TYPE:Support interface"));
+    }
+
+    fn object(name: &str, mesh: Mesh, at: Vec3) -> JobObject {
+        JobObject { name: name.into(), mesh: Arc::new(mesh), matrix: Mat4::from_translation(at), ..cube(at, 1.0) }
+    }
+
+    /// Slices, checks the G-code reads back with the same time, and returns it.
+    fn sliced(j: &Job) -> Option<Sliced> {
+        let out = slice(j, &Progress::default());
+        assert!(out.is_ok(), "{:?}", out.as_ref().err());
+        let out = out.ok()?;
+        let back = view_gcode(out.gcode.clone(), &Config::default(), &[Config::default()]);
+        let (a, b) = (back.stats.total_time, out.stats.total_time);
+        assert!((a - b).abs() / b < 0.02, "read back {a} vs sliced {b}");
+        Some(out)
+    }
+
+    #[test]
+    fn orcas_support_test_shapes_get_every_style() {
+        // An arch (two posts and a lintel), a T, and a figure (a ball on a stick).
+        let arch = vec![
+            cube(Vec3::new(60.0, 100.0, 0.0), 4.0),
+            cube(Vec3::new(76.0, 100.0, 0.0), 4.0),
+            object("lintel", primitives::cube(20.0), Vec3::new(60.0, 100.0, 4.0)),
+        ];
+        let t = vec![cube(Vec3::new(107.0, 100.0, 0.0), 6.0), cube(Vec3::new(100.0, 93.0, 6.0), 20.0)];
+        let figure = vec![
+            object("stick", primitives::cylinder(1.5, 10.0, 32), Vec3::new(160.0, 110.0, 0.0)),
+            object("ball", primitives::sphere(10.0, 64), Vec3::new(160.0, 110.0, 9.5)),
+        ];
+        for (kind, style) in [
+            ("normal(auto)", "grid"),
+            ("normal(auto)", "snug"),
+            ("tree(auto)", "organic"),
+            ("tree(auto)", "tree_hybrid"),
+        ] {
+            for (name, objects) in [("arch", &arch), ("T", &t), ("figure", &figure)] {
+                let mut j = job(objects.clone());
+                j.process.set("enable_support", "1");
+                j.process.set("support_type", kind);
+                j.process.set("support_style", style);
+                let Some(out) = sliced(&j) else { return };
+                if std::env::var("DEBUG_SUPPORT").is_ok() {
+                    let mut types: Vec<&str> = out.gcode.lines().filter_map(|l| l.strip_prefix(";TYPE:")).collect();
+                    types.sort_unstable();
+                    types.dedup();
+                    eprintln!("{name} {style}: {types:?} {:?} layers {}", out.warnings, out.stats.layers);
+                }
+                assert!(out.gcode.contains(";TYPE:Support"), "{name} {style}");
+                assert!(out.gcode.contains(";TYPE:Support interface"), "{name} {style}");
+                assert!(!out.warnings.iter().any(|w| w.contains("support")), "{:?}", out.warnings);
+            }
+        }
+    }
+
+    #[test]
+    fn a_raft_lifts_the_part() {
+        let mut j = job(vec![cube(Vec3::new(100.0, 100.0, 0.0), 10.0)]);
+        j.process.set("raft_layers", "3");
+        j.process.set("raft_contact_distance", "0.1");
+        let Some(out) = sliced(&j) else { return };
+        assert_eq!(out.preview.layers.len(), 53);
+        let z: Vec<f32> = out.preview.layers.iter().map(|l| l.z).collect();
+        // Raft 0.2 + 0.2 + 0.2, the gap, then the part at 0.2 a layer.
+        assert!((z[2] - 0.6).abs() < 1e-3 && (z[3] - 0.9).abs() < 1e-3, "{:?}", &z[..5]);
+        assert!((z[52] - 10.7).abs() < 1e-3);
+        assert!(out.gcode.contains(";TYPE:Support interface"));
+        assert!(!out.gcode.contains(";TYPE:Brim"));
+    }
+
+    #[test]
+    fn enforcers_blockers_and_paint() {
+        let t = || vec![cube(Vec3::new(100.0, 100.0, 0.0), 6.0), cube(Vec3::new(93.0, 93.0, 6.0), 20.0)];
+        let manual = |objects: Vec<JobObject>| {
+            let mut j = job(objects);
+            j.process.set("enable_support", "1");
+            j.process.set("support_type", "normal(manual)");
+            j
+        };
+        let Some(out) = sliced(&manual(t())) else { return };
+        assert!(!out.gcode.contains(";TYPE:Support"));
+        // An enforcer box under one side of the slab.
+        let mut objects = t();
+        if let Some(slab) = objects.get_mut(1) {
+            slab.support_volumes.push(SupportVolume {
+                kind: SupportPaint::Enforce,
+                mesh: Arc::new(primitives::cube(8.0)),
+                matrix: Mat4::from_translation(Vec3::new(92.0, 92.0, 2.0)),
+            });
+        }
+        let Some(out) = sliced(&manual(objects)) else { return };
+        assert!(out.gcode.contains(";TYPE:Support"));
+        // The slab's underside painted.
+        let mut objects = t();
+        if let Some(slab) = objects.get_mut(1) {
+            let m = primitives::cube(20.0);
+            slab.support_paint = m
+                .triangles
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.iter().all(|v| m.vertices.get(*v as usize).is_some_and(|p| p.z == 0.0)))
+                .map(|(i, _)| (i as u32, SupportPaint::Enforce))
+                .collect();
+            assert_eq!(slab.support_paint.len(), 2);
+        }
+        let Some(painted) = sliced(&manual(objects)) else { return };
+        assert!(painted.gcode.contains(";TYPE:Support"));
+        // Blocked everywhere: nothing, even with auto support.
+        let mut objects = t();
+        if let Some(slab) = objects.get_mut(1) {
+            slab.support_volumes.push(SupportVolume {
+                kind: SupportPaint::Block,
+                mesh: Arc::new(primitives::cube(40.0)),
+                matrix: Mat4::from_translation(Vec3::new(80.0, 80.0, 0.0)),
+            });
+        }
+        let mut j = job(objects);
+        j.process.set("enable_support", "1");
+        let Some(out) = sliced(&j) else { return };
+        assert!(!out.gcode.contains(";TYPE:Support"));
+    }
+
+    #[test]
+    fn each_object_gets_its_own_brim() {
+        let mut a = cube(Vec3::new(60.0, 100.0, 0.0), 10.0);
+        a.overrides.push(("brim_type".into(), "no_brim".into()));
+        let b = cube(Vec3::new(120.0, 100.0, 0.0), 10.0);
+        let mut j = job(vec![a, b]);
+        j.process.set("brim_type", "outer_only");
+        j.process.set("brim_width", "5");
+        let Some(out) = sliced(&j) else { return };
+        // Brim moves only round the second cube.
+        let mut in_brim = false;
+        let mut xs = Vec::new();
+        for line in out.gcode.lines() {
+            if let Some(t) = line.strip_prefix(";TYPE:") {
+                in_brim = t == "Brim";
+            } else if in_brim
+                && line.starts_with("G1 X")
+                && line.contains(" E")
+                && let Some(x) =
+                    line.split_whitespace().find_map(|w| w.strip_prefix('X')).and_then(|v| v.parse::<f64>().ok())
+            {
+                xs.push(x);
+            }
+        }
+        assert!(!xs.is_empty());
+        assert!(xs.iter().all(|x| (114.0..=136.0).contains(x)), "{xs:?}");
     }
 
     #[test]
@@ -567,6 +822,8 @@ mod tests {
             matrix: Mat4::from_translation(at),
             extruder: 0,
             overrides: Vec::new(),
+            support_volumes: Vec::new(),
+            support_paint: Vec::new(),
         }
     }
 
@@ -637,6 +894,8 @@ mod tests {
             matrix: Mat4::from_translation(Vec3::new(110.0, 110.0, 0.0)),
             extruder: 0,
             overrides: Vec::new(),
+            support_volumes: Vec::new(),
+            support_paint: Vec::new(),
         }]);
         for (k, v) in std::env::var("SLICE_SET").unwrap_or_default().split(';').filter_map(|kv| kv.split_once('=')) {
             // Printer keys (printable_height, …) as well as process ones.

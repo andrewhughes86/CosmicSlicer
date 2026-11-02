@@ -36,7 +36,12 @@ pub struct Settings {
     pub brim_type: String,
     pub brim_width: f64,
     pub brim_gap: f64,
+    /// Mouse ears at corners sharper than this, degrees.
+    pub brim_ears_max_angle: f64,
+    /// Outlines are simplified by this before looking for corners, mm.
+    pub brim_ears_detection_length: f64,
     pub support: Support,
+    pub raft: Raft,
     pub gcode: GcodeSettings,
     pub motion: Motion,
     pub seam: String,
@@ -461,19 +466,92 @@ pub struct Retract {
     pub toolchange_length: f64,
 }
 
+/// How support areas are shaped (OrcaSlicer's `support_style`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SupportStyle {
+    /// Columns merged into blocks: sturdy, easy to print.
+    Grid,
+    /// Columns that follow the overhang's outline.
+    Snug,
+    /// Branches, smooth and thin (OrcaSlicer's organic trees).
+    Organic,
+    TreeSlim,
+    TreeStrong,
+    /// Trees under small overhangs, columns under large flat ones.
+    TreeHybrid,
+}
+
+impl SupportStyle {
+    pub fn is_tree(self) -> bool {
+        !matches!(self, SupportStyle::Grid | SupportStyle::Snug)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Tree {
+    /// Most a branch leans from vertical, radians.
+    pub branch_angle: f64,
+    /// Tips under an overhang sit this far apart, mm.
+    pub branch_distance: f64,
+    pub tip_diameter: f64,
+    pub branch_diameter: f64,
+    /// How fast branches thicken going down, radians.
+    pub diameter_angle: f64,
+    /// Loops round each branch.
+    pub walls: usize,
+    pub with_infill: bool,
+    /// Brim round the trunks on the plate, mm (0 for none).
+    pub brim: f64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Support {
     pub enabled: bool,
-    pub tree: bool,
+    /// Generated wherever overhangs need it; off for "manual", where only enforcers count.
+    pub auto: bool,
+    pub style: SupportStyle,
     /// Overhangs steeper than this from vertical need support (degrees from horizontal as
-    /// OrcaSlicer counts: 30 means faces within 30° of horizontal).
+    /// OrcaSlicer counts: 30 means faces within 30° of horizontal); 0 uses `threshold_overlap`.
     pub threshold_angle: f64,
+    /// With no angle: a line needs support when less than this share of it rests on the
+    /// layer below (0..1).
+    pub threshold_overlap: f64,
+    pub critical_only: bool,
+    pub remove_small: bool,
+    /// The first this many layers get support under any overhang, even with support off.
+    pub enforce_layers: usize,
+    /// Base pattern: "rectilinear", "rectilinear-grid", "honeycomb", "lightning" or "hollow".
+    pub base_pattern: String,
     pub spacing: f64,
+    /// Base lines' direction, radians.
+    pub angle: f64,
+    pub expansion: f64,
     pub top_z_distance: f64,
+    pub bottom_z_distance: f64,
     pub xy_distance: f64,
+    /// Gap round the part on the first layer only.
+    pub first_layer_gap: f64,
     pub interface_layers: usize,
+    pub bottom_interface_layers: usize,
     pub interface_spacing: f64,
+    pub bottom_interface_spacing: f64,
+    /// "rectilinear", "concentric", "spiralinset", "rectilinear_interlaced" or "grid".
+    pub interface_pattern: String,
     pub build_plate_only: bool,
+    pub flow: f64,
+    pub interface_flow: f64,
+    pub tree: Tree,
+}
+
+#[derive(Clone, Debug)]
+pub struct Raft {
+    pub layers: usize,
+    /// Gap between the raft's top and the part, mm.
+    pub contact_distance: f64,
+    pub expansion: f64,
+    pub first_layer_expansion: f64,
+    /// 0..1.
+    pub first_layer_density: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -905,16 +983,96 @@ impl Settings {
             brim_type: r.text("brim_type"),
             brim_width: r.range("brim_width", 0.0, 0.0, 100.0),
             brim_gap: r.range("brim_object_gap", 0.0, 0.0, 10.0),
-            support: Support {
-                enabled: r.flag("enable_support"),
-                tree: support_type.starts_with("tree"),
-                threshold_angle: r.range("support_threshold_angle", 30.0, 0.0, 90.0),
-                spacing: r.range("support_base_pattern_spacing", 2.5, nozzle, 50.0),
-                top_z_distance: r.range("support_top_z_distance", 0.2, 0.0, 5.0),
-                xy_distance: r.range("support_object_xy_distance", 0.35, 0.0, 10.0),
-                interface_layers: r.count("support_interface_top_layers", 3, 20),
-                interface_spacing: r.range("support_interface_spacing", 0.5, 0.0, 10.0),
-                build_plate_only: r.flag("support_on_build_plate_only"),
+            brim_ears_max_angle: r.range("brim_ears_max_angle", 125.0, 0.0, 180.0),
+            brim_ears_detection_length: r.range("brim_ears_detection_length", 1.0, 0.0, 100.0),
+            support: {
+                let style = match (support_type.starts_with("tree"), r.text("support_style").as_str()) {
+                    (false, "snug") => SupportStyle::Snug,
+                    (false, _) => SupportStyle::Grid,
+                    (true, "tree_slim") => SupportStyle::TreeSlim,
+                    (true, "tree_strong") => SupportStyle::TreeStrong,
+                    (true, "tree_hybrid") => SupportStyle::TreeHybrid,
+                    (true, _) => SupportStyle::Organic,
+                };
+                let organic = style == SupportStyle::Organic;
+                let pick = |plain: &str, org: &str| if organic { org.to_owned() } else { plain.to_owned() };
+                let top_layers = r.count("support_interface_top_layers", 3, 20);
+                let bottom = r.num("support_interface_bottom_layers", 0.0);
+                Support {
+                    enabled: r.flag("enable_support"),
+                    auto: !support_type.ends_with("(manual)"),
+                    style,
+                    threshold_angle: r.range("support_threshold_angle", 30.0, 0.0, 90.0),
+                    threshold_overlap: r.mm_or_percent("support_threshold_overlap", 1.0).unwrap_or(0.5).min(1.0),
+                    critical_only: r.flag("support_critical_regions_only"),
+                    remove_small: r.flag("support_remove_small_overhang"),
+                    enforce_layers: r.count("enforce_support_layers", 0, 5000),
+                    base_pattern: match r.text("support_base_pattern").as_str() {
+                        p @ ("rectilinear" | "rectilinear-grid" | "honeycomb" | "lightning" | "hollow") => p.to_owned(),
+                        _ if style.is_tree() => "hollow".into(),
+                        _ => "rectilinear".into(),
+                    },
+                    spacing: r.range("support_base_pattern_spacing", 2.5, nozzle, 50.0),
+                    angle: r.range("support_angle", 0.0, 0.0, 359.0).to_radians(),
+                    expansion: r.range("support_expansion", 0.0, -10.0, 20.0),
+                    top_z_distance: r.range("support_top_z_distance", 0.2, 0.0, 5.0),
+                    bottom_z_distance: r.range("support_bottom_z_distance", 0.2, 0.0, 5.0),
+                    xy_distance: r.range("support_object_xy_distance", 0.35, 0.0, 10.0),
+                    first_layer_gap: r.range("support_object_first_layer_gap", 0.2, 0.0, 10.0),
+                    interface_layers: top_layers,
+                    bottom_interface_layers: if bottom < 0.0 { top_layers } else { (bottom.round() as usize).min(20) },
+                    interface_spacing: r.range("support_interface_spacing", 0.5, 0.0, 10.0),
+                    bottom_interface_spacing: r.range("support_bottom_interface_spacing", 0.5, 0.0, 10.0),
+                    interface_pattern: match r.text("support_interface_pattern").as_str() {
+                        p @ ("concentric" | "spiralinset" | "rectilinear_interlaced" | "grid") => p.to_owned(),
+                        _ => "rectilinear".into(),
+                    },
+                    build_plate_only: r.flag("support_on_build_plate_only"),
+                    flow: r.range("support_flow_ratio", 1.0, 0.1, 2.0),
+                    interface_flow: r.range("support_interface_flow_ratio", 1.0, 0.1, 2.0),
+                    tree: Tree {
+                        branch_angle: r
+                            .range(
+                                &pick("tree_support_branch_angle", "tree_support_branch_angle_organic"),
+                                40.0,
+                                0.0,
+                                60.0,
+                            )
+                            .to_radians(),
+                        branch_distance: r.range(
+                            &pick("tree_support_branch_distance", "tree_support_branch_distance_organic"),
+                            5.0,
+                            1.0,
+                            10.0,
+                        ),
+                        tip_diameter: r.range("tree_support_tip_diameter", 0.8, nozzle, 10.0),
+                        branch_diameter: r.range(
+                            &pick("tree_support_branch_diameter", "tree_support_branch_diameter_organic"),
+                            5.0,
+                            1.0,
+                            10.0,
+                        ),
+                        diameter_angle: r.range("tree_support_branch_diameter_angle", 5.0, 0.0, 15.0).to_radians(),
+                        walls: match (r.count("tree_support_wall_count", 0, 2), style) {
+                            (0, SupportStyle::TreeStrong) => 2,
+                            (0, _) => 1,
+                            (n, _) => n,
+                        },
+                        with_infill: r.flag("tree_support_with_infill"),
+                        brim: if r.flag("tree_support_auto_brim") {
+                            3.0
+                        } else {
+                            r.range("tree_support_brim_width", 3.0, 0.0, 20.0)
+                        },
+                    },
+                }
+            },
+            raft: Raft {
+                layers: r.count("raft_layers", 0, 100),
+                contact_distance: r.range("raft_contact_distance", 0.1, 0.0, 5.0),
+                expansion: r.range("raft_expansion", 1.5, 0.0, 50.0),
+                first_layer_expansion: r.range("raft_first_layer_expansion", 2.0, 0.0, 50.0),
+                first_layer_density: r.range("raft_first_layer_density", 90.0, 10.0, 100.0) / 100.0,
             },
             gcode: GcodeSettings {
                 flavor: r.text("gcode_flavor"),
