@@ -78,6 +78,8 @@ pub struct JobObject {
     pub volumes: Vec<JobVolume>,
     /// Settings by height, millimetres above the plate.
     pub ranges: Vec<HeightSettings>,
+    /// Variable layer height: (height above the plate, layer height) points, in order.
+    pub layer_profile: Vec<(f64, f64)>,
 }
 
 /// Settings for the layers between two heights: (from, to, settings).
@@ -296,7 +298,32 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
         return Err(SliceError::TooTall(top + lift, s.max_print_height));
     }
     let first_height = if raft_heights.is_empty() { s.first_layer_height } else { s.layer_height };
-    let layers = slicing::layer_heights(top, first_height, s.layer_height);
+    let varies = job
+        .objects
+        .iter()
+        .any(|o| !o.layer_profile.is_empty() || o.ranges.iter().any(|r| r.2.iter().any(|(k, _)| k == "layer_height")));
+    let layers = if varies {
+        // The finest height any object asks for at each height.
+        let asked = |z: f64| -> f64 {
+            job.objects
+                .iter()
+                .map(|o| {
+                    let ranged = o
+                        .ranges
+                        .iter()
+                        .filter(|r| z >= r.0 && z < r.1)
+                        .filter_map(|r| r.2.iter().find(|(k, _)| k == "layer_height"))
+                        .filter_map(|(_, v)| v.trim().parse::<f64>().ok())
+                        .fold(f64::INFINITY, f64::min);
+                    profile_at(&o.layer_profile, z).unwrap_or(s.layer_height).min(ranged)
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        let hi = s.max_layer_height.max(s.min_layer_height);
+        slicing::layer_heights_by(top, first_height, s.min_layer_height, hi, &asked)
+    } else {
+        slicing::layer_heights(top, first_height, s.layer_height)
+    };
     let n = layers.len();
     let objects = placed.len().max(1) as f64;
 
@@ -462,10 +489,28 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
                 if islands.is_empty() && sup.is_empty() {
                     continue;
                 }
+                // The skirt with the first object; each object's own brim before it.
+                let mut ring = Vec::new();
+                if k == 0 && i < s.skirt_height {
+                    let w = if i == 0 { s.widths.first_layer } else { s.widths.outer };
+                    ring = skirt::skirt(&skirt_around, &s, w, l.height);
+                }
+                if !started
+                    && let (Some(sl), Some(os), Some(o_job)) =
+                        (object_slices.get(o), object_settings.get(o), job.objects.get(o))
+                {
+                    let one = skirt::BrimObject {
+                        footprint: sl.first().map_or(&[][..], Vec::as_slice),
+                        settings: os,
+                        height: heights_of.get(o).copied().unwrap_or(0.0),
+                        ears: &o_job.brim_ears,
+                    };
+                    ring.extend(skirt::brims(&[one]).0);
+                }
                 plans.push(LayerPlan {
                     print_z: l.print_z,
                     height: l.height,
-                    skirt: if k == 0 { skirt_for(i, l.height) } else { Vec::new() },
+                    skirt: ring,
                     support: sup,
                     objects: vec![(o, islands)],
                     new_object: k > 0 && !started,
@@ -706,6 +751,22 @@ fn check_clearance(
     }
 }
 
+/// A variable layer height profile's height at `z`, straight between its points.
+pub fn profile_at(profile: &[(f64, f64)], z: f64) -> Option<f64> {
+    let first = profile.first()?;
+    if z <= first.0 {
+        return Some(first.1);
+    }
+    for pair in profile.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if z <= b.0 {
+            let t = if b.0 - a.0 > 1e-9 { (z - a.0) / (b.0 - a.0) } else { 1.0 };
+            return Some(a.1 + (b.1 - a.1) * t);
+        }
+    }
+    profile.last().map(|p| p.1)
+}
+
 /// An object with colour painted on it: each layer split among the painted filaments, each
 /// part planned on its own and its islands marked with its filament.
 #[allow(clippy::too_many_arguments)]
@@ -894,6 +955,7 @@ mod tests {
             brim_ears: Vec::new(),
             volumes: Vec::new(),
             ranges: Vec::new(),
+            layer_profile: Vec::new(),
         }
     }
 
@@ -1317,6 +1379,65 @@ mod tests {
     }
 
     #[test]
+    fn variable_layer_heights_slice_as_drawn() {
+        let mut c = cube(Vec3::new(100.0, 100.0, 0.0), 20.0);
+        c.layer_profile = vec![(0.0, 0.1), (8.0, 0.1), (12.0, 0.3), (20.0, 0.3)];
+        let Some(out) = sliced(&job(vec![c])) else { return };
+        let heights = |lo: f32, hi: f32| -> Vec<f32> {
+            out.preview.layers.iter().filter(|l| l.z > lo && l.z < hi).map(|l| l.height).collect()
+        };
+        assert!(heights(1.0, 7.0).iter().all(|h| (h - 0.1).abs() < 0.011), "{:?}", heights(1.0, 7.0));
+        assert!(heights(13.0, 19.5).iter().all(|h| (h - 0.3).abs() < 0.011), "{:?}", heights(13.0, 19.5));
+        // In between it thickens gradually.
+        let mid = heights(8.5, 11.5);
+        assert!(mid.windows(2).all(|w| w[1] >= w[0] - 1e-4), "{mid:?}");
+        let top = out.preview.layers.last().map_or(0.0, |l| l.z);
+        assert!((top - 20.0).abs() < 1e-3, "{top}");
+        // A height range's layer height thins its layers.
+        let mut c = cube(Vec3::new(100.0, 100.0, 0.0), 20.0);
+        c.ranges.push((5.0, 10.0, vec![("layer_height".into(), "0.1".into())]));
+        let Some(out) = sliced(&job(vec![c])) else { return };
+        assert!(out.preview.layers.iter().filter(|l| l.z > 5.5 && l.z < 9.5).all(|l| (l.height - 0.1).abs() < 0.011));
+        assert!(out.preview.layers.iter().filter(|l| l.z > 11.0).all(|l| (l.height - 0.2).abs() < 0.011));
+    }
+
+    #[test]
+    fn a_spiral_vase_climbs_as_it_goes_round() {
+        let v = object("vase", primitives::cylinder(15.0, 20.0, 64), Vec3::new(110.0, 110.0, 0.0));
+        let mut j = job(vec![v]);
+        j.process.set("spiral_mode", "1");
+        let Some(out) = sliced(&j) else { return };
+        // Extruding moves that also rise, within the layers above the bottom.
+        let rising = out.gcode.lines().filter(|l| l.starts_with("G1 ") && l.contains(" Z") && l.contains(" E")).count();
+        assert!(rising > 1000, "{rising}");
+        let zs: Vec<f64> = out
+            .gcode
+            .lines()
+            .filter(|l| l.starts_with("G1 ") && l.contains(" E"))
+            .filter_map(|l| l.split_whitespace().find_map(|w| w.strip_prefix('Z')).and_then(|v| v.parse().ok()))
+            .collect();
+        // Steadily up, never down while printing.
+        assert!(zs.windows(2).all(|w| w[1] >= w[0] - 1e-6), "{:?}", &zs[..10]);
+    }
+
+    #[test]
+    fn one_at_a_time_each_object_has_its_own_brim() {
+        let a = cube(Vec3::new(60.0, 100.0, 0.0), 5.0);
+        let b = cube(Vec3::new(140.0, 100.0, 0.0), 5.0);
+        let mut j = job(vec![a, b]);
+        j.process.set("print_sequence", "by object");
+        j.process.set("brim_type", "outer_only");
+        j.process.set("brim_width", "3");
+        let Some(out) = sliced(&j) else { return };
+        // A brim at the start of each object, the second after the first is finished.
+        let layers: Vec<&str> = out.gcode.split(";LAYER_CHANGE").collect();
+        let with_brim: Vec<usize> =
+            layers.iter().enumerate().filter(|(_, l)| l.contains(";TYPE:Brim")).map(|(i, _)| i).collect();
+        assert_eq!(with_brim.len(), 2, "{with_brim:?}");
+        assert!(with_brim[1] > 20, "{with_brim:?}");
+    }
+
+    #[test]
     fn a_raft_lifts_the_part() {
         let mut j = job(vec![cube(Vec3::new(100.0, 100.0, 0.0), 10.0)]);
         j.process.set("raft_layers", "3");
@@ -1507,6 +1628,7 @@ mod tests {
             brim_ears: Vec::new(),
             volumes: Vec::new(),
             ranges: Vec::new(),
+            layer_profile: Vec::new(),
         }
     }
 
@@ -1585,6 +1707,7 @@ mod tests {
             brim_ears: Vec::new(),
             volumes: Vec::new(),
             ranges: Vec::new(),
+            layer_profile: Vec::new(),
         }]);
         for (k, v) in std::env::var("SLICE_SET").unwrap_or_default().split(';').filter_map(|kv| kv.split_once('=')) {
             // Printer keys (printable_height, …) as well as process ones.

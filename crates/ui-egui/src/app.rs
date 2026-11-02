@@ -431,7 +431,10 @@ impl CosmicSlicerApp {
             Step::Slice => actions.push(Action::Slice),
             Step::Advanced => self.session.prefs.advanced = true,
             Step::Tool(name) => {
-                self.viewport.tool = Tool::GIZMOS.iter().find(|g| g.2.eq_ignore_ascii_case(&name)).map(|g| g.0);
+                self.viewport.tool =
+                    Tool::GIZMOS.iter().find(|g| g.2.eq_ignore_ascii_case(&name)).map(|g| g.0).or_else(|| {
+                        name.eq_ignore_ascii_case("variable layer height").then_some(Tool::VariableLayerHeight)
+                    });
             }
             Step::Export(path) => {
                 self.export_to = Some(path);

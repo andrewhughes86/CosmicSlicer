@@ -19,6 +19,7 @@ end of every session (no crashes, tests and clippy clean, smoke tests cover new 
 | 10 | Object model | Parts, modifiers, negative volumes, support enforcers/blockers and height ranges on objects (model, engine, 3MF, autosave); object list as a tree with Orca's add-part/modifier menus (primitive or file), split to parts, assemble, drag to reorder, per-part and per-range settings; mesh repair on import with a report |
 | 11 | Prepare tools | Support, seam, fuzzy-skin and colour painting (circle, sphere, fill, smart fill, gap fill) with the engine using support, seam and fuzzy paint; Cut with capped faces, flip, cut to parts, plug and dowel connectors; Text and SVG emboss/engrave; Measure; brim ears placed by hand ("Painted" brim); Boolean union/difference; Assemble; lay-on-face highlight, scale to fit; undoable volume edits |
 | 12 | Multi-material | Colour painting sliced into filaments (nearest painted surface, or a set depth); layers printed filament by filament; prime tower sized to the purges, with brim and sparse layers; flushing volumes table (auto from colours, multiplier); change-filament G-code; ooze prevention; support and interface filaments; print by object with clearance checks and per-plate sequence; colour change, pause and custom G-code from the layer slider (3MF `custom_gcode_per_layer.xml`) |
+| 13 | Layer height | Variable layer height tool (draw the curve, adaptive from surface slopes with a quality setting, smooth, reset), saved per object (3MF `layer_heights_profile.txt`); layer stacks from profiles and height ranges with `layer_height`; a continuous-Z spiral vase; each object's brim with it when printing one at a time |
 
 ## Order, and why
 Get a user's own printer printing well and safely first (profiles, correct motion G-code,
@@ -47,7 +48,7 @@ CI comes early because the Windows and macOS builds are not yet checked by anyth
 | 19 | Parity check against OrcaSlicer on a reference set | 6–14 |
 | 20 | Packaging and release for all three platforms | 3, 18 |
 
-8 more sessions. Session 13 can come earlier; 17 can be split up and done between others.
+7 more sessions. 17 can be split up and done between others.
 
 ---
 
@@ -283,14 +284,28 @@ Moved on: flushing into infill, objects or support instead of the tower, and the
 infill filament options (missing from our extracted settings; re-extract them) to session 19;
 moving the tower on the canvas to session 14.
 
-## 13 · Layer height
-- Variable layer height tool (paint smooth/adaptive), adaptive layer height, layer ranges.
-- Proper spiral vase (continuous Z, smoothing), sequential printing heights.
-- From session 8: independent support layer height (support on its own layer stack, so the
-  top gap need not be a whole number of layers), brims per object in by-object printing,
-  leading-edge-only brims.
+## 13 · Layer height — done
+- Variable layer height (`model::layers`): a profile of layer height by height above the plate
+  per object; the toolbar tool draws it as a curve (drag to set the height under a brush that
+  fades at its edge), Adaptive from the surfaces (thin where they lie near flat, thick up walls;
+  a quality setting), Smooth (radius, keeping the thinnest layers or not) and Reset; each a
+  single undo step; saved in autosave and 3MF (`Metadata/layer_heights_profile.txt`, our
+  reading of Orca's layout).
+- Engine: the plate's layers follow the thinnest layer any object asks for at each height
+  (its profile, or a height range that sets `layer_height`), within the printer's minimum and
+  maximum layer height, the last layer ending at the top (`slicing::layer_heights_by`).
+- Spiral vase: above the solid bottom, on single-loop layers, the outer wall climbs from the
+  last layer's height to this one's as it goes round, carrying on from where the last turn
+  ended, its flow growing from nothing on the first turn; no seam, no loop wipe, no arcs there.
+- Printing one at a time, each object's brim prints with its first layer.
+- Checked by engine tests: a drawn profile slices 0.1 mm layers low and 0.3 mm high, rising
+  steadily between, and the Preview's layers show those heights; a spiral vase never moves down
+  while printing and reads back with the same time.
 
-**Done when:** the variable-layer tool's curve slices as drawn and the Preview shows it.
+Moved on to session 19: per-object layer stacks interleaved by height (here one stack serves
+the plate, the thinnest any object wants); independent support layer height; the spiral vase's
+XY smoothing between layers (`spiral_mode_smooth`); leading-edge-only brims. The layer height
+profile is not drawn beside the object on the canvas, only in the tool's panel.
 
 ## 14 · Arrange, orient and plates
 - Arrangement with rotation and alignment like Orca's (nesting, spacing, avoiding excluded bed
@@ -359,6 +374,8 @@ and the Device page follows both prints.
   finer than the mesh (Orca's triangle selector), moving volumes with the canvas gizmos.
 - From session 12: flush into infill / objects / support; wall and infill filaments (re-extract
   Orca's settings to get `wall_filament`, `sparse_infill_filament`, `solid_infill_filament`).
+- From session 13: per-object layer stacks; independent support layer height; spiral vase
+  XY smoothing; leading-edge-only brims; the layer profile drawn beside the object.
 
 ## 20 · Packaging and release
 - Windows installer (MSI) with file associations; macOS `.app` (universal) as a DMG; Linux

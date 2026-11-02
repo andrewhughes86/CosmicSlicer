@@ -280,6 +280,7 @@ pub fn to_project(session: &Session) -> Project {
             settings: o.overrides.clone(),
             ranges: o.ranges.iter().map(|r| (r.lo, r.hi, r.overrides.clone())).collect(),
             brim_ears: o.brim_ears.iter().map(|e| (e.at, e.radius)).collect(),
+            layer_profile: o.layer_profile.clone(),
         });
     }
     let colours: Vec<[u8; 3]> = (0..session.presets.project_filaments.len())
@@ -518,6 +519,7 @@ pub fn open(session: &Session, path: &Path) -> Result<(Restored, Vec<String>), S
                     .iter()
                     .map(|(p, r)| CosmicSlicer_model::BrimEar { at: frame.transform_point3(*p), radius: *r })
                     .collect(),
+                layer_profile: o.layer_profile.clone(),
             });
         }
     }
@@ -697,6 +699,7 @@ mod tests {
             settings: vec![("sparse_infill_density".into(), "35%".into()), ("not_an_option".into(), "x".into())],
             ranges: vec![],
             brim_ears: vec![],
+            layer_profile: vec![],
         }];
         p.plates = vec![Plate::default(), Plate { name: "two".into(), ..Default::default() }];
         p.settings = Some(

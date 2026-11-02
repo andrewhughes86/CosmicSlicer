@@ -67,6 +67,23 @@ pub struct ToolState {
     pub ear_radius: f32,
     pub cut: CutState,
     pub text: TextState,
+    pub layers: LayerTool,
+}
+
+/// The variable layer height tool's settings.
+#[derive(Clone, Debug)]
+pub struct LayerTool {
+    /// Drawing brush, mm of height.
+    pub radius: f32,
+    pub quality: f32,
+    pub smooth_radius: f32,
+    pub keep_min: bool,
+}
+
+impl Default for LayerTool {
+    fn default() -> Self {
+        Self { radius: 2.0, quality: 0.5, smooth_radius: 5.0, keep_min: false }
+    }
 }
 
 /// Where embossed text or an SVG goes.
@@ -196,6 +213,7 @@ impl Default for ToolState {
             ear_radius: 3.0,
             cut: CutState::default(),
             text: TextState::default(),
+            layers: LayerTool::default(),
         }
     }
 }

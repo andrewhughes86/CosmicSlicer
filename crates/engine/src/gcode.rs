@@ -260,6 +260,8 @@ struct Writer<'a> {
     seams: Vec<Option<DVec2>>,
     /// The prime tower, when one is printed.
     tower: Option<Tower>,
+    /// On a spiral vase layer: `Some(true)` on the first.
+    spiral: Option<bool>,
     /// The island being printed's painted seams: where they go, where they must not.
     seam_paint: (Vec<geom::Shape>, Vec<geom::Shape>),
     /// Speed factor for layer cooling.
@@ -568,6 +570,24 @@ impl<'a> Writer<'a> {
             return steps;
         }
         steps.push(plain(start, path.overhang_at(n - 1)));
+        // Spiral vase: the wall climbs from the last layer's height to this one's as it goes
+        // round, with no seam (and on the first spiral layer, the flow grows from nothing).
+        if let Some(first_turn) = self.spiral.filter(|_| path.role == Role::OuterWall) {
+            let total = path.length().max(1e-6);
+            let h = self.height;
+            let mut along = 0.0;
+            let mut at = start;
+            for st in &mut steps {
+                along += at.distance(st.to);
+                at = st.to;
+                let f = (along / total).min(1.0);
+                st.dz = -h * (1.0 - f);
+                if first_turn {
+                    st.flow = f.max(0.05);
+                }
+            }
+            return steps;
+        }
         let sm = &self.s().seams;
         if !scarf {
             // Stop a little short of the start, so the seam does not blob.
@@ -658,7 +678,7 @@ impl<'a> Writer<'a> {
             self.preview.seams.push([start.x as f32, start.y as f32, z as f32]);
         }
         self.last_path = all;
-        if path.closed && path.role == Role::OuterWall && self.s().motion.wipe_on_loops {
+        if path.closed && path.role == Role::OuterWall && self.s().motion.wipe_on_loops && self.spiral.is_none() {
             self.wipe_inwards(path);
         }
     }
@@ -747,6 +767,7 @@ impl<'a> Writer<'a> {
         let e_per_mm = area / fil.area() * fil.flow_ratio;
         self.last_speed = speed;
         let fit = !first.scarf
+            && run.iter().all(|st| st.dz == 0.0)
             && match s.motion.arc_fitting {
                 ArcFitting::All => true,
                 ArcFitting::SparseInfill => path.role == Role::SparseInfill,
@@ -846,6 +867,15 @@ impl<'a> Writer<'a> {
                 }
             })
             .flatten();
+        // A spiral carries straight on from where the last turn ended.
+        let painted = if self.spiral.is_some() {
+            (0..path.points.len()).min_by(|&a, &b| {
+                let d = |i: usize| path.points.get(i).map_or(f64::INFINITY, |p| p.distance_squared(here));
+                d(a).total_cmp(&d(b))
+            })
+        } else {
+            painted
+        };
         let index = match (painted, seam.as_str()) {
             (Some(i), _) => i,
             (None, seam) => match seam {
@@ -1439,6 +1469,7 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         seams: vec![None; cx.object_names.len()],
         seam_paint: (Vec::new(), Vec::new()),
         tower: None,
+        spiral: None,
         slow: 1.0,
         preview_tolerance: preview_tolerance(plans),
         region: None,
@@ -1556,8 +1587,16 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
     }
 
     let mut highest: f64 = 0.0;
+    let mut spiral_started = false;
     for (li, plan) in plans.iter().enumerate() {
         w.layer = li;
+        // Spiral vase: above the solid bottom, on layers that are a single loop.
+        let single = plan.objects.len() == 1
+            && plan.objects.first().is_some_and(|(_, isl)| {
+                isl.len() == 1 && isl.first().is_some_and(|i| i.walls.iter().flatten().count() == 1)
+            });
+        w.spiral = (s.spiral && li >= s.bottom_layers.max(1) && single).then_some(!spiral_started);
+        spiral_started |= w.spiral.is_some();
         w.height = plan.height;
         let seg_start = w.preview.segments.len();
         let travel_start = w.preview.travels.len();

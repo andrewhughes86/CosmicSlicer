@@ -11,6 +11,9 @@ pub struct Settings {
     pub nozzle: f64,
     pub layer_height: f64,
     pub first_layer_height: f64,
+    /// The printer's layer height limits.
+    pub min_layer_height: f64,
+    pub max_layer_height: f64,
     pub widths: Widths,
     pub wall_loops: usize,
     pub top_layers: usize,
@@ -901,6 +904,11 @@ impl Settings {
             nozzle,
             layer_height,
             first_layer_height,
+            min_layer_height: r.range("min_layer_height", 0.07, 0.01, nozzle),
+            max_layer_height: {
+                let v = r.num("max_layer_height", 0.0);
+                if v.is_finite() && v > 0.01 { v.min(nozzle) } else { nozzle * 0.75 }
+            },
             widths,
             wall_loops: r.count("wall_loops", 2, 100),
             top_layers: shells("top_shell_layers", "top_shell_thickness"),

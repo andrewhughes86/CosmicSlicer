@@ -208,6 +208,8 @@ pub struct ProjectObject {
     pub ranges: Ranges,
     /// Brim ears placed by hand: point in the object's frame, radius.
     pub brim_ears: Vec<(Vec3, f32)>,
+    /// Variable layer height: (height, layer height) points.
+    pub layer_profile: Vec<(f32, f32)>,
 }
 
 impl ProjectObject {
@@ -788,6 +790,25 @@ pub fn read(bytes: &[u8]) -> ModelResult<Project> {
             }
         }
     }
+    if let Ok(b) = z.read("Metadata/layer_heights_profile.txt") {
+        for line in String::from_utf8_lossy(&b).lines() {
+            let Some((head, values)) = line.split_once('|') else { continue };
+            let Some(id) = head.trim().strip_prefix("object_id=") else { continue };
+            let v: Vec<f32> = values
+                .split(|c: char| c == ';' || c.is_whitespace())
+                .filter_map(|x| x.parse::<f32>().ok())
+                .filter(|x| x.is_finite())
+                .take(MAX_OBJECTS)
+                .collect();
+            let profile: Vec<(f32, f32)> =
+                v.as_chunks::<2>().0.iter().map(|[z, h]| (*z, *h)).filter(|p| p.1 > 0.0).collect();
+            if let Some(k) = object_ids.iter().position(|o| o == id)
+                && let Some(o) = project.objects.get_mut(k)
+            {
+                o.layer_profile = profile;
+            }
+        }
+    }
     if let Ok(b) = z.read("Metadata/brim_ear_points.txt") {
         for (id, ears) in read_brim_ears(&b) {
             if let Some(k) = object_ids.iter().position(|o| *o == id)
@@ -1047,6 +1068,14 @@ pub fn write(project: &Project) -> ModelResult<Vec<u8>> {
         x.push_str("</custom_gcodes_per_layer>\n");
         files.push(("Metadata/custom_gcode_per_layer.xml".into(), x.into_bytes()));
     }
+    if project.objects.iter().any(|o| !o.layer_profile.is_empty()) {
+        let mut b = String::new();
+        for (o, (oid, _)) in project.objects.iter().zip(&ids).filter(|(o, _)| !o.layer_profile.is_empty()) {
+            let values: Vec<String> = o.layer_profile.iter().flat_map(|(z, h)| [fmt_f(*z), fmt_f(*h)]).collect();
+            let _ = writeln!(b, "object_id={oid}|{}", values.join(";"));
+        }
+        files.push(("Metadata/layer_heights_profile.txt".into(), b.into_bytes()));
+    }
     if project.objects.iter().any(|o| !o.brim_ears.is_empty()) {
         let mut b = String::from("brim_points_format_version=0\n");
         for (o, (oid, _)) in project.objects.iter().zip(&ids).filter(|(o, _)| !o.brim_ears.is_empty()) {
@@ -1130,6 +1159,7 @@ mod tests {
                     settings: vec![("wall_loops".into(), "4".into())],
                     ranges: vec![(2.0, 4.5, vec![("sparse_infill_density".into(), "40%".into())])],
                     brim_ears: vec![(Vec3::new(5.0, -5.0, 0.0), 2.5)],
+                    layer_profile: vec![(0.0, 0.2), (5.0, 0.1), (10.0, 0.25)],
                 },
                 ProjectObject {
                     name: "Ball".into(),
@@ -1142,6 +1172,7 @@ mod tests {
                     settings: vec![],
                     ranges: vec![],
                     brim_ears: vec![],
+                    layer_profile: vec![],
                 },
             ],
             plates: vec![
@@ -1172,6 +1203,7 @@ mod tests {
         assert_eq!(a.settings, b.settings);
         assert_eq!(a.ranges, b.ranges);
         assert_eq!(a.brim_ears, b.brim_ears);
+        assert_eq!(a.layer_profile, b.layer_profile);
         assert!(back.objects[1].ranges.is_empty());
         assert_eq!(a.parts.len(), 2);
         assert_eq!(a.parts[1].kind, PartKind::Modifier);

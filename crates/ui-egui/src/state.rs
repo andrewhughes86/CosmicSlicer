@@ -1036,6 +1036,14 @@ impl Session {
         self.selection = ids;
     }
 
+    /// Sets object `id`'s variable layer height profile (no undo step: callers take one).
+    pub fn set_layer_profile(&mut self, id: u64, profile: Vec<(f32, f32)>) {
+        if let Some(o) = self.model.get_mut(id) {
+            o.layer_profile = profile;
+        }
+        self.touch();
+    }
+
     /// Adds a colour change, pause or custom G-code at height `z` on plate `plate`.
     pub fn add_event(&mut self, plate: usize, z: f32, kind: EventKind, gcode: String) {
         if !z.is_finite() {

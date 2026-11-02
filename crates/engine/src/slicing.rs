@@ -49,6 +49,34 @@ pub fn layer_heights(top: f64, first: f64, h: f64) -> Vec<LayerZ> {
     out
 }
 
+/// The layers up to `top`: the first `first` high, then each as high as `height_at` says at
+/// its middle (clamped to `lo..=hi`), the last one ending at the top.
+pub fn layer_heights_by(top: f64, first: f64, lo: f64, hi: f64, height_at: &dyn Fn(f64) -> f64) -> Vec<LayerZ> {
+    let mut out = Vec::new();
+    if !(top.is_finite() && top > 0.0 && first > 0.0 && lo > 0.0 && hi >= lo) {
+        return out;
+    }
+    let mut z = first.min(top.max(first));
+    out.push(LayerZ { print_z: z, height: first });
+    let pick = |at: f64| {
+        let h = height_at(at);
+        if h.is_finite() { h.max(lo).min(hi) } else { hi }
+    };
+    while z + 1.0e-6 < top && out.len() < MAX_LAYERS {
+        // Look at the layer's middle: guess its height, then take the height asked there.
+        let guess = pick(z);
+        let mut h = pick(z + guess / 2.0);
+        // Do not leave a sliver at the top: stretch or share the last bit.
+        let left = top - z;
+        if left < h + lo * 0.5 {
+            h = if left <= hi { left.max(lo.min(left)) } else { left / 2.0 };
+        }
+        z += h;
+        out.push(LayerZ { print_z: z, height: h });
+    }
+    out
+}
+
 /// A mesh placed in the scene, ready to slice: world-space vertices.
 pub struct Placed {
     pub vertices: Vec<DVec3>,

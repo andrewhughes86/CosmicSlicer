@@ -252,15 +252,9 @@ fn tool_panel(
                     (Tool::Boolean, _) => boolean_panel(ui, session, t),
                     (Tool::Assembly, _) => assembly_panel(ui, session, t),
                     (Tool::BrimEars, first) => ears_panel(ui, vp, session, t, first),
+                    (Tool::VariableLayerHeight, Some(id)) => layer_height_panel(ui, vp, session, t, id),
                     _ => {
-                        // Only variable layer height is left: the layer-height step builds it.
-                        ui.label(
-                            RichText::new(format!(
-                                "{} is built with variable and adaptive layer heights (roadmap session 13).",
-                                tool.name()
-                            ))
-                            .color(t.text_muted),
-                        );
+                        ui.label(RichText::new("Select an object.").color(t.text_muted));
                     }
                 }
             });
@@ -476,6 +470,98 @@ fn text_panel(
         .weak()
         .small(),
     );
+}
+
+fn layer_height_panel(ui: &mut Ui, vp: &mut Viewport, session: &mut Session, t: &Tokens, id: u64) {
+    use CosmicSlicer_config::TabKind;
+    use CosmicSlicer_model::layers;
+    let Some(o) = session.model.get(id) else { return };
+    let schema = session.schema;
+    let num = |kind: TabKind, key: &str, fallback: f32| {
+        CosmicSlicer_config::first_number(&session.presets.value(schema, kind, 0, key))
+            .map(|v| v as f32)
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(fallback)
+    };
+    let base = num(TabKind::Process, "layer_height", 0.2);
+    let nozzle = num(TabKind::Printer, "nozzle_diameter", 0.4);
+    let lo = num(TabKind::Printer, "min_layer_height", 0.07).min(base);
+    let hi = num(TabKind::Printer, "max_layer_height", nozzle * 0.75).max(base);
+    let top = o.bounds().size().z.max(0.1);
+    let profile = o.layer_profile.clone();
+    let ls = &mut vp.tools.layers;
+    // The curve: layer height across, height up.
+    let (rect, response) = ui.allocate_exact_size(vec2(240.0, 260.0), Sense::click_and_drag());
+    let p = ui.painter();
+    p.rect_filled(rect, 4.0, t.raised_bg);
+    let to_screen = |z: f32, h: f32| {
+        pos2(rect.left() + (h - lo) / (hi - lo).max(1e-3) * rect.width(), rect.bottom() - z / top * rect.height())
+    };
+    let bx = to_screen(0.0, base).x;
+    p.vline(bx, rect.y_range(), Stroke::new(1.0, t.border));
+    let steps = 120;
+    let pts: Vec<Pos2> = (0..=steps)
+        .map(|k| {
+            let z = top * k as f32 / steps as f32;
+            to_screen(z, layers::at(&profile, z).unwrap_or(base))
+        })
+        .collect();
+    p.add(egui::Shape::line(pts, Stroke::new(2.0, t.accent)));
+    p.text(
+        rect.left_bottom() + vec2(4.0, -4.0),
+        Align2::LEFT_BOTTOM,
+        format!("{lo:.2}"),
+        FontId::proportional(10.0),
+        t.text_muted,
+    );
+    p.text(
+        rect.right_bottom() + vec2(-4.0, -4.0),
+        Align2::RIGHT_BOTTOM,
+        format!("{hi:.2} mm"),
+        FontId::proportional(10.0),
+        t.text_muted,
+    );
+    if let Some(m) = response.hover_pos() {
+        let z = ((rect.bottom() - m.y) / rect.height() * top).clamp(0.0, top);
+        let h = (lo + (m.x - rect.left()) / rect.width() * (hi - lo)).clamp(lo, hi);
+        let r = ls.radius / top * rect.height();
+        p.rect_stroke(
+            Rect::from_x_y_ranges(rect.x_range(), (m.y - r)..=(m.y + r)),
+            0.0,
+            Stroke::new(1.0, t.text_muted.gamma_multiply(0.5)),
+            egui::StrokeKind::Inside,
+        );
+        response.clone().on_hover_text(format!("{z:.2} mm: layers {h:.3} mm"));
+        if response.drag_started() || response.clicked() {
+            session.checkpoint();
+        }
+        if response.dragged() || response.clicked() {
+            session.set_layer_profile(id, layers::draw(&profile, base, top, z, ls.radius, h));
+        }
+    }
+    ui.label(RichText::new("Drag on the curve to draw the layer heights.").weak().small());
+    ui.add(egui::Slider::new(&mut ls.radius, 0.5..=top.max(1.0)).text("Brush (mm)"));
+    ui.separator();
+    ui.add(egui::Slider::new(&mut ls.quality, 0.0..=1.0).text("Quality"));
+    ui.horizontal(|ui| {
+        if ui.button("Adaptive").on_hover_text("Fine layers where the surface is near flat, thick up walls").clicked()
+            && let Some(o) = session.model.get(id)
+        {
+            let p = layers::adaptive(&o.mesh, &o.matrix(), ls.quality, lo, hi);
+            session.checkpoint();
+            session.set_layer_profile(id, p);
+        }
+        if ui.button("Smooth").clicked() && !profile.is_empty() {
+            session.checkpoint();
+            session.set_layer_profile(id, layers::smooth(&profile, ls.smooth_radius, ls.keep_min));
+        }
+        if ui.add_enabled(!profile.is_empty(), egui::Button::new("Reset")).clicked() {
+            session.checkpoint();
+            session.set_layer_profile(id, Vec::new());
+        }
+    });
+    ui.add(egui::Slider::new(&mut ls.smooth_radius, 0.5..=20.0).text("Smooth radius (mm)"));
+    ui.checkbox(&mut ls.keep_min, "Keep the thinnest layers");
 }
 
 fn measure_panel(ui: &mut Ui, vp: &mut Viewport, t: &Tokens) {

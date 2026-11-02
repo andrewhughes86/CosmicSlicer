@@ -180,6 +180,7 @@ pub fn job(session: &Session, plate: usize) -> Job {
                     })
                     .collect(),
                 ranges: o.ranges.iter().map(|r| (f64::from(r.lo), f64::from(r.hi), r.overrides.clone())).collect(),
+                layer_profile: o.layer_profile.iter().map(|(z, h)| (f64::from(*z), f64::from(*h))).collect(),
                 support_paint: o
                     .paint
                     .as_deref()

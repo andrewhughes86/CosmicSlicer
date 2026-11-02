@@ -6,6 +6,7 @@
 #![allow(non_snake_case)]
 
 pub mod cut;
+pub mod layers;
 pub mod mesh;
 pub mod obj;
 pub mod primitives;
@@ -299,6 +300,8 @@ pub struct Object {
     pub ranges: Vec<HeightRange>,
     /// Brim ears placed by hand.
     pub brim_ears: Vec<BrimEar>,
+    /// Variable layer height: (height above the plate, layer height) points; empty for none.
+    pub layer_profile: Vec<(f32, f32)>,
 }
 
 impl Object {
@@ -368,6 +371,7 @@ impl Model {
             parts: Vec::new(),
             ranges: Vec::new(),
             brim_ears: Vec::new(),
+            layer_profile: Vec::new(),
         };
         object.drop_to_bed();
         self.objects.push(object);
