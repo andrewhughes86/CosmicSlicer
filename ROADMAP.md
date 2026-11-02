@@ -496,8 +496,13 @@ Done so far (2026-11-02):
   → 0.90 GB peak on the speed test structure). Benchy 6.5 → 3.7 s, the KSR FDM test with
   supports and gyroid 38.7 → 14.5 s, the speed test structure 47 → 29 s. The 300 mm gyroid
   takes 0.39 s.
-- Still open: offsets cost ~1 ms each in i_overlay (the speed test structure's walls); the
-  soak test; mesh booleans.
+- Soak test (`app::soak`): random use of the whole app through the session's methods with
+  frames drawn (add, select, move, scale, mirror, cut, split, copy, delete, undo and redo,
+  plates, pages, any setting, arrange, slice); no panic, and memory levelling off once the
+  undo history is full. CI runs 400 steps with the run number as the seed; 600 and 1 500
+  steps (seeds 1 and 2, 194 slices) ran clean here.
+- Still open: offsets cost ~1 ms each in i_overlay (the speed test structure's walls); mesh
+  booleans.
 
 ## 19 · Parity with OrcaSlicer
 - A reference set (calibration cube, Benchy, thin walls, overhang test, multi-part, multi-colour,

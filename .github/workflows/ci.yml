@@ -56,6 +56,14 @@ jobs:
       - name: Performance budgets
         run: cargo test -p CosmicSlicer-engine --lib budget_tests -- --ignored --nocapture --test-threads=1
 
+      # Random use of the whole app (add, edit, cut, undo, plates, settings, slice) with frames
+      # drawn: no panic, and memory levelling off. A new seed each run widens the search.
+      - name: Soak
+        shell: bash
+        env:
+          COSMICSLICER_SOAK_STEPS: "400"
+        run: COSMICSLICER_SOAK_SEED=${{ github.run_number }} cargo test -p CosmicSlicer-ui-egui --lib soak -- --ignored --nocapture
+
       - name: Release build
         run: cargo build --release
 

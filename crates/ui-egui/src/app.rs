@@ -1873,3 +1873,232 @@ mod smoke {
         assert!(app.dialogs.shortcuts);
     }
 }
+
+#[cfg(test)]
+mod soak {
+    //! A long session of random use through the session's own methods, with frames drawn
+    //! between: add, select, move, scale, mirror, cut, split, copy, delete, undo and redo,
+    //! plates, pages, any setting, arrange and slice. Nothing may panic, and memory must level
+    //! off once the undo history is full. Run with `--ignored`; `COSMICSLICER_SOAK_STEPS` (default
+    //! 600) and `COSMICSLICER_SOAK_SEED` set its length and seed. A failure names the step, the
+    //! seed and the actions before it.
+
+    use super::*;
+    use CosmicSlicer_import::fuzz::Rng;
+    use glam::Vec3;
+
+    fn frames(app: &mut CosmicSlicerApp, ctx: &egui::Context, n: usize) {
+        for _ in 0..n {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+            out.textures_delta.clear();
+        }
+    }
+
+    fn rss_mb() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+        line.split_whitespace().nth(1)?.parse::<u64>().ok().map(|kb| kb / 1024)
+    }
+
+    fn env(name: &str, default: u64) -> u64 {
+        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    }
+
+    /// One random action; returns what it did.
+    fn act(app: &mut CosmicSlicerApp, rng: &mut Rng, keys: &[&String]) -> String {
+        let s = &mut app.session;
+        let ids: Vec<u64> = s.model.objects.iter().map(|o| o.id).collect();
+        let any = |rng: &mut Rng| ids.get(rng.below(ids.len())).copied();
+        match rng.below(22) {
+            0 | 1 => {
+                let name = ["Cube", "Cylinder", "Sphere", "Cone", "Disc", "Torus"][rng.below(6)];
+                s.add_primitive(name);
+                format!("add {name}")
+            }
+            2 => {
+                s.selection = any(rng).into_iter().collect();
+                format!("select {:?}", s.selection)
+            }
+            3 => {
+                s.select_all();
+                "select all".into()
+            }
+            4 => {
+                let d = Vec3::new(rng.unit() as f32, rng.unit() as f32, rng.unit() as f32) * 150.0;
+                let t = s.targets();
+                s.nudge(&t, d);
+                format!("nudge {d}")
+            }
+            5 => {
+                let f = [0.5f32, 0.8, 1.25, 2.0][rng.below(4)];
+                let t = s.targets();
+                s.scale_objects(&t, f);
+                format!("scale {f}")
+            }
+            6 => {
+                let axis = rng.below(3);
+                s.mirror(axis);
+                format!("mirror {axis}")
+            }
+            7 | 8 => {
+                let n = 1 + rng.below(5);
+                for _ in 0..n {
+                    s.undo();
+                }
+                format!("undo {n}")
+            }
+            9 => {
+                let n = 1 + rng.below(5);
+                for _ in 0..n {
+                    s.redo();
+                }
+                format!("redo {n}")
+            }
+            10 => {
+                s.delete_selected();
+                "delete".into()
+            }
+            11 => {
+                s.copy();
+                s.paste();
+                "copy and paste".into()
+            }
+            12 => {
+                s.clone_selected();
+                "clone".into()
+            }
+            13 => {
+                s.arrange(rng.chance(3));
+                "arrange".into()
+            }
+            14 => {
+                let page = [Page::Home, Page::Prepare, Page::Preview, Page::Device, Page::Project][rng.below(5)];
+                s.page = page;
+                format!("page {page:?}")
+            }
+            15 => {
+                let Some(key) = keys.get(rng.below(keys.len())) else { return "no keys".into() };
+                let def = s.schema.option(key);
+                let value = match def.map(|d| d.enum_values.as_slice()) {
+                    Some(e) if !e.is_empty() => e.get(rng.below(e.len())).map(|v| v.0.clone()).unwrap_or_default(),
+                    _ => ["0", "1", "2", "5", "0.2", "50%", "-1", "1000", ""][rng.below(9)].to_owned(),
+                };
+                let kind = [TabKind::Process, TabKind::Filament, TabKind::Printer][rng.below(3)];
+                s.presets.set_value(s.schema, kind, 0, key, value.clone());
+                format!("set {kind:?} {key} = {value:?}")
+            }
+            16 => match rng.below(3) {
+                0 => {
+                    s.add_plate();
+                    "add plate".into()
+                }
+                1 => {
+                    let p = rng.below(s.model.plates.max(1));
+                    s.plate = p;
+                    format!("plate {p}")
+                }
+                _ => {
+                    let p = rng.below(s.model.plates.max(1));
+                    s.delete_plate(p);
+                    format!("delete plate {p}")
+                }
+            },
+            17 => {
+                let Some(id) = any(rng) else { return "cut: nothing".into() };
+                let z = s.model.get(id).map_or(0.0, |o| {
+                    let b = o.bounds();
+                    b.min.z + (b.max.z - b.min.z) * (0.2 + 0.6 * rng.unit().abs() as f32)
+                });
+                let opts = crate::state::CutOptions::default();
+                s.cut(id, Vec3::new(0.0, 0.0, z), Vec3::Z, &opts);
+                format!("cut {id} at {z}")
+            }
+            18 => match rng.below(4) {
+                0 => {
+                    s.split_selected();
+                    "split".into()
+                }
+                1 => {
+                    s.drop_to_bed();
+                    "drop to bed".into()
+                }
+                2 => {
+                    s.auto_orient();
+                    "auto orient".into()
+                }
+                _ => {
+                    s.add_instance();
+                    "add instance".into()
+                }
+            },
+            19 => {
+                if rng.chance(20) {
+                    s.new_project();
+                    "new project".into()
+                } else {
+                    s.selection.clear();
+                    "select none".into()
+                }
+            }
+            _ => {
+                app.start_slice();
+                "slice".into()
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "long: run with --ignored (CI runs it on its own)"]
+    fn a_long_session_of_random_use() {
+        let steps = env("COSMICSLICER_SOAK_STEPS", 600) as usize;
+        let seed = env("COSMICSLICER_SOAK_SEED", 1);
+        let ctx = egui::Context::default();
+        let mut app = CosmicSlicerApp::headless(LaunchOptions { ephemeral: true, ..Default::default() });
+        let schema = app.session.schema;
+        let mut keys: Vec<&String> = schema.options.keys().collect();
+        keys.sort();
+        let mut rng = Rng::new(seed);
+        let mut recent: std::collections::VecDeque<String> = Default::default();
+        let mut slices = 0;
+        let mut warm = None;
+        let started = std::time::Instant::now();
+        for step in 0..steps {
+            let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let what = act(&mut app, &mut rng, &keys);
+                let slicing = what == "slice";
+                recent.push_back(what);
+                if recent.len() > 20 {
+                    recent.pop_front();
+                }
+                frames(&mut app, &ctx, 1);
+                // Let a slice finish (or fail) through the frames, as the app does.
+                let mut waited = 0;
+                while slicing && app.runner.is_some() && waited < 6000 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    frames(&mut app, &ctx, 1);
+                    waited += 1;
+                }
+                slicing
+            }));
+            assert!(done.is_ok(), "step {step} (seed {seed}) panicked; the actions before it: {recent:#?}");
+            slices += usize::from(done.unwrap_or(false));
+            if step == steps / 2 {
+                warm = rss_mb();
+            }
+        }
+        let end = rss_mb();
+        println!(
+            "{steps} steps, {slices} slices in {:.0} s; {} objects; memory {warm:?} MB at half way, {end:?} MB at the end",
+            started.elapsed().as_secs_f64(),
+            app.session.model.objects.len()
+        );
+        // The undo history is full by half way: from there memory must level off.
+        if let (Some(a), Some(b)) = (warm, end) {
+            assert!(b < a + 300, "memory grew from {a} MB to {b} MB");
+        }
+    }
+}
