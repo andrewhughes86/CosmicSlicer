@@ -255,30 +255,85 @@ fn rows(area: &[Shape], spacing: f64, a: f64, phase: f64, width: f64) -> Vec<Pol
     geom::clip_lines(&lines, area).into_iter().filter(|l| geom::length(l) > width * 0.5).collect()
 }
 
-/// Orders pieces of lines along `a` by row, then along the row, each running the same way.
-fn by_rows(pieces: Vec<Polyline>, a: f64, spacing: f64) -> Vec<Polyline> {
+/// Pieces of lines along `a` as regions OrcaSlicer prints in one go: runs of rows where each
+/// piece has exactly one piece next to it in the row before (a hole splits the rows into a
+/// region each side of it). Each region's pieces run the same way, row by row.
+fn regions(pieces: Vec<Polyline>, a: f64, spacing: f64) -> Vec<Vec<Polyline>> {
     let dir = DVec2::new(a.cos(), a.sin());
     let normal = dir.perp();
-    let mut keyed: Vec<(f64, f64, Polyline)> = pieces
+    // (row, from, to along the row, piece)
+    let mut keyed: Vec<(i64, f64, f64, Polyline)> = pieces
         .into_iter()
-        .map(|mut l| {
-            if let (Some(&s), Some(&e)) = (l.first(), l.last())
-                && (e - s).dot(dir) < 0.0
-            {
+        .filter_map(|mut l| {
+            let (s, e) = (*l.first()?, *l.last()?);
+            if (e - s).dot(dir) < 0.0 {
                 l.reverse();
             }
-            let s = l.first().copied().unwrap_or_default();
-            ((s.dot(normal) / spacing).round(), s.dot(dir), l)
+            let (from, to) =
+                l.iter().fold((f64::MAX, f64::MIN), |(lo, hi), q| (lo.min(q.dot(dir)), hi.max(q.dot(dir))));
+            let row = (l.first().copied().unwrap_or_default().dot(normal) / spacing).round();
+            Some((row.clamp(-1.0e15, 1.0e15) as i64, from, to, l))
         })
         .collect();
-    keyed.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.total_cmp(&y.1)));
-    keyed.into_iter().map(|k| k.2).collect()
+    keyed.sort_by(|x, y| x.0.cmp(&y.0).then(x.1.total_cmp(&y.1)));
+    let overlap = |p: &(i64, f64, f64), q: &(i64, f64, f64)| p.1 < q.2 && q.1 < p.2;
+    // Open regions: their pieces, and the last piece's (row, from, to).
+    let mut done: Vec<Vec<Polyline>> = Vec::new();
+    let mut open: Vec<(Vec<Polyline>, (i64, f64, f64))> = Vec::new();
+    let mut i = 0;
+    while i < keyed.len() {
+        let row = keyed.get(i).map_or(0, |k| k.0);
+        let end = keyed.iter().skip(i).position(|k| k.0 != row).map_or(keyed.len(), |n| i + n);
+        let here: Vec<(i64, f64, f64)> = keyed.get(i..end).unwrap_or(&[]).iter().map(|k| (k.0, k.1, k.2)).collect();
+        let mut next: Vec<(Vec<Polyline>, (i64, f64, f64))> = Vec::new();
+        let mut taken = vec![false; open.len()];
+        for (j, piece) in here.iter().enumerate() {
+            let Some(line) = keyed.get_mut(i + j).map(|k| std::mem::take(&mut k.3)) else { continue };
+            // The one open region whose last piece is next to this one and to no other.
+            let touching: Vec<usize> = (0..open.len())
+                .filter(|&o| open.get(o).is_some_and(|r| r.1.0 == row - 1 && overlap(&r.1, piece)))
+                .collect();
+            let only = match touching.as_slice() {
+                [o] => {
+                    open.get(*o).is_some_and(|r| here.iter().filter(|h| overlap(&r.1, h)).count() == 1).then_some(*o)
+                }
+                _ => None,
+            };
+            match only.filter(|o| !taken.get(*o).copied().unwrap_or(true)) {
+                Some(o) => {
+                    if let Some(t) = taken.get_mut(o) {
+                        *t = true;
+                    }
+                    if let Some(r) = open.get_mut(o) {
+                        let mut lines = std::mem::take(&mut r.0);
+                        lines.push(line);
+                        next.push((lines, *piece));
+                    }
+                }
+                None => next.push((vec![line], *piece)),
+            }
+        }
+        for (r, t) in open.into_iter().zip(taken) {
+            if !t {
+                done.push(r.0);
+            }
+        }
+        open = next;
+        i = end;
+    }
+    done.extend(open.into_iter().map(|r| r.0));
+    done.retain(|r| !r.is_empty());
+    done
+}
+
+/// Pieces of lines along `a`, joined zig-zag within each region.
+fn join_rows(pieces: Vec<Polyline>, a: f64, spacing: f64, area: &[Shape], max_step: f64) -> Vec<Line> {
+    regions(pieces, a, spacing).into_iter().flat_map(|r| join_zigzag(r, area, max_step)).collect()
 }
 
 /// Lines `spacing` apart at angle `a`, clipped and joined zig-zag where they meet.
 fn parallel(area: &[Shape], spacing: f64, a: f64, phase: f64, width: f64) -> Vec<Line> {
-    let pieces = by_rows(rows(area, spacing, a, phase, width), a, spacing);
-    join_zigzag(pieces, area, spacing * 1.9)
+    join_rows(rows(area, spacing, a, phase, width), a, spacing, area, spacing * 1.9)
 }
 
 /// Parallel lines in several directions, each `(angle, phase)`.
@@ -288,9 +343,12 @@ fn directions(area: &[Shape], width: f64, spacing: f64, dirs: &[(f64, f64)]) -> 
 
 /// Monotonic: every line runs the same way, printed in order across the region.
 fn monotonic(area: &[Shape], spacing: f64, a: f64, width: f64, joined: bool) -> Vec<Line> {
-    let pieces = by_rows(rows(area, spacing, a, 0.0, width), a, spacing);
-    let mut out =
-        if joined { join_zigzag(pieces, area, spacing * 1.9) } else { pieces.into_iter().map(Line::open).collect() };
+    let pieces = rows(area, spacing, a, 0.0, width);
+    let mut out = if joined {
+        join_rows(pieces, a, spacing, area, spacing * 1.9)
+    } else {
+        regions(pieces, a, spacing).into_iter().flatten().map(Line::open).collect()
+    };
     for l in &mut out {
         l.ordered = true;
     }
@@ -352,8 +410,7 @@ fn wave_rows(area: &[Shape], a: f64, spacing: f64, period: f64, amp: f64, shift:
             })
             .collect()
     });
-    let pieces = by_rows(lines, a, spacing);
-    join_zigzag(pieces, area, spacing * 1.9)
+    join_rows(lines, a, spacing, area, spacing * 1.9)
 }
 
 /// Cross zag: zig-zag waves along the infill direction, shifted along by `shift_step` each
@@ -464,8 +521,7 @@ fn lateral_honeycomb(area: &[Shape], p: &Params) -> Vec<Line> {
             })
             .collect()
     });
-    let pieces = by_rows(lines, p.angle, wid / 2.0);
-    join_zigzag(pieces, area, wid)
+    join_rows(lines, p.angle, wid / 2.0, area, wid)
 }
 
 /// Curves of an implicit surface solved along one axis: for each `u` sample, the `v` values

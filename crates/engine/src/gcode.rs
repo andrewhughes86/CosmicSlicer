@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 use glam::{DVec2, DVec3};
 
 use crate::arcs::{self, Piece};
+use crate::gcodeview::Machine;
 use crate::geom;
 use crate::motion::{self, Block, BlockKind};
 use crate::settings::{ArcFitting, Filament, Flavor, Scarf, Settings, ZHop, bead_area};
@@ -67,6 +68,9 @@ pub struct Stats {
     pub total_time: f64,
     pub time_by_role: [f64; Role::COUNT],
     pub travel_time: f64,
+    /// Seconds before the first layer (the start G-code): OrcaSlicer's "prepare" time, which
+    /// its "model printing time" leaves out.
+    pub prepare_time: f64,
     /// Per extruder: mm of filament, mm³, grams, cost.
     pub filament_mm: Vec<f64>,
     pub volume_mm3: Vec<f64>,
@@ -234,6 +238,20 @@ enum Op {
     },
     Accel(f64),
     Jerk(f64),
+    /// The part fan, %. The layer's speed is settled once the layer is written (it follows the
+    /// layer's time after cooling), so the fan commands say what they are for.
+    Fan(f64, Fan),
+}
+
+/// What a fan command is for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Fan {
+    /// The layer's fan.
+    Layer,
+    /// At least this (overhangs and bridges), or the layer's fan when that is higher.
+    AtLeast,
+    /// Exactly this (internal bridges, support interfaces and ironing with their own speed).
+    Exact,
 }
 
 struct Writer<'a> {
@@ -250,10 +268,12 @@ struct Writer<'a> {
     role: Option<Role>,
     width: f64,
     extruder: usize,
-    /// The layer's fan, %.
-    fan: f64,
-    /// The fan as last commanded (the overhang fan may have it above the layer's).
-    out_fan: f64,
+    /// The fan as last commanded: (%, what for).
+    out_fan: (f64, Fan),
+    /// The fan ramp over the first layers (0 to 1; 0 while the fan is off).
+    fan_ramp: f64,
+    /// The fan asked for each Preview segment of this layer, settled by `cool_layer`.
+    seg_fans: Vec<(f64, Fan)>,
     temp: f64,
     layer: usize,
     print_z: f64,
@@ -270,8 +290,6 @@ struct Writer<'a> {
     spiral: Option<bool>,
     /// The island being printed's painted seams: where they go, where they must not.
     seam_paint: (Vec<geom::Shape>, Vec<geom::Shape>),
-    /// Speed factor for layer cooling.
-    slow: f64,
     /// How far the Preview's copy of a path may stray from it, mm.
     preview_tolerance: f64,
     /// The island being printed, for travel inside it.
@@ -418,11 +436,14 @@ impl<'a> Writer<'a> {
             return;
         }
         self.preview.retractions.push([self.pos.x as f32, self.pos.y as f32, self.pos.z as f32]);
+        let firmware = self.s().motion.firmware_retraction;
         let mut left = r.length;
-        // Wipe back along the last path, retracting part of the way while moving.
+        // Wipe back along the last path (OrcaSlicer's split): `retract_before_wipe` of the
+        // length first, standing, then the rest spread over the wipe as it moves, but only as
+        // much as the extruder can pull back at its retraction speed in the wipe's time; what
+        // does not fit is retracted standing too.
         if r.wipe && self.s().motion.wipe_distance > 0.0 && self.last_path.len() >= 2 {
             let distance = self.s().motion.wipe_distance;
-            let share = self.s().motion.retract_before_wipe;
             let mut wipe: Vec<DVec2> = Vec::new();
             let mut travelled = 0.0;
             let mut at = self.pos.truncate();
@@ -445,21 +466,34 @@ impl<'a> Writer<'a> {
                 self.last_speed
             } else {
                 m.wipe_speed.of(self.s().speeds.travel)
-            };
-            if travelled > 0.0 {
-                let during = r.length * share;
+            }
+            .max(10.0);
+            if travelled > 0.0 && !firmware {
+                let during = (r.length * (1.0 - m.retract_before_wipe)).min(r.speed * travelled / wipe_speed);
+                let before = r.length - during;
+                if before > 1e-6 {
+                    let to = self.pos;
+                    self.mv(to, -before, r.speed, MoveKind::Retract);
+                    left -= before;
+                }
+                let per_mm = during / travelled;
                 let mut from = self.pos.truncate();
                 for p in wipe {
-                    let e = -during * from.distance(p) / travelled;
+                    let e = -per_mm * from.distance(p);
                     let z = self.pos.z;
                     self.mv(p.extend(z), e, wipe_speed, MoveKind::Wipe);
+                    left += e;
                     from = p;
                 }
-                left -= during;
+            } else if travelled > 0.0 {
+                for p in wipe {
+                    let z = self.pos.z;
+                    self.mv(p.extend(z), 0.0, wipe_speed, MoveKind::Wipe);
+                }
             }
         }
         if left > 1e-6 {
-            if self.s().motion.firmware_retraction {
+            if firmware {
                 self.ops.push(Op::FirmwareRetract { retract: true, length: left, feed: r.speed });
             } else {
                 let to = self.pos;
@@ -501,9 +535,10 @@ impl<'a> Writer<'a> {
         }
     }
 
-    /// Moves to `to` without printing: inside the island when it can, routed round walls when
-    /// asked to, retracting and lifting when the move leaves the part or is long.
-    fn travel(&mut self, to: DVec2) {
+    /// Moves to `to` without printing, to print a `next` path: inside the island when it can,
+    /// routed round walls when asked to, retracting and lifting as OrcaSlicer does (on leaving
+    /// an outer wall, on the way to a wall, and wherever the move leaves the part).
+    fn travel(&mut self, to: DVec2, next: Role) {
         let from = self.pos.truncate();
         let d = from.distance(to);
         if d < 1.0e-4 && self.xy_known {
@@ -533,7 +568,9 @@ impl<'a> Writer<'a> {
             }
         }
         let length = geom::length(&route);
-        let retract = length > self.s().retract.min_travel && !(inside && m.reduce_infill_retraction);
+        let leaving_outer = matches!(self.role, Some(Role::OuterWall | Role::OverhangWall));
+        let quiet = inside && m.reduce_infill_retraction && !next.is_wall() && self.s().density > 0.0;
+        let retract = length > self.s().retract.min_travel && (leaving_outer || !quiet);
         if retract {
             self.retract();
         }
@@ -666,7 +703,7 @@ impl<'a> Writer<'a> {
     /// Prints `path` from its first point (loops all the way round).
     fn extrude(&mut self, path: &Path) {
         let Some(start) = path.start() else { return };
-        self.travel(start);
+        self.travel(start, path.role);
         if let Some(r) = self.pending_region.take() {
             self.region = Some(r);
         }
@@ -704,11 +741,7 @@ impl<'a> Writer<'a> {
             let to = self.pos.truncate().extend(z);
             self.mv(to, 0.0, self.s().speeds.travel_z.max(5.0), MoveKind::Travel);
         }
-        if (self.out_fan - self.fan).abs() > 0.5 {
-            self.out_fan = self.fan;
-            let f = self.fan;
-            self.line(fan_command(f));
-        }
+        self.fan_for(0.0, Fan::Layer);
         if path.closed && path.role == Role::OuterWall {
             self.preview.seams.push([start.x as f32, start.y as f32, z as f32]);
         }
@@ -772,33 +805,32 @@ impl<'a> Writer<'a> {
             base = s.seams.scarf_speed.of(base);
             flow *= s.seams.scarf_flow;
         }
-        // The fan: bridges and overhangs past the filament's threshold get the overhang fan.
-        let fan_on = self.layer >= fil.fan_off_layers;
-        let fan = match (fil.overhang_fan_from, role) {
-            (Some(_), Role::InternalBridge) if fan_on => {
-                fil.internal_bridge_fan.unwrap_or(fil.overhang_fan).max(self.fan)
+        // The fan (as OrcaSlicer's cooling buffer): bridges and overhangs past the filament's
+        // threshold get the overhang fan when it is higher than the layer's; internal bridges,
+        // support interfaces and ironing their own speed when they have one.
+        let ramp = self.fan_ramp;
+        let (fan, kind) = match (fil.overhang_fan_from, role) {
+            _ if ramp <= 0.0 => (0.0, Fan::Layer),
+            (_, Role::SupportInterface) if fil.support_interface_fan.is_some() => {
+                (fil.support_interface_fan.unwrap_or(0.0), Fan::Exact)
             }
-            (Some(_), Role::Bridge) if fan_on => fil.overhang_fan.max(self.fan),
+            (_, Role::Ironing) if fil.ironing_fan.is_some() => (fil.ironing_fan.unwrap_or(0.0), Fan::Exact),
+            (_, Role::InternalBridge) if fil.internal_bridge_fan.is_some() => {
+                (fil.internal_bridge_fan.unwrap_or(0.0), Fan::Exact)
+            }
+            (Some(_), Role::InternalBridge | Role::Bridge) => (fil.overhang_fan * ramp, Fan::AtLeast),
             (Some(t), _)
-                if fan_on
-                    && path.role.is_wall()
-                    && ((t == 0 && path.role == Role::OuterWall) || (t > 0 && deg >= t)) =>
+                if path.role.is_wall() && ((t == 0 && path.role == Role::OuterWall) || (t > 0 && deg >= t)) =>
             {
-                fil.overhang_fan.max(self.fan)
+                (fil.overhang_fan * ramp, Fan::AtLeast)
             }
-            _ => self.fan,
+            _ => (0.0, Fan::Layer),
         };
-        if (fan - self.out_fan).abs() > 0.5 {
-            self.out_fan = fan;
-            self.line(fan_command(fan));
-        }
+        self.fan_for(fan, kind);
         let h = self.height;
         let area = bead_area(path.width, h) * flow;
-        let mut speed = base * self.slow;
-        let bridging = role.is_bridge() || deg == 5;
-        if !matches!(role, Role::Skirt | Role::Brim) && !bridging {
-            speed = speed.max(fil.slow_down_min_speed.min(base));
-        }
+        // Cooling slows the layer down once it is written (`cool_layer`).
+        let mut speed = base;
         // The hot end can only melt so much per second.
         if area > 0.0 {
             speed = speed.min(fil.max_volumetric / area);
@@ -874,6 +906,7 @@ impl<'a> Writer<'a> {
                 extruder: self.extruder as u8,
                 flow: (area * speed) as f32,
             });
+            self.seg_fans.push((fan, kind));
         }
     }
 
@@ -1165,12 +1198,86 @@ impl<'a> Writer<'a> {
         self.pending_region = None;
     }
 
-    fn set_fan(&mut self, fan: f64) {
-        if (fan - self.fan).abs() > 0.5 || (fan - self.out_fan).abs() > 0.5 {
-            self.fan = fan;
-            self.out_fan = fan;
-            self.line(fan_command(fan));
+    /// Sets the fan for what is printed next, unless it already is.
+    fn fan_for(&mut self, fan: f64, kind: Fan) {
+        let same = match kind {
+            Fan::Layer => self.out_fan.1 == Fan::Layer,
+            _ => self.out_fan.1 == kind && (self.out_fan.0 - fan).abs() < 0.5,
+        };
+        if !same {
+            self.out_fan = (fan, kind);
+            self.ops.push(Op::Fan(fan, kind));
         }
+    }
+
+    /// Layer cooling, as OrcaSlicer's cooling buffer does it once a layer is written: a layer
+    /// quicker than the filament's slow-down time has its fastest extrusions slowed to one
+    /// common speed until it takes that long (none below the minimum speed, outer walls kept
+    /// when the filament says so), and the layer's fan follows the time it then takes. Moves
+    /// are timed as the buffer times them, length over feed.
+    fn cool_layer(&mut self, (from, start): (usize, DVec3), f: &Filament, seg_start: usize) {
+        let adjustable = |role: Role, feed: f64| {
+            feed > f.slow_down_min_speed && !(f.keep_outer_wall_speed && role == Role::OuterWall)
+        };
+        let mut pos = start;
+        let mut total = 0.0;
+        let mut moves: Vec<(f64, f64)> = Vec::new();
+        for op in self.ops.get(from..).unwrap_or(&[]) {
+            if let Op::Move { to, e, feed, kind, arc, xy } = op {
+                let d = if *xy { *to - pos } else { DVec3::new(0.0, 0.0, to.z - pos.z) };
+                let xyz = match arc {
+                    Some((c, ccw)) if *xy => arcs::arc_length(pos.truncate(), to.truncate(), *c, *ccw).hypot(d.z),
+                    _ => d.length(),
+                };
+                let len = if xyz > 1e-9 { xyz } else { e.abs() };
+                pos = *to;
+                if *feed > 0.0 {
+                    total += len / feed;
+                }
+                if let MoveKind::Extrude(role) = kind
+                    && adjustable(*role, *feed)
+                {
+                    moves.push((len, *feed));
+                }
+            }
+        }
+        let target = f.slow_down_layer_time * 1.001;
+        let mut cap = f64::INFINITY;
+        let mut time = total;
+        if f.slow_down && total < target && !moves.is_empty() {
+            cap = slow_down_cap(&moves, target - total, f.slow_down_min_speed).unwrap_or(f.slow_down_min_speed);
+            time += moves.iter().map(|(len, v)| len / v.min(cap) - len / v).sum::<f64>();
+        }
+        let fan = layer_fan(f, time, self.fan_ramp);
+        for op in self.ops.get_mut(from..).into_iter().flatten() {
+            match op {
+                Op::Move { feed, kind: MoveKind::Extrude(role), .. } if adjustable(*role, *feed) => {
+                    *feed = feed.min(cap);
+                }
+                Op::Fan(speed, Fan::Layer) => *speed = fan,
+                Op::Fan(speed, Fan::AtLeast) => *speed = speed.max(fan),
+                _ => {}
+            }
+        }
+        let fans = std::mem::take(&mut self.seg_fans);
+        for (sg, (asked, kind)) in self.preview.segments.get_mut(seg_start..).into_iter().flatten().zip(fans) {
+            let v = f64::from(sg.speed);
+            if adjustable(sg.role, v) && v > cap {
+                sg.flow *= (cap / v) as f32;
+                sg.speed = cap as f32;
+            }
+            sg.fan = match kind {
+                Fan::Layer => fan,
+                Fan::AtLeast => asked.max(fan),
+                Fan::Exact => asked,
+            } as f32;
+        }
+    }
+
+    /// A fixed fan speed, outside the layers' cooling (the end of the print).
+    fn set_fan(&mut self, fan: f64) {
+        self.out_fan = (fan, Fan::Exact);
+        self.ops.push(Op::Fan(fan, Fan::Exact));
     }
 
     fn pressure_advance(&mut self) {
@@ -1501,8 +1608,9 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         role: None,
         width: 0.0,
         extruder: cx.object_extruder.first().copied().unwrap_or(0).min(n_ext - 1),
-        fan: 0.0,
-        out_fan: 0.0,
+        out_fan: (0.0, Fan::Exact),
+        fan_ramp: 0.0,
+        seg_fans: Vec::new(),
         temp: 0.0,
         layer: 0,
         print_z: 0.0,
@@ -1522,7 +1630,6 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         seam_paint: (Vec::new(), Vec::new()),
         tower: None,
         spiral: None,
-        slow: 1.0,
         preview_tolerance: preview_tolerance(plans),
         region: None,
         pending_region: None,
@@ -1733,25 +1840,13 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
                 w.line(format!("M140 S{}", bed.round() as i64));
             }
         }
-        // Layer cooling: a quick layer prints slower so it has time to set.
+        // The layer's fan; its speed is settled with the layer's cooling, once it is written.
         let fil = w.filament().cloned();
-        let rough = rough_layer_time(plan);
-        w.slow = 1.0;
-        let mut fan = 0.0;
-        if let Some(f) = &fil
-            && li >= f.fan_off_layers
-        {
-            fan = f.fan_min;
-            if f.full_fan_layer > f.fan_off_layers && li < f.full_fan_layer {
-                let t = (li - f.fan_off_layers + 1) as f64 / (f.full_fan_layer - f.fan_off_layers + 1) as f64;
-                fan = f.fan_min * t;
-            }
-            if f.slow_down_layer_time > 0.0 && rough > 0.0 && rough < f.slow_down_layer_time {
-                w.slow = (rough / f.slow_down_layer_time).clamp(0.05, 1.0);
-                fan = f.fan_max;
-            }
-        }
-        w.set_fan(fan);
+        w.fan_ramp = fil.as_ref().map_or(0.0, |f| fan_ramp(f, li));
+        let cool_from = (w.ops.len(), w.pos);
+        w.seg_fans.clear();
+        w.out_fan = (0.0, Fan::Exact);
+        w.fan_for(0.0, Fan::Layer);
 
         // Pauses, colour changes and custom G-code asked for at this layer.
         for (_, ev) in cx.events.iter().filter(|(z, _)| (z - plan.print_z).abs() < plan.height * 0.5) {
@@ -1807,6 +1902,9 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         if w.tower.is_some() {
             w.tower_finish();
         }
+        if let Some(f) = &fil {
+            w.cool_layer(cool_from, f, seg_start);
+        }
         w.preview.layers.push(PreviewLayer {
             z: plan.print_z as f32,
             height: plan.height as f32,
@@ -1839,10 +1937,17 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
                 }
             }
             Op::Move { .. } | Op::FirmwareRetract { .. } => stats.travel_time += t,
+            // Custom G-code: the start and end sequences, layer change, filament change.
+            Op::Text(_) => {
+                if let Some(slot) = stats.time_by_role.get_mut(Role::Custom.index()) {
+                    *slot += t;
+                }
+            }
             _ => {}
         }
-        if let Some(slot) = layer.and_then(|i| layer_times.get_mut(i)) {
-            *slot += t;
+        match layer.and_then(|i| layer_times.get_mut(i)) {
+            Some(slot) => *slot += t,
+            None => stats.prepare_time += t,
         }
     }
     stats.total_time = times.iter().sum();
@@ -1866,7 +1971,7 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
     let _ = writeln!(
         header,
         "; model printing time: {}; total estimated time: {}",
-        hms(stats.total_time - stats.travel_time),
+        hms(stats.total_time - stats.prepare_time),
         hms(stats.total_time)
     );
     let _ = writeln!(header, "; estimated printing time (normal mode) = {}", hms(stats.total_time));
@@ -1892,45 +1997,81 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
 
 /// The program's moves as motion blocks, and each op's time. The blocks go to the planner as
 /// they are made and the times come back in the same order, so no copy of the program is held.
+/// Custom G-code text is timed too, line by line (its moves, waits and acceleration changes).
 fn time_ops(ops: &[Op], s: &Settings) -> Vec<f64> {
     let m = &s.motion;
-    let mut pos = DVec3::ZERO;
-    let mut accel = 0.0;
-    let mut jerk = 0.0;
-    let blocks = ops.iter().filter_map(|op| match op {
-        Op::Accel(a) => {
-            accel = *a;
-            None
-        }
-        Op::Jerk(j) => {
-            jerk = *j;
-            None
-        }
-        Op::Move { to, e, feed, kind, arc, xy } => {
-            // Before the head's position is known, count only Z and E.
-            let d = if *xy { *to - pos } else { DVec3::new(0.0, 0.0, to.z - pos.z) };
-            let length = arc.map(|(c, ccw)| arcs::arc_length(pos.truncate(), to.truncate(), c, ccw));
-            let bk = match kind {
-                MoveKind::Extrude(_) => BlockKind::Extrude,
-                MoveKind::Retract => BlockKind::Retract,
-                MoveKind::Travel | MoveKind::Wipe => BlockKind::Travel,
-            };
-            pos = *to;
-            Some(Block { delta: [d.x, d.y, d.z, *e], length, feed: *feed, accel, kind: bk, jerk })
-        }
-        Op::FirmwareRetract { retract, length, feed } => {
-            let e = if *retract { -length } else { *length };
-            Some(Block { delta: [0.0, 0.0, 0.0, e], length: None, feed: *feed, accel, kind: BlockKind::Retract, jerk })
-        }
-        _ => None,
+    let machine = std::cell::Cell::new(Machine::default());
+    // The op each block came from.
+    let owner: std::cell::RefCell<Vec<u32>> = std::cell::RefCell::new(Vec::with_capacity(ops.len()));
+    let mine = |i: usize, b: Block| {
+        owner.borrow_mut().push(i as u32);
+        b
+    };
+    let blocks = ops.iter().enumerate().flat_map(|(i, op)| {
+        let mut st = machine.get();
+        let (one, text) = match op {
+            Op::Accel(a) => {
+                st.accel = *a;
+                (None, "")
+            }
+            Op::Jerk(j) => {
+                st.jerk = *j;
+                (None, "")
+            }
+            Op::Move { to, e, feed, kind, arc, xy } => {
+                // Before the head's position is known, count only Z and E.
+                let d = if *xy { *to - st.pos } else { DVec3::new(0.0, 0.0, to.z - st.pos.z) };
+                let length = arc.map(|(c, ccw)| arcs::arc_length(st.pos.truncate(), to.truncate(), c, ccw));
+                let bk = match kind {
+                    MoveKind::Extrude(_) => BlockKind::Extrude,
+                    MoveKind::Retract => BlockKind::Retract,
+                    MoveKind::Travel | MoveKind::Wipe => BlockKind::Travel,
+                };
+                st.pos = *to;
+                let b = Block {
+                    delta: [d.x, d.y, d.z, *e],
+                    length,
+                    feed: *feed,
+                    accel: st.accel,
+                    kind: bk,
+                    jerk: st.jerk,
+                    dwell: 0.0,
+                };
+                (Some(b), "")
+            }
+            Op::FirmwareRetract { retract, length, feed } => {
+                let e = if *retract { -length } else { *length };
+                let b = Block {
+                    delta: [0.0, 0.0, 0.0, e],
+                    length: None,
+                    feed: *feed,
+                    accel: st.accel,
+                    kind: BlockKind::Retract,
+                    jerk: st.jerk,
+                    dwell: 0.0,
+                };
+                (Some(b), "")
+            }
+            Op::Text(t) => (None, t.as_str()),
+            _ => (None, ""),
+        };
+        machine.set(st);
+        let from_text = text.lines().filter_map(|l| {
+            let mut st = machine.get();
+            let b = st.line(l);
+            machine.set(st);
+            b
+        });
+        one.into_iter().chain(from_text).map(move |b| mine(i, b))
     });
-    let mut t = motion::plan(blocks, &m.limits, m.flavor).into_iter();
-    ops.iter()
-        .map(|op| match op {
-            Op::Move { .. } | Op::FirmwareRetract { .. } => t.next().unwrap_or(0.0),
-            _ => 0.0,
-        })
-        .collect()
+    let times = motion::plan(blocks, &m.limits, m.flavor);
+    let mut out = vec![0.0; ops.len()];
+    for (i, t) in owner.borrow().iter().zip(times) {
+        if let Some(slot) = out.get_mut(*i as usize) {
+            *slot += t;
+        }
+    }
+    out
 }
 
 /// The program as G-code text, with M73 progress at each layer.
@@ -1941,6 +2082,7 @@ fn render_ops(out: &mut String, ops: &[Op], times: &[f64], total: f64, s: &Setti
     let mut feed = -1.0;
     let mut e_abs = 0.0;
     let mut elapsed = 0.0;
+    let mut last_fan: Option<String> = None;
     let line = |out: &mut String, s: &str| {
         out.push_str(s);
         out.push('\n');
@@ -1948,7 +2090,18 @@ fn render_ops(out: &mut String, ops: &[Op], times: &[f64], total: f64, s: &Setti
     line(out, &format!("M73 P0 R{}", (total / 60.0).round() as i64));
     for (op, t) in ops.iter().zip(times) {
         match op {
-            Op::Text(text) => line(out, text),
+            Op::Text(text) => {
+                line(out, text);
+                // Custom G-code may have set the fan itself.
+                last_fan = None;
+            }
+            Op::Fan(f, _) => {
+                let command = fan_command(*f);
+                if last_fan.as_deref() != Some(command.as_str()) {
+                    line(out, &command);
+                    last_fan = Some(command);
+                }
+            }
             Op::Layer(_) => {
                 let p = if total > 0.0 { (elapsed / total * 100.0).floor() as i64 } else { 0 };
                 let r = ((total - elapsed).max(0.0) / 60.0).round() as i64;
@@ -2043,12 +2196,51 @@ fn path_points(plans: &[LayerPlan]) -> usize {
         .sum()
 }
 
-/// Printing time of a layer before cooling, from its path lengths and speeds.
-fn rough_layer_time(plan: &LayerPlan) -> f64 {
-    let all = plan.skirt.iter().chain(&plan.support).chain(
-        plan.objects.iter().flat_map(|(_, isl)| isl.iter().flat_map(|i| i.walls.iter().flatten().chain(&i.fills))),
-    );
-    all.map(|p| p.length() / p.speed.max(1.0)).sum()
+/// OrcaSlicer's fan ramp over the first layers: 0 while the fan is off, then up to 1 at
+/// `full_fan_speed_layer`.
+fn fan_ramp(f: &Filament, li: usize) -> f64 {
+    if li < f.fan_off_layers {
+        return 0.0;
+    }
+    if li + 1 < f.full_fan_layer {
+        return (li + 1 - f.fan_off_layers) as f64 / (f.full_fan_layer - f.fan_off_layers) as f64;
+    }
+    1.0
+}
+
+/// The layer's fan from its time after cooling (OrcaSlicer's): full below the slow-down time,
+/// from full to the minimum up to the fan cooling time, then the minimum (or off, unless the
+/// filament keeps it running), all on the ramp over the first layers.
+fn layer_fan(f: &Filament, layer_time: f64, ramp: f64) -> f64 {
+    if ramp <= 0.0 {
+        return 0.0;
+    }
+    let fan = if layer_time < f.slow_down_layer_time {
+        f.fan_max
+    } else if layer_time < f.fan_cooling_layer_time {
+        let t = (layer_time - f.slow_down_layer_time) / (f.fan_cooling_layer_time - f.slow_down_layer_time);
+        (t * f.fan_min + (1.0 - t) * f.fan_max + 0.5).floor()
+    } else if f.keep_fan_on {
+        f.fan_min
+    } else {
+        0.0
+    };
+    if ramp < 1.0 { (fan * ramp + 0.5).floor() } else { fan }
+}
+
+/// The feed cap that makes moves of (length, feed) take `extra` seconds longer, no feed going
+/// below `min`; `None` when even `min` is not slow enough.
+fn slow_down_cap(moves: &[(f64, f64)], extra: f64, min: f64) -> Option<f64> {
+    let added = |cap: f64| -> f64 { moves.iter().map(|(len, f)| len / f.min(cap) - len / f).sum() };
+    if added(min) < extra {
+        return None;
+    }
+    let (mut lo, mut hi) = (min, moves.iter().map(|m| m.1).fold(min, f64::max));
+    for _ in 0..60 {
+        let mid = (lo + hi) / 2.0;
+        if added(mid) > extra { lo = mid } else { hi = mid }
+    }
+    Some(lo)
 }
 
 #[cfg(test)]

@@ -66,7 +66,12 @@ OrcaSlicer's crashes are the reason this exists.
   travel, cooling, G-code, estimates, Preview moves). `geom` wraps i_overlay under
   `catch_unwind`; `settings` clamps every value it reads. `slice()` never panics.
   `SLICE_FILE=x.stl cargo test --release -p CosmicSlicer-engine slice_a_file -- --nocapture`
-  times a real model.
+  times a real model. `tools/parity.sh <dir> [x1c mk4 voron]` slices a reference set with
+  OrcaSlicer's command line (presets flattened by `tools/parity_flatten.py`, since Orca's CLI
+  ignores `inherits`) and with ours using the settings Orca wrote into its G-code, then
+  `parity_tests` compares them (time, filament, features, retractions, toolpath maps and
+  layer pictures in `<dir>/<model>@<set>/`). Orca's behaviour is the reference: when they
+  differ, read Orca's source for the rule rather than guessing.
 - `crates/ui-egui` — the UI. `project.rs` maps the session to and from 3MF projects (presets by name, edits kept);
   `slicer.rs` runs the engine on a thread (results checked against a
   settings fingerprint and the model revision); `preview.rs` colours toolpaths. `state.rs` is the session (all edits go through its methods, which

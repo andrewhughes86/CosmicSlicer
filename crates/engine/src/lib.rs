@@ -459,11 +459,12 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
                 settings: os,
                 height: *h,
                 ears: &o.brim_ears,
+                material: filaments.get(o.extruder).map_or("PLA", |f| f.kind.as_str()),
             })
             .collect();
         skirt::brims(&objects)
     } else {
-        skirt::brim(&footprint, &s, top)
+        skirt::brim(&footprint, &s, top, filaments.first().map_or("PLA", |f| f.kind.as_str()))
     };
     let skirt_around = geom::boolean(&footprint, &brim_area, Op::Union);
     let skirt_around =
@@ -534,6 +535,7 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
                         settings: os,
                         height: heights_of.get(o).copied().unwrap_or(0.0),
                         ears: &o_job.brim_ears,
+                        material: filaments.get(o_job.extruder).map_or("PLA", |f| f.kind.as_str()),
                     };
                     ring.extend(skirt::brims(&[one]).0);
                 }
@@ -989,6 +991,8 @@ mod budget_tests;
 #[cfg(test)]
 mod fuzz_tests;
 #[cfg(test)]
+mod parity_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
     use CosmicSlicer_model::primitives;
@@ -1152,6 +1156,7 @@ mod tests {
         assert!(out.gcode.lines().filter(|l| l.starts_with("M900 K")).count() >= 17 * 4);
     }
 
+    #[track_caller]
     fn sliced(j: &Job) -> Option<Sliced> {
         let out = slice(j, &Progress::default());
         assert!(out.is_ok(), "{:?}", out.as_ref().err());
@@ -1714,6 +1719,8 @@ mod tests {
             j.process.set("wipe_speed", "50%");
             j.process.set("role_based_wipe_speed", role_based);
             j.process.set("wipe_on_loops", "1");
+            // All of it while wiping (as far as the retraction speed allows).
+            j.process.set("retract_before_wipe", "0%");
             let out = slice(&j, &Progress::default());
             assert!(out.is_ok(), "{:?}", out.as_ref().err());
             let gcode = out.map(|o| o.gcode).unwrap_or_default();

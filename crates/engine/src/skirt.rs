@@ -6,19 +6,69 @@ use crate::geom::{self, Join, Op, Shape};
 use crate::settings::Settings;
 use crate::toolpath::{Path, Role};
 
-/// Brim width for "auto": tall, thin parts get one, squat ones none (OrcaSlicer's rule of thumb
-/// on height against footprint).
-fn auto_brim_width(footprint: &[Shape], height: f64, nozzle: f64) -> f64 {
-    let Some((lo, hi)) = geom::bounds(footprint) else { return 0.0 };
-    let short_side = (hi - lo).min_element().max(1.0e-3);
-    let ratio = height / short_side;
-    if ratio > 3.0 {
-        (ratio * nozzle * 4.0).clamp(3.0, 10.0)
-    } else if geom::area(footprint) < 100.0 {
-        3.0
-    } else {
-        0.0
+/// OrcaSlicer's bed adhesion coefficient and "thermal length" (mm) of a filament type: how
+/// well it holds to the plate and how far it can run before it warps.
+fn material(kind: &str) -> (f64, f64) {
+    let k = kind.trim().to_ascii_uppercase();
+    match k.as_str() {
+        "TPU" | "FLEX" => (0.5, 1000.0),
+        "PETG" | "PET" | "PET-CF" | "PET-GF" => (2.0, 100.0),
+        "PCTG" => (2.0, 200.0),
+        "PETG-CF" | "PETG-GF" => (1.0, 100.0),
+        "PC" | "PC-PBT" => (1.0, 40.0),
+        "PC-ABS" | "PC-CF" => (1.0, 80.0),
+        _ if k.starts_with("ABS") || k.starts_with("ASA") || (k.starts_with("PA") && !k.starts_with("PAHT")) => {
+            (1.0, 100.0)
+        }
+        _ => (1.0, 200.0),
     }
+}
+
+/// Second moments of area of `shapes` about their joint centroid (∫y² dA, ∫x² dA), and their
+/// area: how hard the footprint is to tip over in each direction.
+fn second_moments(shapes: &[Shape]) -> Option<(f64, f64)> {
+    // Per contour: area, first moments and second moments about the origin.
+    let (mut a, mut mx, mut my, mut ixx, mut iyy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for c in shapes.iter().flatten() {
+        let n = c.len();
+        for i in 0..n {
+            let (Some(p), Some(q)) = (c.get(i), c.get((i + 1) % n)) else { continue };
+            let cross = p.x * q.y - q.x * p.y;
+            a += cross / 2.0;
+            mx += (p.x + q.x) * cross / 6.0;
+            my += (p.y + q.y) * cross / 6.0;
+            ixx += (p.y * p.y + p.y * q.y + q.y * q.y) * cross / 12.0;
+            iyy += (p.x * p.x + p.x * q.x + q.x * q.x) * cross / 12.0;
+        }
+    }
+    if a.abs() < 1e-9 {
+        return None;
+    }
+    let (cx, cy) = (mx / a, my / a);
+    Some(((ixx - cy * cy * a).abs(), (iyy - cx * cx * a).abs()))
+}
+
+/// Brim width for "auto" (OrcaSlicer's): from how tall the part is against how wide its
+/// footprint is in its weakest direction, how fast it prints and how well the filament holds;
+/// none under 5 mm, at most 18 mm, in whole pairs of brim lines.
+fn auto_brim_width(footprint: &[Shape], height: f64, max_speed: f64, material_kind: &str, spacing: f64) -> f64 {
+    let Some((lo, hi)) = geom::bounds(footprint) else { return 0.0 };
+    let Some((ixx, iyy)) = second_moments(footprint) else { return 0.0 };
+    let (adhesion, reference) = material(material_kind);
+    let size = hi - lo;
+    let thermal = size.length();
+    let height_to_area = (height / ixx.max(1e-9) * size.y).max(height / iyy.max(1e-9) * size.x) * height / 1920.0;
+    let by_height = thermal * 8.0 / reference * height.min(30.0) / 30.0;
+    let mut w = adhesion * (height_to_area * max_speed).max(by_height).min(18.0).min(1.5 * thermal);
+    if w < 5.0 && w < 1.5 * thermal {
+        w = 0.0;
+    }
+    pairs(w.min(18.0), spacing)
+}
+
+/// `w` rounded down to whole pairs of lines `spacing` apart.
+fn pairs(w: f64, spacing: f64) -> f64 {
+    if spacing > 0.0 { (w / spacing / 2.0).floor() * spacing * 2.0 } else { w }
 }
 
 /// One object's first layer and settings, for its brim.
@@ -29,6 +79,8 @@ pub struct BrimObject<'a> {
     pub height: f64,
     /// Brim ears placed by hand (centre, radius), for the "Painted" brim type.
     pub ears: &'a [(DVec2, f64)],
+    /// The first layer's filament type ("PLA", "PETG", …), for the auto brim.
+    pub material: &'a str,
 }
 
 /// Every object's brim, each by its own settings and kept off the other objects, and the area
@@ -40,7 +92,7 @@ pub fn brims(objects: &[BrimObject]) -> (Vec<Path>, Vec<Shape>) {
         let (mut p, area) = if o.settings.brim_type == "painted" {
             painted_brim(o.footprint, o.settings, o.ears)
         } else {
-            brim(o.footprint, o.settings, o.height)
+            brim(o.footprint, o.settings, o.height, o.material)
         };
         if p.is_empty() {
             continue;
@@ -90,18 +142,14 @@ fn keep_off(paths: Vec<Path>, others: &[Shape]) -> Vec<Path> {
 
 /// The brim loops around `footprint` (one object's first layer), outermost last, and the area
 /// the brim covers.
-pub fn brim(footprint: &[Shape], s: &Settings, object_height: f64) -> (Vec<Path>, Vec<Shape>) {
+pub fn brim(footprint: &[Shape], s: &Settings, object_height: f64, material: &str) -> (Vec<Path>, Vec<Shape>) {
     let w = s.widths.first_layer;
     let kind = s.brim_type.as_str();
+    if kind == "auto_brim" {
+        return auto_brim(footprint, s, object_height, material);
+    }
     let width = match kind {
         "no_brim" | "painted" => 0.0,
-        "auto_brim" => {
-            if s.brim_width > 0.0 {
-                s.brim_width
-            } else {
-                auto_brim_width(footprint, object_height, s.nozzle)
-            }
-        }
         "brim_ears" if s.brim_width <= 0.0 => 3.0,
         _ => s.brim_width,
     };
@@ -163,6 +211,51 @@ pub fn brim(footprint: &[Shape], s: &Settings, object_height: f64) -> (Vec<Path>
             &geom::offset(&holes, -(s.brim_gap + loops as f64 * spacing), Join::Round),
             Op::Difference,
         ));
+    }
+    (paths, covered)
+}
+
+/// The auto brim (OrcaSlicer's): one width for the object, then for each island of its first
+/// layer some more when it is small and tall, and never more than the island is across.
+fn auto_brim(footprint: &[Shape], s: &Settings, height: f64, material: &str) -> (Vec<Path>, Vec<Shape>) {
+    let spacing = Settings::spacing(s.widths.first_layer, s.first_layer_height);
+    let max_speed = [s.speeds.inner, s.speeds.outer, s.speeds.sparse, s.speeds.solid, s.speeds.top, s.speeds.support]
+        .into_iter()
+        .fold(0.0, f64::max);
+    let max_speed = if max_speed > 0.0 { max_speed } else { 250.0 };
+    let width = auto_brim_width(footprint, height, max_speed, material, spacing);
+    let extra = pairs(5.0, spacing);
+    let mut by_width: Vec<(f64, Vec<Shape>)> = Vec::new();
+    for sh in footprint {
+        let Some(outer) = sh.first() else { continue };
+        let mut w = width;
+        // A narrow island on a tall part gets some brim even when the part as a whole gets none.
+        let perimeter = geom::length(outer) + outer.first().zip(outer.last()).map_or(0.0, |(a, b)| a.distance(*b));
+        let thin = perimeter > 0.0 && geom::area(std::slice::from_ref(sh)) / perimeter < 1.1;
+        if w < 5.0 && height > 10.0 && thin && w < spacing {
+            w += extra;
+        }
+        if let Some((lo, hi)) = geom::bounds(std::slice::from_ref(sh)) {
+            w = w.min((hi - lo).max_element());
+        }
+        let w = pairs(w, spacing);
+        if w <= 0.0 {
+            continue;
+        }
+        match by_width.iter_mut().find(|(bw, _)| (bw - w).abs() < 1e-9) {
+            Some((_, group)) => group.push(sh.clone()),
+            None => by_width.push((w, vec![sh.clone()])),
+        }
+    }
+    let mut paths = Vec::new();
+    let mut covered = Vec::new();
+    for (w, group) in by_width {
+        let mut one = s.clone();
+        one.brim_type = "outer_only".into();
+        one.brim_width = w;
+        let (p, c) = brim(&group, &one, height, material);
+        paths.extend(p);
+        covered.extend(c);
     }
     (paths, covered)
 }
@@ -303,7 +396,7 @@ mod tests {
     fn mouse_ears_sit_on_sharp_corners_only() {
         let s = settings(&[("brim_type", "brim_ears"), ("brim_width", "4")]);
         let square = geom::rectangle(DVec2::ZERO, DVec2::splat(20.0));
-        let (paths, area) = brim(&[square], &s, 10.0);
+        let (paths, area) = brim(&[square], &s, 10.0, "PLA");
         assert!(!paths.is_empty());
         // Four discs of 4 mm, three quarters of each outside the square.
         let a = geom::area(&area);
@@ -315,7 +408,28 @@ mod tests {
                 DVec2::new(t.cos(), t.sin()) * 10.0
             })
             .collect();
-        assert!(brim(&[vec![round]], &s, 10.0).0.is_empty());
+        assert!(brim(&[vec![round]], &s, 10.0, "PLA").0.is_empty());
+    }
+
+    #[test]
+    fn auto_brims_go_to_tall_narrow_parts_only() {
+        // OrcaSlicer's formula: a 20 mm cube needs none; a 5 mm post 60 tall gets one, but
+        // never wider than the post itself, in whole pairs of lines.
+        let s = settings(&[("brim_type", "auto_brim"), ("brim_width", "5")]);
+        let cube = geom::rectangle(DVec2::ZERO, DVec2::splat(20.0));
+        assert!(brim(&[cube], &s, 20.0, "PLA").0.is_empty());
+        let post = geom::rectangle(DVec2::ZERO, DVec2::splat(5.0));
+        let (paths, area) = brim(std::slice::from_ref(&post), &s, 60.0, "PLA");
+        assert!(!paths.is_empty());
+        let (lo, hi) = geom::bounds(&area).unwrap_or_default();
+        let width = (hi - lo).x / 2.0 - 2.5;
+        assert!(width > 3.0 && width <= 5.0 + s.brim_gap + 1e-6, "{width}");
+        let spacing = Settings::spacing(s.widths.first_layer, s.first_layer_height);
+        assert_eq!(paths.len() % 2, 0, "{} loops at {spacing}", paths.len());
+        // A short wide part in PLA: none; the same in TPU (half the adhesion): none either.
+        let slab = geom::rectangle(DVec2::ZERO, DVec2::new(100.0, 10.0));
+        assert!(brim(std::slice::from_ref(&slab), &s, 5.0, "PLA").0.is_empty());
+        assert!(brim(&[slab], &s, 5.0, "TPU").0.is_empty());
     }
 
     #[test]
@@ -326,7 +440,7 @@ mod tests {
         ring.push(hole);
         let inside = |kind: &str| {
             let s = settings(&[("brim_type", kind), ("brim_width", "3")]);
-            let (paths, _) = brim(&[ring.clone()], &s, 10.0);
+            let (paths, _) = brim(&[ring.clone()], &s, 10.0, "PLA");
             let pts: Vec<DVec2> = paths.iter().flat_map(|p| p.points.clone()).collect();
             let within =
                 pts.iter().filter(|p| p.cmpgt(DVec2::splat(10.0)).all() && p.cmplt(DVec2::splat(20.0)).all()).count();

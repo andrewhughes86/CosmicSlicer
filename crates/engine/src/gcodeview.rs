@@ -5,6 +5,8 @@
 
 use glam::{DVec2, DVec3};
 
+use CosmicSlicer_config::{Config, Schema};
+
 use crate::gcode::{Preview, PreviewLayer, Segment, Stats};
 use crate::motion::{self, Block, BlockKind};
 use crate::settings::{Filament, Settings, bead_area};
@@ -102,6 +104,8 @@ pub fn read(text: &str, s: &Settings, fil: &[Filament]) -> Viewed {
     let mut marked = false;
     let mut new_layer = false;
     let mut marked_z: Option<f64> = None;
+    // Blocks before the first layer mark: the start G-code.
+    let mut prepare_blocks: Option<usize> = None;
     let mut layer_extruded = false;
     let close_layer = |layers: &mut Vec<PreviewLayer>,
                        preview: &Preview,
@@ -136,11 +140,14 @@ pub fn read(text: &str, s: &Settings, fil: &[Filament]) -> Viewed {
                 role = role_of(t);
             } else if let Some(w) = comment.strip_prefix("WIDTH:") {
                 width = w.trim().parse::<f64>().ok().filter(|v| *v > 0.0 && *v < 10.0);
-            } else if comment == "LAYER_CHANGE" {
+            } else if comment == "LAYER_CHANGE" || comment == "CHANGE_LAYER" {
+                // PrusaSlicer's and OrcaSlicer's mark, and Bambu Studio's (also Orca's for
+                // Bambu printers).
                 marked = true;
                 new_layer = true;
                 marked_z = None;
-            } else if let Some(z) = comment.strip_prefix("Z:") {
+                prepare_blocks.get_or_insert(blocks.len());
+            } else if let Some(z) = comment.strip_prefix("Z:").or_else(|| comment.strip_prefix("Z_HEIGHT:")) {
                 marked_z = z.trim().parse::<f64>().ok().filter(|v| v.is_finite());
             } else if let Some(h) = comment.strip_prefix("HEIGHT:") {
                 height = h.trim().parse::<f64>().ok().filter(|v| *v > 0.0 && *v < 10.0);
@@ -184,6 +191,12 @@ pub fn read(text: &str, s: &Settings, fil: &[Filament]) -> Viewed {
                 }
                 if let Some(j) = param(&upper, "SQUARE_CORNER_VELOCITY") {
                     jerk = j;
+                }
+            }
+            "G4" | "M400" => {
+                if let Some(t) = dwell(cmd, &upper) {
+                    blocks.push(Block::wait(t));
+                    owners.push((None, layers.len()));
                 }
             }
             c if c.starts_with('T') && c[1..].parse::<usize>().is_ok() => {
@@ -308,6 +321,7 @@ pub fn read(text: &str, s: &Settings, fil: &[Filament]) -> Viewed {
                     accel,
                     kind,
                     jerk,
+                    dwell: 0.0,
                 });
                 owners.push((extruding.then_some(role), layers.len()));
                 pos = to;
@@ -336,6 +350,7 @@ pub fn read(text: &str, s: &Settings, fil: &[Filament]) -> Viewed {
         }
     }
     stats.total_time = times.iter().sum();
+    stats.prepare_time = prepare_blocks.map_or(0.0, |n| times.iter().take(n).sum());
     stats.layers = layers.len();
     for (i, f) in fil.iter().enumerate() {
         let v = stats.volume_mm3.get(i).copied().unwrap_or(0.0);
@@ -351,10 +366,215 @@ pub fn read(text: &str, s: &Settings, fil: &[Filament]) -> Viewed {
     Viewed { preview, stats, warnings }
 }
 
+/// Seconds a `G4` (P milliseconds or S seconds) or Bambu Lab's `M400 S…`/`M400 P…` waits.
+fn dwell(cmd: &str, upper: &str) -> Option<f64> {
+    let t = word(upper, 'S').or_else(|| word(upper, 'P').map(|ms| ms / 1000.0))?;
+    (cmd == "G4" || cmd == "M400").then_some(t).filter(|t| *t > 0.0)
+}
+
+/// The motion state of a printer running G-code text, for timing the custom G-code (start,
+/// end, layer change) inside our own program: modes, position, feed, acceleration.
+#[derive(Clone, Copy, Debug)]
+pub struct Machine {
+    /// Where the head is, from the origin at the start (as this reader and OrcaSlicer assume).
+    pub pos: DVec3,
+    pub accel: f64,
+    pub jerk: f64,
+    abs_xyz: bool,
+    abs_e: bool,
+    e: f64,
+    feed: f64,
+}
+
+impl Default for Machine {
+    fn default() -> Self {
+        Machine { pos: DVec3::ZERO, accel: 0.0, jerk: 0.0, abs_xyz: true, abs_e: false, e: 0.0, feed: 30.0 }
+    }
+}
+
+impl Machine {
+    /// The block one line of G-code makes, if it moves or waits; modes, feed and acceleration
+    /// are kept for the lines after.
+    pub fn line(&mut self, raw: &str) -> Option<Block> {
+        let code = raw.split(';').next().unwrap_or("").trim();
+        if code.is_empty() {
+            return None;
+        }
+        let upper = code.to_ascii_uppercase();
+        let cmd = upper.split_whitespace().next().unwrap_or("");
+        match cmd {
+            "G90" => self.abs_xyz = true,
+            "G91" => self.abs_xyz = false,
+            "M82" => self.abs_e = true,
+            "M83" => self.abs_e = false,
+            "G92" => {
+                if let Some(v) = word(&upper, 'E') {
+                    self.e = v;
+                }
+            }
+            "M204" => {
+                if let Some(a) = word(&upper, 'S').or_else(|| word(&upper, 'P')) {
+                    self.accel = a;
+                }
+            }
+            "SET_VELOCITY_LIMIT" => {
+                if let Some(a) = param(&upper, "ACCEL") {
+                    self.accel = a;
+                }
+            }
+            "G4" | "M400" => return dwell(cmd, &upper).map(Block::wait),
+            "G0" | "G1" | "G2" | "G3" => {
+                if let Some(f) = word(&upper, 'F') {
+                    self.feed = (f / 60.0).max(0.1);
+                }
+                let get = |axis: char, cur: f64| match word(&upper, axis) {
+                    Some(v) if self.abs_xyz => v,
+                    Some(v) => cur + v,
+                    None => cur,
+                };
+                let to = DVec3::new(get('X', self.pos.x), get('Y', self.pos.y), get('Z', self.pos.z));
+                let de = match word(&upper, 'E') {
+                    Some(v) if self.abs_e => {
+                        let d = v - self.e;
+                        self.e = v;
+                        d
+                    }
+                    Some(v) => v,
+                    None => 0.0,
+                };
+                let d = to - self.pos;
+                let length = if cmd == "G0" || cmd == "G1" {
+                    None
+                } else {
+                    let c = self.pos.truncate()
+                        + DVec2::new(word(&upper, 'I').unwrap_or(0.0), word(&upper, 'J').unwrap_or(0.0));
+                    Some(crate::arcs::arc_length(self.pos.truncate(), to.truncate(), c, cmd == "G3"))
+                };
+                self.pos = to;
+                let xy = d.x.hypot(d.y);
+                let kind = if de > 1e-9 && xy > 1e-9 {
+                    BlockKind::Extrude
+                } else if xy < 1e-9 && d.z.abs() < 1e-9 {
+                    BlockKind::Retract
+                } else {
+                    BlockKind::Travel
+                };
+                return Some(Block {
+                    delta: [d.x, d.y, d.z, de],
+                    length,
+                    feed: self.feed,
+                    accel: self.accel,
+                    kind,
+                    jerk: self.jerk,
+                    dwell: 0.0,
+                });
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+/// The settings a slicer wrote into its G-code: OrcaSlicer's and Bambu Studio's
+/// `; CONFIG_BLOCK_START` block, or PrusaSlicer's `; prusaslicer_config = begin` one, as
+/// `; key = value` lines. Text options are unescaped (`\n`, quotes, `"a";"b"` lists joined with
+/// commas, as the profile library keeps them). Empty when the file has none.
+pub fn embedded_config(text: &str) -> Config {
+    let schema = Schema::get();
+    let mut config = Config::default();
+    let mut inside = false;
+    for line in text.lines().take(MAX_LINES) {
+        let line = line.trim_end_matches('\r');
+        if line.starts_with("; CONFIG_BLOCK_START") || line.starts_with("; prusaslicer_config = begin") {
+            inside = true;
+            continue;
+        }
+        if line.starts_with("; CONFIG_BLOCK_END") || line.starts_with("; prusaslicer_config = end") {
+            inside = false;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        let Some((key, value)) = line.strip_prefix("; ").and_then(|l| l.split_once(" = ")) else { continue };
+        let key = key.trim();
+        if key.is_empty() || config.values.len() >= MAX_CONFIG_KEYS {
+            continue;
+        }
+        let value = match schema.option(key) {
+            Some(def) if def.kind() == CosmicSlicer_config::OptionType::String => {
+                if def.is_vector() {
+                    split_strings(value).iter().map(|s| unescape(s)).collect::<Vec<_>>().join(",")
+                } else {
+                    unescape(value)
+                }
+            }
+            _ => value.to_owned(),
+        };
+        config.set(key, value);
+    }
+    config
+}
+
+const MAX_CONFIG_KEYS: usize = 10_000;
+
+/// A `"a";"b";c` list into its items, quotes kept (`unescape` removes them).
+fn split_strings(value: &str) -> Vec<&str> {
+    let (mut items, mut start, mut quoted, mut escaped) = (Vec::new(), 0, false, false);
+    for (i, c) in value.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => quoted = !quoted,
+            ';' if !quoted => {
+                items.push(value.get(start..i).unwrap_or(""));
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(value.get(start..).unwrap_or(""));
+    items
+}
+
+/// One C-style string: surrounding quotes dropped, `\n` a newline, `\x` the character x.
+fn unescape(value: &str) -> String {
+    let inner = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(value);
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use CosmicSlicer_config::{Config, Schema};
+
+    #[test]
+    fn reads_the_settings_written_into_the_file() {
+        let g = "G1 X1\n; CONFIG_BLOCK_START\n; layer_height = 0.2\n; machine_start_gcode = M17\\nG28 ; home\n\
+                 ; filament_end_gcode = \" \"\n; compatible_printers = \"A 0.4\";\"B \\\"x\\\"\";C\n\
+                 ; different_settings_to_system = ;;\n; CONFIG_BLOCK_END\n; layer_height = 9\n";
+        let c = embedded_config(g);
+        assert_eq!(c.values.get("layer_height").map(String::as_str), Some("0.2"));
+        assert_eq!(c.values.get("machine_start_gcode").map(String::as_str), Some("M17\nG28 ; home"));
+        assert_eq!(c.values.get("filament_end_gcode").map(String::as_str), Some(" "));
+        assert_eq!(c.values.get("compatible_printers").map(String::as_str), Some("A 0.4,B \"x\",C"));
+        assert_eq!(c.values.get("different_settings_to_system").map(String::as_str), Some(",,"));
+        assert!(embedded_config("G1 X1\n; layer_height = 0.2\n").values.is_empty());
+    }
 
     #[test]
     fn reads_moves_layers_and_features() {

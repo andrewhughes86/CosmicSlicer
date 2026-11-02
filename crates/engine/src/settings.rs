@@ -626,8 +626,19 @@ pub struct Filament {
     pub overhang_fan_from: Option<u8>,
     /// Internal bridges' fan; `None` keeps the overhang fan.
     pub internal_bridge_fan: Option<f64>,
+    /// Whether short layers are slowed down to `slow_down_layer_time`.
+    pub slow_down: bool,
     pub slow_down_layer_time: f64,
     pub slow_down_min_speed: f64,
+    /// Up to this layer time the fan runs between its maximum and minimum speed.
+    pub fan_cooling_layer_time: f64,
+    /// The fan keeps its minimum speed on long layers (else it stops).
+    pub keep_fan_on: bool,
+    /// Layer cooling leaves outer walls at their speed.
+    pub keep_outer_wall_speed: bool,
+    /// Support interfaces' and ironing's own fan speeds.
+    pub support_interface_fan: Option<f64>,
+    pub ironing_fan: Option<f64>,
     pub max_volumetric: f64,
     pub kind: String,
     pub colour: String,
@@ -1214,7 +1225,19 @@ impl Filament {
                 let v = r.num("internal_bridge_fan_speed", -1.0);
                 (v >= 0.0).then(|| v.min(100.0))
             },
+            slow_down: r.flag("slow_down_for_layer_cooling"),
             slow_down_layer_time: r.range("slow_down_layer_time", 5.0, 0.0, 1000.0),
+            fan_cooling_layer_time: r.range("fan_cooling_layer_time", 60.0, 0.0, 10_000.0),
+            keep_fan_on: r.flag("reduce_fan_stop_start_freq"),
+            keep_outer_wall_speed: r.flag("dont_slow_down_outer_wall"),
+            support_interface_fan: {
+                let v = r.num("support_material_interface_fan_speed", -1.0);
+                (v >= 0.0).then(|| v.min(100.0))
+            },
+            ironing_fan: {
+                let v = r.num("ironing_fan_speed", -1.0);
+                (v >= 0.0).then(|| v.min(100.0))
+            },
             slow_down_min_speed: r.range("slow_down_min_speed", 10.0, 1.0, 1000.0),
             max_volumetric: {
                 let v = r.num("filament_max_volumetric_speed", 0.0);

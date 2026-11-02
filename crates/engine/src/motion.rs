@@ -28,7 +28,28 @@ pub struct Block {
     /// Corner speed the G-code set (jerk or Klipper's square corner velocity), mm/s; 0 for the
     /// machine's.
     pub jerk: f64,
+    /// Seconds the machine waits, stopped, before this block (G4); a block with no move is just
+    /// the wait.
+    pub dwell: f64,
 }
+
+impl Block {
+    /// Waiting `seconds`, stopped.
+    pub fn wait(seconds: f64) -> Block {
+        Block {
+            delta: [0.0; 4],
+            length: None,
+            feed: 1.0,
+            accel: 0.0,
+            kind: BlockKind::Travel,
+            jerk: 0.0,
+            dwell: seconds,
+        }
+    }
+}
+
+/// Longest wait one block can ask for (a day): more is damage.
+const MAX_DWELL: f64 = 86_400.0;
 
 /// Times (seconds) of each block. Takes the blocks as they come, so callers need not hold a
 /// copy of every move (millions on a tall print).
@@ -40,6 +61,7 @@ pub fn plan(blocks: impl IntoIterator<Item = Block>, limits: &Limits, flavor: Fl
         accel: f64,
         max_entry: f64,
         jerk: f64,
+        dwell: f64,
     }
     let blocks = blocks.into_iter();
     let mut ps: Vec<P> = Vec::with_capacity(blocks.size_hint().0);
@@ -47,8 +69,9 @@ pub fn plan(blocks: impl IntoIterator<Item = Block>, limits: &Limits, flavor: Fl
         let d = b.delta;
         let xyz = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
         let len = b.length.unwrap_or(if xyz > 1e-9 { xyz } else { d[3].abs() }).max(0.0);
+        let dwell = if b.dwell.is_finite() { b.dwell.clamp(0.0, MAX_DWELL) } else { 0.0 };
         if !(len.is_finite()) || len < 1e-9 {
-            ps.push(P { len: 0.0, dir: [0.0; 4], nominal: 0.0, accel: 1.0, max_entry: 0.0, jerk: b.jerk });
+            ps.push(P { len: 0.0, dir: [0.0; 4], nominal: 0.0, accel: 1.0, max_entry: 0.0, jerk: b.jerk, dwell });
             continue;
         }
         let dir = [d[0] / len, d[1] / len, d[2] / len, d[3] / len];
@@ -68,12 +91,16 @@ pub fn plan(blocks: impl IntoIterator<Item = Block>, limits: &Limits, flavor: Fl
                 a = a.min(max_a / share);
             }
         }
-        ps.push(P { len, dir, nominal: v, accel: a.max(1.0), max_entry: 0.0, jerk: b.jerk });
+        ps.push(P { len, dir, nominal: v, accel: a.max(1.0), max_entry: 0.0, jerk: b.jerk, dwell });
     }
     let n = ps.len();
     // Corner speeds between consecutive moves.
     let mut prev: Option<usize> = None;
     for i in 0..n {
+        // A wait stops the machine: no corner speed carries across it.
+        if ps[i].dwell > 0.0 {
+            prev = None;
+        }
         if ps[i].len == 0.0 {
             continue;
         }
@@ -93,15 +120,24 @@ pub fn plan(blocks: impl IntoIterator<Item = Block>, limits: &Limits, flavor: Fl
     let mut next_entry = 0.0;
     for i in (0..n).rev() {
         if ps[i].len == 0.0 {
+            if ps[i].dwell > 0.0 {
+                next_entry = 0.0;
+            }
             continue;
         }
         exit[i] = next_entry;
         entry[i] = entry[i].min((exit[i] * exit[i] + 2.0 * ps[i].accel * ps[i].len).sqrt());
-        next_entry = entry[i];
+        next_entry = if ps[i].dwell > 0.0 { 0.0 } else { entry[i] };
     }
     let mut prev_exit = 0.0;
     let mut last: Option<usize> = None;
     for i in 0..n {
+        if ps[i].dwell > 0.0 {
+            if let Some(j) = last {
+                exit[j] = 0.0;
+            }
+            last = None;
+        }
         if ps[i].len == 0.0 {
             continue;
         }
@@ -122,10 +158,11 @@ pub fn plan(blocks: impl IntoIterator<Item = Block>, limits: &Limits, flavor: Fl
         .map(|i| {
             let p = &ps[i];
             if p.len == 0.0 {
-                return 0.0;
+                return p.dwell;
             }
             // A move too long or fast for f64 (damaged input) counts as no time, not infinity.
-            Some(trapezoid(p.len, entry[i], exit[i], p.nominal, p.accel)).filter(|t| t.is_finite()).unwrap_or(0.0)
+            p.dwell
+                + Some(trapezoid(p.len, entry[i], exit[i], p.nominal, p.accel)).filter(|t| t.is_finite()).unwrap_or(0.0)
         })
         .collect()
 }
@@ -210,7 +247,7 @@ mod tests {
     }
 
     fn line(dx: f64, dy: f64, feed: f64, accel: f64) -> Block {
-        Block { delta: [dx, dy, 0.0, 0.0], length: None, feed, accel, kind: BlockKind::Extrude, jerk: 0.0 }
+        Block { delta: [dx, dy, 0.0, 0.0], length: None, feed, accel, kind: BlockKind::Extrude, jerk: 0.0, dwell: 0.0 }
     }
 
     #[test]
@@ -226,6 +263,21 @@ mod tests {
         let pieces: Vec<Block> = (0..10).map(|_| line(10.0, 0.0, 100.0, 1000.0)).collect();
         let total: f64 = plan(pieces.iter().copied(), &limits(), Flavor::Marlin).iter().sum();
         assert!((total - 1.1).abs() < 1e-6, "{total}");
+    }
+
+    #[test]
+    fn a_wait_stops_the_machine() {
+        // Two straight pieces with a 2 s wait between: the wait, and each piece starting and
+        // ending at rest.
+        let wait = Block { delta: [0.0; 4], dwell: 2.0, ..line(0.0, 0.0, 100.0, 1000.0) };
+        let t: f64 =
+            plan([line(50.0, 0.0, 100.0, 1000.0), wait, line(50.0, 0.0, 100.0, 1000.0)], &limits(), Flavor::Marlin)
+                .iter()
+                .sum();
+        let alone = plan([line(50.0, 0.0, 100.0, 1000.0)], &limits(), Flavor::Marlin)[0];
+        assert!((t - (2.0 + 2.0 * alone)).abs() < 1e-9, "{t} vs {alone}");
+        let hostile = Block { dwell: f64::INFINITY, ..wait };
+        assert_eq!(plan([hostile], &limits(), Flavor::Marlin)[0], 0.0);
     }
 
     #[test]
@@ -249,6 +301,7 @@ mod tests {
             accel: 1000.0,
             kind: BlockKind::Travel,
             jerk: 0.0,
+            dwell: 0.0,
         };
         let t = plan([z], &limits(), Flavor::Marlin)[0];
         // Capped at 20 mm/s by the Z axis: at least half a second.
@@ -260,14 +313,22 @@ mod tests {
             accel: 0.0,
             kind: BlockKind::Retract,
             jerk: 0.0,
+            dwell: 0.0,
         };
         assert!(plan([retract], &limits(), Flavor::Marlin)[0] > 0.8 / 40.0);
     }
 
     #[test]
     fn nothing_moves_in_no_time() {
-        let empty =
-            Block { delta: [0.0; 4], length: None, feed: 100.0, accel: 1000.0, kind: BlockKind::Travel, jerk: 0.0 };
+        let empty = Block {
+            delta: [0.0; 4],
+            length: None,
+            feed: 100.0,
+            accel: 1000.0,
+            kind: BlockKind::Travel,
+            jerk: 0.0,
+            dwell: 0.0,
+        };
         assert_eq!(plan([empty], &limits(), Flavor::Marlin), vec![0.0]);
         assert!(plan(std::iter::empty(), &limits(), Flavor::Marlin).is_empty());
         let bad = Block { delta: [f64::NAN, 0.0, 0.0, 0.0], ..empty };

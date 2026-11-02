@@ -69,8 +69,7 @@ fn classify(area: &[Shape], slices: &[Vec<Shape>], i: usize, s: &Settings, w: f6
         }
         all
     };
-    // Solid shells grow a little into the sparse area so they anchor on it.
-    let mut solid_all = geom::boolean(&geom::offset(&solid_all, w, Join::Miter), area, Op::Intersect);
+    let mut solid_all = regularize_shell(solid_all, area, slices, i, s, w);
     let mut sparse = geom::without_slivers(geom::boolean(area, &solid_all, Op::Difference), sliver);
     // "Filter out small internal areas": sparse bits too small to bother with print solid.
     if s.infill.min_sparse_area > 0.0 {
@@ -84,6 +83,80 @@ fn classify(area: &[Shape], slices: &[Vec<Shape>], i: usize, s: &Settings, w: f6
     let solid = geom::boolean(&geom::boolean(&solid_all, &top, Op::Difference), &bottom, Op::Difference);
     let solid = geom::without_slivers(solid, sliver);
     Regions { top, bottom, solid, sparse }
+}
+
+/// OrcaSlicer's clean-up of the solid shell on a layer ("ensure vertical shell thickness"):
+/// strips narrower than about two thirds of a line go, gaps under a line and a bit close, the
+/// shell overlaps the sparse infill by a fifth of a line, and pieces too small to print well
+/// go: under 1.5 mm² × the line spacing, or under 8 mm² × it where the layers above and below
+/// cover them anyway.
+fn regularize_shell(
+    shell: Vec<Shape>,
+    area: &[Shape],
+    slices: &[Vec<Shape>],
+    i: isize,
+    s: &Settings,
+    w: f64,
+) -> Vec<Shape> {
+    if shell.is_empty() {
+        return shell;
+    }
+    let spacing = Settings::spacing(w, s.layer_height) * 1.05;
+    let (narrow, gaps, overlap) = (0.5 * 0.65 * spacing, 0.5 * 1.2 * spacing, 0.2 * spacing);
+    let opened = geom::offset(&geom::offset(&shell, -narrow, Join::Miter), narrow + gaps, Join::Miter);
+    let regular = geom::offset(&opened, -(gaps - overlap), Join::Miter);
+    // What the layers below and above both cover.
+    let around = geom::boolean(&common(slices, i - 1, i), &common(slices, i + 1, i + 2), Op::Intersect);
+    let kept: Vec<Shape> = regular
+        .into_iter()
+        .filter(|p| {
+            let a = geom::shape_area(p);
+            let tiny = a < spacing * 1.5
+                || (a < spacing * 8.0
+                    && !around.is_empty()
+                    && geom::boolean(std::slice::from_ref(p), &around, Op::Difference).is_empty());
+            !tiny
+        })
+        .collect();
+    geom::boolean(&kept, area, Op::Intersect)
+}
+
+/// Which of a layer's solid infill bridges the sparse infill below (OrcaSlicer's "bridge over
+/// infill"), and the rest. Only what lies over open sparse infill counts: the sparse area below
+/// less three lines round its edge (strips along walls and next to solid infill are held up
+/// well enough). A solid piece partly held up bridges only when the open part is over three
+/// lines square; the bridge takes four lines round it, and leftover scraps of the piece.
+fn internal_bridges(solid: &[Shape], sparse_below: &[Shape], s: &Settings, h: f64) -> (Vec<Shape>, Vec<Shape>) {
+    let spacing = Settings::spacing(s.widths.solid, h);
+    let open = geom::offset(sparse_below, -3.0 * spacing, Join::Miter);
+    if open.is_empty() {
+        return (Vec::new(), solid.to_vec());
+    }
+    let mut bridged: Vec<Shape> = Vec::new();
+    for piece in solid {
+        let piece = std::slice::from_ref(piece);
+        let unsupported = geom::boolean(piece, &open, Op::Intersect);
+        let a = geom::area(&unsupported);
+        if a <= 0.0 {
+            continue;
+        }
+        let partly = a < geom::area(piece) - 1e-6;
+        if partly && a <= 9.0 * spacing * spacing {
+            continue;
+        }
+        let mut worth = geom::boolean(piece, &geom::offset(&unsupported, 4.0 * spacing, Join::Miter), Op::Intersect);
+        let left = geom::boolean(piece, &geom::offset(&worth, spacing, Join::Miter), Op::Difference);
+        worth.extend(left.into_iter().filter(|p| {
+            let a = geom::shape_area(p);
+            a > spacing * spacing && a < spacing * 12.0
+        }));
+        bridged.extend(geom::boolean(&geom::union(&worth), piece, Op::Intersect));
+    }
+    if bridged.is_empty() {
+        return (Vec::new(), solid.to_vec());
+    }
+    let rest = geom::without_slivers(geom::boolean(solid, &bridged, Op::Difference), spacing * spacing);
+    (bridged, rest)
 }
 
 /// Paths from fill lines; lines that must keep their order share a new group.
@@ -645,17 +718,7 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
     }
     // Solid infill over sparse infill bridges it: an internal bridge.
     let (internal, solid) = match at.sparse_below {
-        Some(sb) if !sb.is_empty() && !r.solid.is_empty() => {
-            let over = geom::without_slivers(geom::boolean(&r.solid, sb, Op::Intersect), solid_w * solid_w * 4.0);
-            if over.is_empty() {
-                (Vec::new(), r.solid.clone())
-            } else {
-                // Grown a little so the bridge lands on the solid round it.
-                let over = geom::boolean(&geom::offset(&over, solid_w, Join::Miter), &r.solid, Op::Intersect);
-                let rest = geom::without_slivers(geom::boolean(&r.solid, &over, Op::Difference), solid_w * solid_w);
-                (over, rest)
-            }
-        }
+        Some(sb) if !sb.is_empty() && !r.solid.is_empty() => internal_bridges(&r.solid, sb, s, h),
         _ => (Vec::new(), r.solid.clone()),
     };
     if !internal.is_empty() {
