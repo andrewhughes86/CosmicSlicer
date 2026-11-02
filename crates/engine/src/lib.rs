@@ -23,6 +23,7 @@ pub mod medial;
 pub mod motion;
 pub mod overhang;
 pub mod plan;
+pub mod segment;
 pub mod settings;
 pub mod skirt;
 pub mod slicing;
@@ -42,7 +43,7 @@ use glam::Mat4;
 use CosmicSlicer_config::{Config, Schema};
 use CosmicSlicer_model::Mesh;
 
-pub use gcode::{Preview, PreviewLayer, Segment, Stats};
+pub use gcode::{LayerEvent, Preview, PreviewLayer, Segment, Stats, auto_flush};
 pub use settings::{Filament, Settings};
 pub use toolpath::Role;
 
@@ -69,6 +70,8 @@ pub struct JobObject {
     pub seam_paint: Vec<(u32, SupportPaint)>,
     /// Painted fuzzy skin: triangles of `mesh`.
     pub fuzzy_paint: Vec<u32>,
+    /// Painted colours: triangles of `mesh` and their filament (1-based).
+    pub color_paint: Vec<(u32, u8)>,
     /// Brim ears placed by hand: centre on the plate (printer coordinates) and radius.
     pub brim_ears: Vec<(glam::DVec2, f64)>,
     /// More parts, modifiers and negative volumes, placed like `matrix`.
@@ -130,6 +133,8 @@ pub struct Job {
     pub bed_type_name: String,
     pub objects: Vec<JobObject>,
     pub plate_name: String,
+    /// Pauses, colour changes and custom G-code by print height (mm).
+    pub events: Vec<(f64, LayerEvent)>,
 }
 
 /// Shared with the UI while a slice runs: how far along, what stage, and a stop button.
@@ -333,7 +338,11 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
             let heights: Vec<f64> = layers.iter().map(|l| l.height).collect();
             overhang::make_printable(&mut slices, &heights, angle);
         }
-        let islands = plan::object(&slices, &layers, &os, &regions, &cancelled);
+        let islands = if o.color_paint.is_empty() {
+            plan::object(&slices, &layers, &os, &regions, &cancelled)
+        } else {
+            coloured(o, p, &slices, &layers, &os, &regions, filaments.len(), &cancelled)
+        };
         if cancelled() {
             return Err(SliceError::Cancelled);
         }
@@ -427,11 +436,45 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
                 skirt: skirt_for(k, r.height),
                 support: support::raft_paths(r, k, &s, raft_z),
                 objects: Vec::new(),
+                new_object: false,
             }
         })
         .collect();
     let below = plans.len();
-    plans.extend(layers.iter().enumerate().map(|(i, l)| {
+    // One object at a time: each object's layers, shortest object first.
+    let by_object = s.multi.by_object && job.objects.len() > 1 && plans.is_empty();
+    if by_object {
+        let mut order: Vec<usize> = (0..job.objects.len()).collect();
+        order.sort_by(|a, b| {
+            heights_of.get(*a).copied().unwrap_or(0.0).total_cmp(&heights_of.get(*b).copied().unwrap_or(0.0))
+        });
+        check_clearance(&order, &object_slices, &heights_of, &s, &mut warnings);
+        for (k, &o) in order.iter().enumerate() {
+            // Each object's own supports, round itself only.
+            let own = object_slices.get(o).map_or(&[][..], Vec::as_slice);
+            let input: Vec<support::Input<'_>> = inputs.get(o).copied().into_iter().collect();
+            let sl = support::generate(&input, own, &heights, &s, &cancelled);
+            let mut started = false;
+            for (i, l) in layers.iter().enumerate() {
+                let islands =
+                    object_plans.get_mut(o).and_then(|p| p.get_mut(i)).map(std::mem::take).unwrap_or_default();
+                let sup = support::paths(&sl, i, &s, i == 0, l.print_z);
+                if islands.is_empty() && sup.is_empty() {
+                    continue;
+                }
+                plans.push(LayerPlan {
+                    print_z: l.print_z,
+                    height: l.height,
+                    skirt: if k == 0 { skirt_for(i, l.height) } else { Vec::new() },
+                    support: sup,
+                    objects: vec![(o, islands)],
+                    new_object: k > 0 && !started,
+                });
+                started = true;
+            }
+        }
+    }
+    plans.extend(layers.iter().enumerate().filter(|_| !by_object).map(|(i, l)| {
         let g = below + i;
         let first = g == 0;
         LayerPlan {
@@ -445,6 +488,7 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
                 .filter_map(|(o, p)| p.get_mut(i).map(|isl| (o, std::mem::take(isl))))
                 .filter(|(_, isl)| !isl.is_empty())
                 .collect(),
+            new_object: false,
         }
     }));
     if cancelled() {
@@ -517,14 +561,36 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
         macros: &macros,
         plate_name: job.plate_name.clone(),
         thumbnails,
+        events: &job.events,
     };
     let out = gcode::emit(&plans, &cx);
     if let Some(e) = out.error {
         return Err(SliceError::Gcode(e));
     }
     warnings.extend(out.warnings);
-    if extruders.iter().any(|e| *e != extruders.first().copied().unwrap_or(0)) {
-        warnings.push("Several filaments print without a prime tower for now; expect some colour bleed.".into());
+    let several = extruders.iter().any(|e| *e != extruders.first().copied().unwrap_or(0))
+        || job.objects.iter().any(|o| !o.color_paint.is_empty());
+    if several && filaments.len() > 1 {
+        if !s.multi.tower {
+            warnings.push(
+                "Several filaments print without a prime tower; expect colours to bleed into one another.".into(),
+            );
+        } else {
+            // The tower must stand on the bed, clear of the objects.
+            let (x, y) = (s.multi.tower_at[0], s.multi.tower_at[1]);
+            let tower =
+                vec![geom::rectangle(glam::DVec2::new(x, y), glam::DVec2::new(x + s.multi.tower_width, y + 20.0))];
+            let on_bed = x >= lo[0] - 0.5 && y >= lo[1] - 0.5 && x + s.multi.tower_width <= lo[0] + size[0] + 0.5;
+            if !on_bed || y > lo[1] + size[1] {
+                warnings.push(
+                    "The prime tower stands partly off the bed; move it in the Process settings (Multimaterial)."
+                        .into(),
+                );
+            }
+            if !geom::boolean(&tower, &footprint, Op::Intersect).is_empty() {
+                warnings.push("The prime tower overlaps an object; move one of them.".into());
+            }
+        }
     }
     progress.set(1.0, "Slicing complete");
     Ok(Sliced { gcode: out.gcode, preview: out.preview, stats: out.stats, warnings, colours })
@@ -590,6 +656,135 @@ fn layer_regions(
             }
         })
         .collect()
+}
+
+/// Printing one object at a time: objects closer than the extruder clearance would be hit by
+/// the print head, and only the last may be taller than the head's clearance.
+fn check_clearance(
+    order: &[usize],
+    slices: &[Vec<Vec<Shape>>],
+    heights: &[f64],
+    s: &Settings,
+    warnings: &mut Vec<String>,
+) {
+    let footprint = |o: usize| -> Vec<Shape> {
+        let pts: Vec<glam::DVec2> =
+            slices.get(o).into_iter().flatten().flatten().filter_map(|sh| sh.first()).flatten().copied().collect();
+        let hull = geom::convex_hull(&pts);
+        if hull.len() < 3 {
+            Vec::new()
+        } else {
+            geom::offset(&[vec![hull]], s.multi.clearance_radius / 2.0, geom::Join::Round)
+        }
+    };
+    let zones: Vec<Vec<Shape>> = order.iter().map(|&o| footprint(o)).collect();
+    let mut close = false;
+    for (i, a) in zones.iter().enumerate() {
+        for b in zones.iter().skip(i + 1) {
+            if !a.is_empty() && !b.is_empty() && !geom::boolean(a, b, Op::Intersect).is_empty() {
+                close = true;
+            }
+        }
+    }
+    if close {
+        warnings.push(format!(
+            "Printing one object at a time, some objects are closer than the extruder clearance ({:.0} mm); the print head may hit them.",
+            s.multi.clearance_radius
+        ));
+    }
+    let tall = order
+        .iter()
+        .rev()
+        .skip(1)
+        .filter(|&&o| heights.get(o).copied().unwrap_or(0.0) > s.multi.clearance_height)
+        .count();
+    if tall > 0 {
+        warnings.push(format!(
+            "Printing one object at a time, only the last object may be taller than {:.0} mm (the extruder clearance height).",
+            s.multi.clearance_height
+        ));
+    }
+}
+
+/// An object with colour painted on it: each layer split among the painted filaments, each
+/// part planned on its own and its islands marked with its filament.
+#[allow(clippy::too_many_arguments)]
+fn coloured(
+    o: &JobObject,
+    placed: &Placed,
+    slices: &[Vec<Shape>],
+    layers: &[LayerZ],
+    s: &Settings,
+    regions: &[plan::LayerRegions],
+    filaments: usize,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Vec<Vec<toolpath::Island>> {
+    use rayon::prelude::*;
+    let mut by_filament: std::collections::BTreeMap<usize, Vec<u32>> = Default::default();
+    for (t, f) in &o.color_paint {
+        let f = usize::from(*f).saturating_sub(1);
+        // Colours past the project's filaments print in the object's own.
+        if f < filaments && f != o.extruder {
+            by_filament.entry(f).or_default().push(*t);
+        }
+    }
+    if by_filament.is_empty() {
+        return plan::object(slices, layers, s, regions, cancelled);
+    }
+    let bands: Vec<(usize, Vec<Vec<Shape>>)> = by_filament
+        .into_iter()
+        .map(|(f, tris)| {
+            let layers_of = slicing::painted(placed, &tris, layers, 0.6)
+                .into_iter()
+                .map(|l| if l.is_empty() { l } else { geom::offset(&l, 0.4, geom::Join::Round) })
+                .collect();
+            (f, layers_of)
+        })
+        .collect();
+    let step = s.widths.outer.max(0.3);
+    // Per layer: each colour's region, and what is left for the object's filament.
+    let split: Vec<Vec<(usize, Vec<Shape>)>> = (0..slices.len())
+        .into_par_iter()
+        .map(|i| {
+            if cancelled() {
+                return Vec::new();
+            }
+            let Some(slice) = slices.get(i) else { return Vec::new() };
+            let here: Vec<(usize, Vec<Shape>)> =
+                bands.iter().map(|(f, l)| (*f, l.get(i).cloned().unwrap_or_default())).collect();
+            segment::split(slice, &here, s.multi.segment_width, step)
+        })
+        .collect();
+    let mut pieces: Vec<(Option<usize>, Vec<Vec<Shape>>)> = Vec::new();
+    let rest: Vec<Vec<Shape>> = slices
+        .iter()
+        .zip(&split)
+        .map(|(slice, parts)| {
+            let painted: Vec<Shape> = parts.iter().flat_map(|(_, r)| r.iter().cloned()).collect();
+            if painted.is_empty() { slice.clone() } else { geom::boolean(slice, &painted, Op::Difference) }
+        })
+        .collect();
+    pieces.push((None, rest));
+    for (f, _) in &bands {
+        let mine: Vec<Vec<Shape>> = split
+            .iter()
+            .map(|parts| parts.iter().filter(|(g, _)| g == f).flat_map(|(_, r)| r.iter().cloned()).collect())
+            .collect();
+        pieces.push((Some(*f), mine));
+    }
+    let mut out: Vec<Vec<toolpath::Island>> = vec![Vec::new(); slices.len()];
+    for (f, piece) in pieces {
+        if piece.iter().all(Vec::is_empty) {
+            continue;
+        }
+        for (layer, islands) in out.iter_mut().zip(plan::object(&piece, layers, s, regions, cancelled)) {
+            layer.extend(islands.into_iter().map(|mut isl| {
+                isl.extruder = f;
+                isl
+            }));
+        }
+    }
+    out
 }
 
 /// An object's painted seams and fuzzy skin per layer (empty when none are painted).
@@ -680,6 +875,7 @@ mod tests {
             bed_type_name: "Textured PEI Plate".into(),
             objects,
             plate_name: "Plate 1".into(),
+            events: Vec::new(),
         }
     }
 
@@ -694,6 +890,7 @@ mod tests {
             support_paint: Vec::new(),
             seam_paint: Vec::new(),
             fuzzy_paint: Vec::new(),
+            color_paint: Vec::new(),
             brim_ears: Vec::new(),
             volumes: Vec::new(),
             ranges: Vec::new(),
@@ -996,6 +1193,129 @@ mod tests {
         assert!(brim.iter().all(|(x, y)| (x - 100.0).hypot(y - 100.0) < 4.5), "{brim:?}");
     }
 
+    /// Two filaments, black and white.
+    fn two_filaments(j: &mut Job) {
+        let mut white = Config::default();
+        white.set("filament_density", "1.24");
+        white.set("filament_colour", "#FFFFFF");
+        if let Some(f) = j.filaments.first_mut() {
+            f.set("filament_colour", "#000000");
+        }
+        j.filaments.push(white);
+    }
+
+    #[test]
+    fn a_painted_two_colour_cube_prints_with_a_tower() {
+        let mut c = cube(Vec3::new(100.0, 100.0, 0.0), 20.0);
+        c.color_paint = x0_face(20.0).into_iter().map(|t| (t, 2)).collect();
+        let mut j = job(vec![c]);
+        two_filaments(&mut j);
+        j.process.set("enable_prime_tower", "1");
+        j.process.set("wipe_tower_x", "30");
+        j.process.set("wipe_tower_y", "30");
+        j.process.set("flush_volumes_matrix", "0,200,200,0");
+        let out = slice(&j, &Progress::default());
+        assert!(out.is_ok(), "{:?}", out.as_ref().err());
+        let Ok(out) = out else { return };
+        // It reads back with the same time and filament per extruder.
+        let back = view_gcode(out.gcode.clone(), &Config::default(), &j.filaments);
+        let (a, b) = (back.stats.total_time, out.stats.total_time);
+        assert!((a - b).abs() / b < 0.02, "read back {a} vs sliced {b}");
+        for (x, y) in back.stats.filament_mm.iter().zip(&out.stats.filament_mm) {
+            assert!((x - y).abs() / y.max(1.0) < 0.02, "{x} vs {y}");
+        }
+        assert!(out.gcode.contains(";TYPE:Prime tower"));
+        assert!(out.stats.filament_mm.iter().all(|f| *f > 10.0), "{:?}", out.stats.filament_mm);
+        // At most two changes a layer (to white and back).
+        let changes: Vec<usize> = out
+            .gcode
+            .split(";LAYER_CHANGE")
+            .map(|layer| layer.lines().filter(|l| *l == "T0" || *l == "T1").count())
+            .collect();
+        assert!(changes.iter().all(|c| *c <= 2), "{changes:?}");
+        assert!(changes.iter().filter(|c| **c > 0).count() > 50);
+        // Each change purges about the table's 200 mm³ into the tower.
+        let tower: Vec<(f64, f64)> = extrusions(&out.gcode, "Prime tower");
+        assert!(tower.iter().all(|(x, y)| *x >= 29.0 && *x <= 91.0 && *y >= 29.0 && *y < 120.0), "{:?}", &tower[..3]);
+        assert!(!out.warnings.iter().any(|w| w.contains("tower")), "{:?}", out.warnings);
+        // White is on the painted face: x near 100.
+        let painted: Vec<(f64, f64)> = {
+            let mut on = false;
+            out.gcode
+                .lines()
+                .filter_map(|l| {
+                    if l == "T1" {
+                        on = true;
+                    } else if l == "T0" {
+                        on = false;
+                    }
+                    let get = |c: char| {
+                        l.split_whitespace().find_map(|w| w.strip_prefix(c)).and_then(|v| v.parse::<f64>().ok())
+                    };
+                    (on && l.starts_with("G1 ") && l.contains(" E") && get('X').is_some_and(|x| x > 95.0))
+                        .then(|| (get('X').unwrap_or(0.0), get('Y').unwrap_or(0.0)))
+                })
+                .collect()
+        };
+        assert!(
+            !painted.is_empty() && painted.iter().all(|(x, _)| *x < 112.0),
+            "{:?}",
+            painted.iter().map(|p| p.0).fold(0.0, f64::max)
+        );
+    }
+
+    #[test]
+    fn change_templates_ooze_prevention_and_layer_events() {
+        let a = cube(Vec3::new(60.0, 100.0, 0.0), 10.0);
+        let mut b = cube(Vec3::new(120.0, 100.0, 0.0), 10.0);
+        b.extruder = 1;
+        let mut j = job(vec![a, b]);
+        two_filaments(&mut j);
+        j.printer.set("change_filament_gcode", "; swap {previous_extruder} to {next_extruder}\nT[next_extruder]");
+        j.process.set("ooze_prevention", "1");
+        j.process.set("standby_temperature_delta", "-40");
+        j.events =
+            vec![(2.0, LayerEvent::Pause), (4.0, LayerEvent::ColorChange), (6.0, LayerEvent::Custom("; hello".into()))];
+        let out = slice(&j, &Progress::default());
+        assert!(out.is_ok(), "{:?}", out.as_ref().err());
+        let Ok(out) = out else { return };
+        assert!(out.gcode.contains("; swap 0 to 1"), "the template ran");
+        // The template's own T is the only one.
+        assert!(!out.gcode.contains("T1\nT1"));
+        assert!(out.gcode.lines().any(|l| l.starts_with("M104 T0 S")));
+        for (mark, z) in [("M601", "2"), ("M600", "4"), ("; hello", "6")] {
+            let at = out.gcode.find(mark);
+            assert!(at.is_some(), "{mark}");
+            let before = &out.gcode[..at.unwrap_or(0)];
+            assert!(before.rsplit(";Z:").next().is_some_and(|l| l.starts_with(z)), "{mark}");
+        }
+    }
+
+    #[test]
+    fn objects_print_one_at_a_time() {
+        let tall = cube(Vec3::new(60.0, 100.0, 0.0), 10.0);
+        let short = cube(Vec3::new(90.0, 100.0, 0.0), 5.0);
+        let mut j = job(vec![tall, short]);
+        j.process.set("print_sequence", "by object");
+        let out = slice(&j, &Progress::default());
+        assert!(out.is_ok(), "{:?}", out.as_ref().err());
+        let Ok(out) = out else { return };
+        // The short one first, all of it, then down again for the tall one.
+        let zs: Vec<f64> =
+            out.gcode.lines().filter_map(|l| l.strip_prefix(";Z:")).filter_map(|v| v.parse().ok()).collect();
+        let drops = zs.windows(2).filter(|w| w[1] < w[0]).count();
+        assert_eq!(drops, 1, "{zs:?}");
+        assert!((zs[24] - 5.0).abs() < 1e-6 && (zs[25] - 0.2).abs() < 1e-6, "{:?}", &zs[20..30]);
+        // 30 mm apart, within the 40 mm clearance: a warning.
+        assert!(out.warnings.iter().any(|w| w.contains("clearance")), "{:?}", out.warnings);
+    }
+
+    #[test]
+    fn light_after_dark_needs_more_flushing() {
+        assert!(auto_flush("#000000", "#FFFFFF") > auto_flush("#FFFFFF", "#000000"));
+        assert!(auto_flush("#FF0000", "#FF0000") < auto_flush("#FF0000", "#00FF00"));
+    }
+
     #[test]
     fn a_raft_lifts_the_part() {
         let mut j = job(vec![cube(Vec3::new(100.0, 100.0, 0.0), 10.0)]);
@@ -1183,6 +1503,7 @@ mod tests {
             support_paint: Vec::new(),
             seam_paint: Vec::new(),
             fuzzy_paint: Vec::new(),
+            color_paint: Vec::new(),
             brim_ears: Vec::new(),
             volumes: Vec::new(),
             ranges: Vec::new(),
@@ -1260,6 +1581,7 @@ mod tests {
             support_paint: Vec::new(),
             seam_paint: Vec::new(),
             fuzzy_paint: Vec::new(),
+            color_paint: Vec::new(),
             brim_ears: Vec::new(),
             volumes: Vec::new(),
             ranges: Vec::new(),

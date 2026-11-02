@@ -467,6 +467,7 @@ pub fn object(
                         fills: w.walled.gaps.clone(),
                         seam_enforce: lr.map(|r| r.seam_enforce.clone()).unwrap_or_default(),
                         seam_block: lr.map(|r| r.seam_block.clone()).unwrap_or_default(),
+                        extruder: None,
                     };
                     for p in &w.pieces {
                         match p.settings.as_deref() {

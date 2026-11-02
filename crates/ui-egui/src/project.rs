@@ -18,7 +18,7 @@ use glam::{Mat4, Vec3};
 use serde_json::{Map, Value};
 
 use crate::recovery::Restored;
-use crate::state::{BED_TYPES, PlateSettings, ProjectInfo, Session, plate_columns};
+use crate::state::{BED_TYPES, EventKind, LayerEventSetting, PlateSettings, ProjectInfo, Session, plate_columns};
 
 /// OrcaSlicer's names for the plate types of [`BED_TYPES`], in the same order.
 const ORCA_BEDS: [&str; 6] = [
@@ -322,7 +322,30 @@ pub fn to_project(session: &Session) -> Project {
                     )
                 })
                 .flatten();
-            Plate { name: ps.name, locked: session.locked.get(p).copied().unwrap_or(false), settings, thumbnail }
+            let events = ps
+                .events
+                .iter()
+                .map(|e| {
+                    let kind = match e.kind {
+                        EventKind::ColorChange => 0,
+                        EventKind::Pause => 1,
+                        EventKind::Custom => 2,
+                    };
+                    let gcode = match e.kind {
+                        EventKind::ColorChange => "M600".to_owned(),
+                        EventKind::Pause => "M601".to_owned(),
+                        EventKind::Custom => e.gcode.clone(),
+                    };
+                    (e.z, kind, gcode)
+                })
+                .collect();
+            Plate {
+                name: ps.name,
+                locked: session.locked.get(p).copied().unwrap_or(false),
+                settings,
+                thumbnail,
+                events,
+            }
         })
         .collect();
     let info = &session.project;
@@ -503,6 +526,21 @@ pub fn open(session: &Session, path: &Path) -> Result<(Restored, Vec<String>), S
             let Some(pl) = project.plates.get(p) else { return PlateSettings::default() };
             let get = |k: &str| pl.settings.iter().find(|(a, _)| a == k).map(|(_, v)| v.trim().to_owned());
             PlateSettings {
+                events: pl
+                    .events
+                    .iter()
+                    .filter_map(|(z, kind, gcode)| {
+                        let kind = match kind {
+                            0 => EventKind::ColorChange,
+                            1 => EventKind::Pause,
+                            2 => EventKind::Custom,
+                            _ => return None,
+                        };
+                        // Only custom G-code keeps its text; the others are the printer's.
+                        let gcode = if kind == EventKind::Custom { gcode.clone() } else { String::new() };
+                        Some(LayerEventSetting { z: *z, kind, gcode })
+                    })
+                    .collect(),
                 name: pl.name.clone(),
                 bed_type: get("curr_bed_type").or_else(|| get("bed_type")).and_then(|b| bed_index(&b)),
                 sequence: match get("print_sequence").as_deref() {
@@ -598,6 +636,8 @@ mod tests {
         }
         s.add_range(first);
         s.plate_settings_mut(1).name = "second".into();
+        s.add_event(0, 2.4, EventKind::ColorChange, String::new());
+        s.add_event(0, 4.0, EventKind::Custom, "; hi".into());
         s.plate_settings_mut(1).sequence = 2;
         s.plate_settings_mut(0).bed_type = Some(1);
         s.project.author = "Someone".into();
@@ -614,6 +654,7 @@ mod tests {
         assert_eq!(r.model.plates, 2);
         assert_eq!(r.locked, vec![false, true]);
         assert_eq!(r.plate_settings[1].name, "second");
+        assert_eq!(r.plate_settings[0].events, s.plate_settings[0].events);
         assert_eq!(r.plate_settings[1].sequence, 2);
         assert_eq!(r.plate_settings[0].bed_type, Some(1));
         assert_eq!(r.bed_type, 2);

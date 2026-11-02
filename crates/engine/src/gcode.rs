@@ -89,6 +89,105 @@ pub struct Context<'a> {
     pub plate_name: String,
     /// Thumbnail blocks for the top of the file.
     pub thumbnails: String,
+    /// Pauses, colour changes and custom G-code by height.
+    pub events: &'a [(f64, LayerEvent)],
+}
+
+/// Something asked for at a layer from the layer slider.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LayerEvent {
+    /// The printer's pause G-code.
+    Pause,
+    /// M600: the printer asks for the next filament.
+    ColorChange,
+    Custom(String),
+}
+
+/// What a layer prints with one filament.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Part {
+    /// Support (`true`: its interface).
+    Support(bool),
+    Islands,
+}
+
+/// What layer `plan` prints, in order, each with its filament: support first (with its own
+/// filaments when set, else whatever is loaded), then the islands, the loaded filament's
+/// first and the rest by number.
+fn layer_steps(plan: &LayerPlan, cx: &Context<'_>, n_ext: usize, mut current: usize) -> Vec<(Part, usize)> {
+    let mm = &cx.settings.multi;
+    let mut out = Vec::new();
+    for (interface, chosen) in [(false, mm.support_filament), (true, mm.support_interface_filament)] {
+        if plan.support.iter().any(|p| (p.role == Role::SupportInterface) == interface) {
+            let e = if chosen > 0 { (chosen - 1).min(n_ext - 1) } else { current };
+            out.push((Part::Support(interface), e));
+            current = e;
+        }
+    }
+    let mut exts: Vec<usize> = plan
+        .objects
+        .iter()
+        .flat_map(|(o, islands)| {
+            let own = cx.object_extruder.get(*o).copied().unwrap_or(0);
+            islands.iter().map(move |isl| isl.extruder.unwrap_or(own).min(n_ext - 1))
+        })
+        .collect();
+    exts.sort_unstable();
+    exts.dedup();
+    exts.sort_by_key(|e| *e != current);
+    out.extend(exts.into_iter().map(|e| (Part::Islands, e)));
+    out
+}
+
+/// How much to purge changing from filament `from` to `to`, mm³: the flushing volumes table
+/// when there is one, else from the two colours; never less than the prime volume.
+fn flush_volume(cx: &Context<'_>, from: usize, to: usize) -> f64 {
+    let mm = &cx.settings.multi;
+    let n = cx.filaments.len();
+    let table = mm.flush.get(from * n + to).copied().filter(|v| mm.flush.len() == n * n && *v > 0.0);
+    let v = match table {
+        Some(v) => v * mm.flush_multiplier,
+        None => {
+            let colour = |i: usize| cx.filaments.get(i).map_or("#808080", |f| f.colour.as_str());
+            auto_flush(colour(from), colour(to))
+        }
+    };
+    v.max(mm.prime_volume)
+}
+
+/// A flushing volume from one colour to another, mm³: more for light after dark, and more the
+/// further apart the colours are (after OrcaSlicer's estimate).
+pub fn auto_flush(from: &str, to: &str) -> f64 {
+    let rgb = |hex: &str| {
+        let v = hex
+            .trim()
+            .trim_start_matches('#')
+            .get(..6)
+            .and_then(|h| u32::from_str_radix(h, 16).ok())
+            .unwrap_or(0x80_80_80);
+        [(v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff].map(|c| f64::from(c) / 255.0)
+    };
+    let (a, b) = (rgb(from), rgb(to));
+    let lum = |c: [f64; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    let dist = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt() / 3f64.sqrt();
+    let lighter = (lum(b) - lum(a)).max(0.0);
+    (70.0 + 450.0 * lighter + 250.0 * dist).round()
+}
+
+/// The prime tower: where it stands and how far up this layer's purges have filled it.
+#[derive(Clone, Debug)]
+struct Tower {
+    at: DVec2,
+    width: f64,
+    depth: f64,
+    /// Line width.
+    w: f64,
+    /// How far into the depth this layer's purges reach.
+    used: f64,
+    /// The layer whose walls are printed.
+    walled: Option<usize>,
+    /// The last layer with a filament change: the tower stops there.
+    last: usize,
 }
 
 pub struct Output {
@@ -159,6 +258,8 @@ struct Writer<'a> {
     preview: Preview,
     /// Where the last loop's seam was, per object, for aligned seams.
     seams: Vec<Option<DVec2>>,
+    /// The prime tower, when one is printed.
+    tower: Option<Tower>,
     /// The island being printed's painted seams: where they go, where they must not.
     seam_paint: (Vec<geom::Shape>, Vec<geom::Shape>),
     /// Speed factor for layer cooling.
@@ -832,6 +933,141 @@ impl<'a> Writer<'a> {
         }
     }
 
+    /// The islands layer `plan` prints with filament `e`, object by object.
+    fn objects_in(&mut self, plan: &LayerPlan, e: usize, n_ext: usize, labels: bool) {
+        let cx = self.cx;
+        let m = &cx.settings.motion;
+        for (o, islands) in &plan.objects {
+            let own = cx.object_extruder.get(*o).copied().unwrap_or(0);
+            let mut remaining: Vec<&Island> =
+                islands.iter().filter(|isl| isl.extruder.unwrap_or(own).min(n_ext - 1) == e).collect();
+            if remaining.is_empty() {
+                continue;
+            }
+            let name = cx.object_names.get(*o).map_or_else(String::new, |n| n.replace(['\n', '\r'], " "));
+            self.line(format!("; printing object {name}"));
+            if labels && m.flavor == Flavor::Klipper && m.exclude_object {
+                self.line(format!("EXCLUDE_OBJECT_START NAME={}", label(&name, *o)));
+            } else if labels && matches!(m.flavor, Flavor::Marlin | Flavor::Marlin2) {
+                self.line(format!("M486 S{o}"));
+            }
+            while !remaining.is_empty() {
+                let here = self.pos.truncate();
+                let next = remaining
+                    .iter()
+                    .enumerate()
+                    .map(|(i, isl)| {
+                        let d = isl
+                            .walls
+                            .first()
+                            .and_then(|ws| ws.first())
+                            .or_else(|| isl.fills.first())
+                            .map_or(f64::INFINITY, |p| {
+                                p.points.iter().map(|q| q.distance_squared(here)).fold(f64::INFINITY, f64::min)
+                            });
+                        (i, d)
+                    })
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .map_or(0, |x| x.0);
+                let island = remaining.swap_remove(next);
+                self.island(island, *o);
+            }
+            if labels && m.flavor == Flavor::Klipper && m.exclude_object {
+                self.line(format!("EXCLUDE_OBJECT_END NAME={}", label(&name, *o)));
+            } else if labels && matches!(m.flavor, Flavor::Marlin | Flavor::Marlin2) {
+                self.line("M486 S-1");
+            }
+        }
+    }
+
+    /// One tower path, printed as tower.
+    fn tower_path(&mut self, points: Vec<DVec2>, closed: bool) {
+        let Some(t) = &self.tower else { return };
+        let speed = self.s().speeds.inner.min(90.0);
+        let speed = if self.layer == 0 { self.s().speeds.first_layer } else { speed };
+        let path = Path::new(Role::PrimeTower, points, closed, t.w, speed, 1.0);
+        self.print_nearest(vec![path], None, None);
+    }
+
+    /// The tower's outline on this layer (and its brim on the first), once a layer.
+    fn tower_walls(&mut self) {
+        let layer = self.layer;
+        let brim = self.s().multi.tower_brim;
+        let Some(t) = self.tower.as_mut() else { return };
+        if t.walled == Some(layer) || layer > t.last {
+            return;
+        }
+        t.walled = Some(layer);
+        t.used = 0.0;
+        let (at, width, depth, w) = (t.at, t.width, t.depth, t.w);
+        let rect = |inset: f64| {
+            let (lo, hi) = (at + DVec2::splat(inset), at + DVec2::new(width, depth) - DVec2::splat(inset));
+            vec![lo, DVec2::new(hi.x, lo.y), hi, DVec2::new(lo.x, hi.y)]
+        };
+        if layer == 0 {
+            let loops = (brim / w).round() as usize;
+            for k in (1..=loops.min(50)).rev() {
+                self.tower_path(rect(-(k as f64) * w + w / 2.0), true);
+            }
+        }
+        self.tower_path(rect(w / 2.0), true);
+    }
+
+    /// Purges `volume` mm³ into the tower: rows across it, from where the last purge stopped.
+    fn tower_purge(&mut self, volume: f64) {
+        self.tower_walls();
+        let h = self.height.max(0.01);
+        let Some(t) = &self.tower else { return };
+        let (at, width, depth, w, used) = (t.at, t.width, t.depth, t.w, t.used);
+        let span = (width - 2.0 * w).max(w);
+        let rows = ((volume / (h * w * span)).ceil() as usize).clamp(1, 2000);
+        let room = ((depth - 2.0 * w - used) / w).floor().max(0.0) as usize;
+        let rows = rows.min(room.max(1));
+        let mut pts = Vec::with_capacity(rows * 2);
+        for k in 0..rows {
+            let y = at.y + w + used + (k as f64 + 0.5) * w;
+            let (a, b) = (at.x + w, at.x + w + span);
+            if k % 2 == 0 {
+                pts.extend([DVec2::new(a, y), DVec2::new(b, y)]);
+            } else {
+                pts.extend([DVec2::new(b, y), DVec2::new(a, y)]);
+            }
+        }
+        if let Some(t) = self.tower.as_mut() {
+            t.used += rows as f64 * w;
+        }
+        self.tower_path(pts, false);
+    }
+
+    /// Ends a tower layer: walls if nothing purged, and sparse rows over the rest of it so the
+    /// layers above have something to stand on.
+    fn tower_finish(&mut self) {
+        let layer = self.layer;
+        if self.tower.as_ref().is_none_or(|t| layer > t.last) {
+            return;
+        }
+        self.tower_walls();
+        let Some(t) = &self.tower else { return };
+        let (at, width, depth, w, used) = (t.at, t.width, t.depth, t.w, t.used);
+        let gap = w * 3.0;
+        let mut y = at.y + w + used + gap / 2.0;
+        let mut pts = Vec::new();
+        let mut k = 0;
+        while y < at.y + depth - w && k < 1000 {
+            let (a, b) = (at.x + w, at.x + width - w);
+            if k % 2 == 0 {
+                pts.extend([DVec2::new(a, y), DVec2::new(b, y)]);
+            } else {
+                pts.extend([DVec2::new(b, y), DVec2::new(a, y)]);
+            }
+            y += gap;
+            k += 1;
+        }
+        if pts.len() >= 2 {
+            self.tower_path(pts, false);
+        }
+    }
+
     fn island(&mut self, island: &Island, object: usize) {
         // Arriving uses the plain rules; travel within the island uses its region from the
         // first extrusion on.
@@ -868,7 +1104,9 @@ impl<'a> Writer<'a> {
         self.line(line);
     }
 
-    fn tool_change(&mut self, extruder: usize) {
+    /// Changes to filament `extruder`, running `custom` (the rendered change template); a
+    /// template that sends its own `T` command replaces ours.
+    fn tool_change(&mut self, extruder: usize, custom: &str) {
         if extruder == self.extruder {
             return;
         }
@@ -877,8 +1115,22 @@ impl<'a> Writer<'a> {
             let to = self.pos;
             self.mv(to, -length, self.s().retract.speed, MoveKind::Retract);
         }
+        // Ooze prevention: the hotend going idle drops to its standby temperature.
+        if self.s().multi.ooze_prevention {
+            let standby = self.temp + self.s().multi.standby_delta;
+            self.line(format!("M104 T{} S{}", self.extruder, standby.round() as i64));
+        }
         self.extruder = extruder;
-        self.line(format!("T{extruder}"));
+        let own_t = custom.lines().any(|l| {
+            let l = l.trim_start();
+            l.strip_prefix('T').is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit() || c == '['))
+        });
+        if !custom.trim().is_empty() {
+            self.line(custom.trim_end().to_owned());
+        }
+        if !own_t {
+            self.line(format!("T{extruder}"));
+        }
         if let Some(f) = self.filament() {
             let t = if self.layer == 0 { f.nozzle_temp_first } else { f.nozzle_temp };
             self.temp = t;
@@ -1186,6 +1438,7 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         preview: Preview::default(),
         seams: vec![None; cx.object_names.len()],
         seam_paint: (Vec::new(), Vec::new()),
+        tower: None,
         slow: 1.0,
         preview_tolerance: preview_tolerance(plans),
         region: None,
@@ -1268,6 +1521,41 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
     }
     w.pressure_advance();
 
+    // The prime tower: as deep as the layer with the most purging needs, up to the last change.
+    if s.multi.tower && n_ext > 1 {
+        let mut current = w.extruder;
+        let mut most: f64 = 0.0;
+        let mut last = None;
+        let tw = s.widths.inner;
+        let span = (s.multi.tower_width - 2.0 * tw).max(tw);
+        for (li, plan) in plans.iter().enumerate() {
+            let mut volume = 0.0;
+            for (_, e) in layer_steps(plan, cx, n_ext, current) {
+                if e != current {
+                    volume += flush_volume(cx, current, e);
+                    current = e;
+                }
+            }
+            if volume > 0.0 {
+                last = Some(li);
+                most = most.max(volume / (plan.height.max(0.01) * span));
+            }
+        }
+        if let Some(last) = last {
+            let depth = (most + 4.0 * tw).clamp(5.0, 300.0);
+            w.tower = Some(Tower {
+                at: DVec2::new(s.multi.tower_at[0], s.multi.tower_at[1]),
+                width: s.multi.tower_width,
+                depth,
+                w: tw,
+                used: 0.0,
+                walled: None,
+                last,
+            });
+        }
+    }
+
+    let mut highest: f64 = 0.0;
     for (li, plan) in plans.iter().enumerate() {
         w.layer = li;
         w.height = plan.height;
@@ -1282,6 +1570,23 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
             ("layer_z", Value::Num(plan.print_z)),
             ("previous_layer_z", Value::Num(prev_print_z)),
         ];
+        // The next object, one at a time: up clear of everything printed, across, then down.
+        if plan.new_object {
+            w.retract();
+            let safe = (highest + 2.0).min(s.max_print_height.max(highest));
+            let up = DVec3::new(w.pos.x, w.pos.y, safe);
+            w.mv(up, 0.0, s.speeds.travel_z.max(5.0), MoveKind::Travel);
+            let start = plan
+                .objects
+                .iter()
+                .flat_map(|(_, isl)| isl)
+                .find_map(|isl| isl.walls.first().and_then(|ws| ws.first()).or_else(|| isl.fills.first()))
+                .and_then(|p| p.points.first().copied());
+            if let Some(p) = start {
+                w.mv(DVec3::new(p.x, p.y, safe), 0.0, s.speeds.travel, MoveKind::Travel);
+            }
+        }
+        highest = highest.max(plan.print_z);
         w.line(";LAYER_CHANGE");
         w.line(format!(";Z:{}", f3(plan.print_z)));
         w.line(format!(";HEIGHT:{}", f3(plan.height)));
@@ -1335,57 +1640,59 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         }
         w.set_fan(fan);
 
-        // Skirt and brim, support, then the objects, grouped by extruder.
+        // Pauses, colour changes and custom G-code asked for at this layer.
+        for (_, ev) in cx.events.iter().filter(|(z, _)| (z - plan.print_z).abs() < plan.height * 0.5) {
+            match ev {
+                LayerEvent::Pause => {
+                    let t = render("Pause G-code", &s.gcode.pause, &layer_vars);
+                    w.line(if t.trim().is_empty() { "M601".to_owned() } else { t.trim_end().to_owned() });
+                }
+                LayerEvent::ColorChange => w.line("M600"),
+                LayerEvent::Custom(text) => {
+                    let t = render("Custom G-code", text, &layer_vars);
+                    w.line(t.trim_end().to_owned());
+                }
+            }
+        }
+
+        // Skirt and brim, then support and the objects grouped by filament.
         if !plan.skirt.is_empty() {
             w.print_nearest(plan.skirt.clone(), None, None);
         }
-        if !plan.support.is_empty() {
-            w.print_nearest(plan.support.clone(), None, None);
+        let steps = layer_steps(plan, cx, n_ext, w.extruder);
+        for (part, e) in steps {
+            if e != w.extruder {
+                let from = w.extruder;
+                let vars = [
+                    ("layer_num", Value::Num(li as f64)),
+                    ("layer_z", Value::Num(plan.print_z)),
+                    ("previous_extruder", Value::Num(from as f64)),
+                    ("next_extruder", Value::Num(e as f64)),
+                    ("toolchange_z", Value::Num(plan.print_z)),
+                ];
+                let custom = render("Change filament G-code", &s.gcode.change_filament, &vars);
+                w.tool_change(e, &custom);
+                if w.tower.is_some() {
+                    w.tower_purge(flush_volume(cx, from, e));
+                }
+            }
+            match part {
+                Part::Support(interface) => {
+                    let paths: Vec<Path> = plan
+                        .support
+                        .iter()
+                        .filter(|p| (p.role == Role::SupportInterface) == interface)
+                        .cloned()
+                        .collect();
+                    if !paths.is_empty() {
+                        w.print_nearest(paths, None, None);
+                    }
+                }
+                Part::Islands => w.objects_in(plan, e, n_ext, labels),
+            }
         }
-        let mut objects: Vec<&(usize, Vec<Island>)> = plan.objects.iter().collect();
-        // The current extruder's objects first, to save a tool change.
-        let current = w.extruder;
-        objects.sort_by_key(|(o, _)| {
-            let e = cx.object_extruder.get(*o).copied().unwrap_or(0);
-            (e != current, e)
-        });
-        for (o, islands) in objects {
-            let e = cx.object_extruder.get(*o).copied().unwrap_or(0).min(n_ext - 1);
-            w.tool_change(e);
-            let name = cx.object_names.get(*o).map_or_else(String::new, |n| n.replace(['\n', '\r'], " "));
-            w.line(format!("; printing object {name}"));
-            if labels && m.flavor == Flavor::Klipper && m.exclude_object {
-                w.line(format!("EXCLUDE_OBJECT_START NAME={}", label(&name, *o)));
-            } else if labels && matches!(m.flavor, Flavor::Marlin | Flavor::Marlin2) {
-                w.line(format!("M486 S{o}"));
-            }
-            let mut remaining: Vec<&Island> = islands.iter().collect();
-            while !remaining.is_empty() {
-                let here = w.pos.truncate();
-                let next = remaining
-                    .iter()
-                    .enumerate()
-                    .map(|(i, isl)| {
-                        let d = isl
-                            .walls
-                            .first()
-                            .and_then(|ws| ws.first())
-                            .or_else(|| isl.fills.first())
-                            .map_or(f64::INFINITY, |p| {
-                                p.points.iter().map(|q| q.distance_squared(here)).fold(f64::INFINITY, f64::min)
-                            });
-                        (i, d)
-                    })
-                    .min_by(|a, b| a.1.total_cmp(&b.1))
-                    .map_or(0, |x| x.0);
-                let island = remaining.swap_remove(next);
-                w.island(island, *o);
-            }
-            if labels && m.flavor == Flavor::Klipper && m.exclude_object {
-                w.line(format!("EXCLUDE_OBJECT_END NAME={}", label(&name, *o)));
-            } else if labels && matches!(m.flavor, Flavor::Marlin | Flavor::Marlin2) {
-                w.line("M486 S-1");
-            }
+        if w.tower.is_some() {
+            w.tower_finish();
         }
         w.preview.layers.push(PreviewLayer {
             z: plan.print_z as f32,

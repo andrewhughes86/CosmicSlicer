@@ -96,6 +96,8 @@ pub struct Viewport {
     pub tool: Option<Tool>,
     /// The surface tools' settings and picks.
     pub tools: tools::ToolState,
+    /// Custom G-code being typed for the layer slider.
+    pub custom_gcode: String,
     hover: Option<u64>,
     hot: Option<Handle>,
     drag: Option<Drag>,
@@ -138,6 +140,7 @@ impl Default for Viewport {
             bed_key: None,
             tool: None,
             tools: tools::ToolState::default(),
+            custom_gcode: String::new(),
             hover: None,
             hot: None,
             drag: None,

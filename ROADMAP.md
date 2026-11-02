@@ -18,6 +18,7 @@ end of every session (no crashes, tests and clippy clean, smoke tests cover new 
 | 9 | Project files and import | 3MF projects in OrcaSlicer's layout (plates, objects and copies, per-object and per-plate settings, presets by name with edits, painted data, thumbnails), Orca / Bambu / plain 3MF opened; CosmicDMS's readers vendored (STEP, IGES, SAT, AMF, PLY, OFF, glTF, COLLADA, VRML, X3D, 3DS, DXF), zip archives, multi-object 3MF import, inches prompt, recent projects with thumbnails |
 | 10 | Object model | Parts, modifiers, negative volumes, support enforcers/blockers and height ranges on objects (model, engine, 3MF, autosave); object list as a tree with Orca's add-part/modifier menus (primitive or file), split to parts, assemble, drag to reorder, per-part and per-range settings; mesh repair on import with a report |
 | 11 | Prepare tools | Support, seam, fuzzy-skin and colour painting (circle, sphere, fill, smart fill, gap fill) with the engine using support, seam and fuzzy paint; Cut with capped faces, flip, cut to parts, plug and dowel connectors; Text and SVG emboss/engrave; Measure; brim ears placed by hand ("Painted" brim); Boolean union/difference; Assemble; lay-on-face highlight, scale to fit; undoable volume edits |
+| 12 | Multi-material | Colour painting sliced into filaments (nearest painted surface, or a set depth); layers printed filament by filament; prime tower sized to the purges, with brim and sparse layers; flushing volumes table (auto from colours, multiplier); change-filament G-code; ooze prevention; support and interface filaments; print by object with clearance checks and per-plate sequence; colour change, pause and custom G-code from the layer slider (3MF `custom_gcode_per_layer.xml`) |
 
 ## Order, and why
 Get a user's own printer printing well and safely first (profiles, correct motion G-code,
@@ -46,7 +47,7 @@ CI comes early because the Windows and macOS builds are not yet checked by anyth
 | 19 | Parity check against OrcaSlicer on a reference set | 6–14 |
 | 20 | Packaging and release for all three platforms | 3, 18 |
 
-9 more sessions. Session 13 can come earlier; 17 can be split up and done between others.
+8 more sessions. Session 13 can come earlier; 17 can be split up and done between others.
 
 ---
 
@@ -252,14 +253,35 @@ volumes other than the main mesh, and triangles split finer than the mesh's own 
 volumes moved with the canvas gizmos rather than their panel (session 19). Variable layer
 height's toolbar button opens a note pointing at session 13.
 
-## 12 · Multi-material
-- Prime/wipe tower (Orca's), flushing volumes matrix with auto-calculation from colours,
-  flush into infill / objects / support, ooze prevention and standby temperatures.
-- Colour painting sliced into per-filament regions (MMU segmentation), filament for features.
-- Print sequence by object with extruder clearance and collision checks; per-plate sequence.
-- Tool change G-code, filament change G-code, pause/colour change at layer from the slider.
+## 12 · Multi-material — done
+- Colour painting sliced into filaments (`segment.rs`): each layer split among the colours
+  painted on its surface, every point taking the nearest painted surface's colour, or each
+  colour a set depth in (`mmu_segmented_region_max_width`); each part planned on its own, its
+  islands marked with their filament.
+- Each layer prints filament by filament (support first, with `support_filament` /
+  `support_interface_filament` when set; then the loaded filament's islands), one change per
+  filament per layer.
+- Prime tower: at each change a purge of the flushing volume in rows across the tower; sized
+  from the layer with most purging, with a brim on the first layer, walls and sparse rows on
+  every layer up to the last change; warnings when it is off the bed or over an object.
+- Flushing volumes: the table from `flush_volumes_matrix` (× multiplier), or from the colours
+  (more for light after dark, after OrcaSlicer's estimate); an editable dialog with
+  auto-calculate, multiplier and the tower switch.
+- Change-filament G-code with `previous_extruder` / `next_extruder` (a template's own `T`
+  replaces ours); ooze prevention (idle hotend to its standby temperature).
+- Print by object: each object to the top, shortest first, with its own supports; up clear of
+  what is printed, across, then down; warnings for objects inside the extruder clearance or
+  taller than its height; per-plate sequence.
+- Colour change (M600), pause (the printer's pause G-code, else M601) and custom G-code from
+  the Preview's layer slider, marked on it, saved with the plate (3MF
+  `Metadata/custom_gcode_per_layer.xml`, written in Orca's layout as we understand it).
+- Checked by engine tests: a cube painted on one face in a second filament prints both, with
+  at most two changes a layer, purges in the tower, and reads back with the same time and
+  filament per extruder. Not printed on a real multi-material printer.
 
-**Done when:** a painted two-colour model prints with a tower and correct purges.
+Moved on: flushing into infill, objects or support instead of the tower, and the wall /
+infill filament options (missing from our extracted settings; re-extract them) to session 19;
+moving the tower on the canvas to session 14.
 
 ## 13 · Layer height
 - Variable layer height tool (paint smooth/adaptive), adaptive layer height, layer ranges.
@@ -277,6 +299,7 @@ height's toolbar button opens a note pointing at session 13.
 - Plates: drag objects between plates, plate thumbnails, per-plate names/types/sequence used by
   the engine, slice all plates, export all plates, plate list strip.
 - From session 10: OrcaSlicer's shared instances (one object, several placements).
+- From session 12: drag the prime tower on the canvas.
 
 **Done when:** "Arrange all" packs 30 mixed parts like Orca and nothing overlaps.
 
@@ -334,6 +357,8 @@ and the Device page follows both prints.
 - From session 10: wall settings inside modifiers and parts (Orca's per-region perimeters).
 - From session 11: painting on volumes other than the main mesh, brushes that split triangles
   finer than the mesh (Orca's triangle selector), moving volumes with the canvas gizmos.
+- From session 12: flush into infill / objects / support; wall and infill filaments (re-extract
+  Orca's settings to get `wall_filament`, `sparse_infill_filament`, `solid_infill_filament`).
 
 ## 20 · Packaging and release
 - Windows installer (MSI) with file associations; macOS `.app` (universal) as a DMG; Linux

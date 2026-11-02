@@ -207,6 +207,7 @@ struct Snapshot {
     model: Model,
     selection: Vec<u64>,
     locked: Vec<bool>,
+    plate_settings: Vec<PlateSettings>,
 }
 
 /// Most undo steps kept.
@@ -268,6 +269,26 @@ pub struct PlateSettings {
     pub sequence: usize,
     /// 0 same as global, 1 on, 2 off.
     pub spiral: usize,
+    /// Colour changes, pauses and custom G-code added on the layer slider.
+    pub events: Vec<LayerEventSetting>,
+}
+
+/// What the layer slider can add at a layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EventKind {
+    ColorChange,
+    Pause,
+    Custom,
+}
+
+/// One colour change, pause or custom G-code at a height.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LayerEventSetting {
+    /// Top of the layer it comes before, mm.
+    pub z: f32,
+    pub kind: EventKind,
+    /// The G-code, for custom.
+    pub gcode: String,
 }
 
 impl Default for Session {
@@ -434,7 +455,12 @@ impl Session {
     // ---- history ----
 
     fn snapshot(&self) -> Snapshot {
-        Snapshot { model: self.model.clone(), selection: self.selection.clone(), locked: self.locked.clone() }
+        Snapshot {
+            model: self.model.clone(),
+            selection: self.selection.clone(),
+            locked: self.locked.clone(),
+            plate_settings: self.plate_settings.clone(),
+        }
     }
 
     /// Records the state before a change.
@@ -463,6 +489,7 @@ impl Session {
 
     fn restore(&mut self, s: Snapshot) {
         self.model = s.model;
+        self.plate_settings = s.plate_settings;
         self.selection = s.selection;
         self.locked = s.locked;
         self.plate = self.plate.min(self.model.plates.saturating_sub(1));
@@ -1009,6 +1036,26 @@ impl Session {
         self.selection = ids;
     }
 
+    /// Adds a colour change, pause or custom G-code at height `z` on plate `plate`.
+    pub fn add_event(&mut self, plate: usize, z: f32, kind: EventKind, gcode: String) {
+        if !z.is_finite() {
+            return;
+        }
+        self.checkpoint();
+        let events = &mut self.plate_settings_mut(plate).events;
+        events.retain(|e| (e.z - z).abs() > 1e-4);
+        events.push(LayerEventSetting { z, kind, gcode });
+        events.sort_by(|a, b| a.z.total_cmp(&b.z));
+    }
+
+    pub fn remove_event(&mut self, plate: usize, index: usize) {
+        self.checkpoint();
+        let events = &mut self.plate_settings_mut(plate).events;
+        if index < events.len() {
+            events.remove(index);
+        }
+    }
+
     /// Puts `path` at the top of the recent files.
     pub fn remember(&mut self, path: &Path) {
         self.prefs.recent.retain(|p| p != path);
@@ -1402,6 +1449,21 @@ mod tests {
         s.cut(id, origin, Vec3::Z, &opts);
         assert_eq!(s.model.objects.len(), 1);
         assert!(s.model.objects.first().is_some_and(|o| o.parts.len() == 1));
+    }
+
+    #[test]
+    fn layer_events_add_replace_and_remove() {
+        let mut s = Session::new();
+        s.add_event(0, 3.0, EventKind::Pause, String::new());
+        s.add_event(0, 1.0, EventKind::ColorChange, String::new());
+        // Same height: the new one replaces the old.
+        s.add_event(0, 3.0, EventKind::Custom, "G4 S1".into());
+        let kinds: Vec<(f32, EventKind)> = s.plate_settings[0].events.iter().map(|e| (e.z, e.kind)).collect();
+        assert_eq!(kinds, vec![(1.0, EventKind::ColorChange), (3.0, EventKind::Custom)]);
+        s.remove_event(0, 0);
+        assert_eq!(s.plate_settings[0].events.len(), 1);
+        s.undo();
+        assert_eq!(s.plate_settings[0].events.len(), 2);
     }
 
     #[test]

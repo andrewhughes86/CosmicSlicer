@@ -42,6 +42,7 @@ pub struct Settings {
     pub brim_ears_detection_length: f64,
     pub support: Support,
     pub raft: Raft,
+    pub multi: MultiMaterial,
     pub gcode: GcodeSettings,
     pub motion: Motion,
     pub seam: String,
@@ -563,6 +564,39 @@ pub struct GcodeSettings {
     pub layer_change: String,
     pub relative_e: bool,
     pub printer_model: String,
+    /// Run at each filament change (OrcaSlicer's `change_filament_gcode`).
+    pub change_filament: String,
+    /// A pause from the layer slider.
+    pub pause: String,
+    /// Custom G-code from the layer slider uses its own text; this is the printer's template.
+    pub template_custom: String,
+}
+
+/// Several filaments: the prime tower, flushing, standby temperatures, print order.
+#[derive(Clone, Debug)]
+pub struct MultiMaterial {
+    pub tower: bool,
+    /// The tower's front-left corner, printer coordinates.
+    pub tower_at: [f64; 2],
+    pub tower_width: f64,
+    pub tower_brim: f64,
+    /// Least purged at a change, mm³.
+    pub prime_volume: f64,
+    /// Flushing volumes from filament i to j at `i * n + j`, mm³ (empty: from the colours).
+    pub flush: Vec<f64>,
+    pub flush_multiplier: f64,
+    /// Turn idle hotends down by `standby_delta` (multi-hotend printers).
+    pub ooze_prevention: bool,
+    pub standby_delta: f64,
+    /// Support and its interface print with these filaments (1-based; 0 keeps the current).
+    pub support_filament: usize,
+    pub support_interface_filament: usize,
+    /// How deep painted colours reach in from the surface, mm (0: all the way).
+    pub segment_width: f64,
+    /// Print each object to the top before the next.
+    pub by_object: bool,
+    pub clearance_radius: f64,
+    pub clearance_height: f64,
 }
 
 /// One filament's properties.
@@ -1082,6 +1116,34 @@ impl Settings {
                 layer_change: r.text("layer_change_gcode"),
                 relative_e: r.flag("use_relative_e_distances"),
                 printer_model: r.text("printer_model"),
+                change_filament: r.text("change_filament_gcode"),
+                pause: r.text("machine_pause_gcode"),
+                template_custom: r.text("template_custom_gcode"),
+            },
+            multi: MultiMaterial {
+                tower: r.flag("enable_prime_tower"),
+                tower_at: [
+                    r.range("wipe_tower_x", 15.0, -1000.0, 10_000.0),
+                    r.range("wipe_tower_y", 220.0, -1000.0, 10_000.0),
+                ],
+                tower_width: r.range("prime_tower_width", 60.0, 5.0, 300.0),
+                tower_brim: r.range("prime_tower_brim_width", 3.0, 0.0, 50.0),
+                prime_volume: r.range("prime_volume", 45.0, 0.0, 2000.0),
+                flush: r
+                    .text("flush_volumes_matrix")
+                    .split(',')
+                    .filter_map(|v| v.trim().parse::<f64>().ok())
+                    .map(|v| if v.is_finite() { v.clamp(0.0, 5000.0) } else { 0.0 })
+                    .collect(),
+                flush_multiplier: r.range("flush_multiplier", 1.0, 0.0, 10.0),
+                ooze_prevention: r.flag("ooze_prevention"),
+                standby_delta: r.range("standby_temperature_delta", -5.0, -300.0, 300.0),
+                support_filament: r.count("support_filament", 0, 64),
+                support_interface_filament: r.count("support_interface_filament", 0, 64),
+                segment_width: r.range("mmu_segmented_region_max_width", 0.0, 0.0, 1000.0),
+                by_object: r.text("print_sequence") == "by object",
+                clearance_radius: r.range("extruder_clearance_radius", 40.0, 0.0, 1000.0),
+                clearance_height: r.range("extruder_clearance_height_to_rod", 40.0, 0.0, 1000.0),
             },
             seam: r.text("seam_position"),
             outer_first: r.text("wall_sequence").starts_with("outer"),

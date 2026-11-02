@@ -209,6 +209,8 @@ pub struct Island {
     /// Painted seams on this layer: where seams should go, and where they must not.
     pub seam_enforce: Vec<crate::geom::Shape>,
     pub seam_block: Vec<crate::geom::Shape>,
+    /// The filament (0-based) when not the object's: a painted colour region.
+    pub extruder: Option<usize>,
 }
 
 /// Everything printed on one layer.
@@ -221,4 +223,7 @@ pub struct LayerPlan {
     pub support: Vec<Path>,
     /// Per object (index into the job's objects): its islands.
     pub objects: Vec<(usize, Vec<Island>)>,
+    /// Printing one object at a time: this layer starts the next object, so the nozzle lifts
+    /// clear of what is printed before it comes down.
+    pub new_object: bool,
 }

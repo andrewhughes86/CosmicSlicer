@@ -11,8 +11,9 @@ use crate::pages::{DeviceState, HOST_TYPES};
 use crate::settings::{self, Target};
 use crate::sidebar::preset_combo;
 use crate::state::{BED_TYPES, Level, Page, Session};
-use crate::theme::{Theme, Tokens};
+use crate::theme::{Theme, Tokens, parse_hex};
 use crate::ui_kit::{self, Window};
+use egui::Color32;
 
 /// An open settings editor.
 #[derive(Clone, Debug)]
@@ -740,19 +741,60 @@ impl Dialogs {
         if self.flushing {
             let mut open = true;
             Window::dialog("Flushing volumes").show(ctx, t, &mut open, |ui| {
+                let schema = session.schema;
                 let n = session.presets.project_filaments.len();
+                let colours: Vec<String> = (0..n).map(|i| session.presets.filament_colour(schema, i)).collect();
+                let auto = |i: usize, j: usize| {
+                    if i == j {
+                        0.0
+                    } else {
+                        CosmicSlicer_engine::auto_flush(
+                            colours.get(i).map_or("#808080", String::as_str),
+                            colours.get(j).map_or("#808080", String::as_str),
+                        )
+                    }
+                };
+                let stored: Vec<f64> = session
+                    .presets
+                    .value(schema, TabKind::Process, 0, "flush_volumes_matrix")
+                    .split(',')
+                    .filter_map(|v| v.trim().parse::<f64>().ok())
+                    .collect();
+                // Until set by hand, the table follows the colours.
+                let mut table: Vec<f64> = if stored.len() == n * n && stored.iter().any(|v| *v > 0.0) {
+                    stored
+                } else {
+                    (0..n * n).map(|k| auto(k / n.max(1), k % n.max(1))).collect()
+                };
                 ui.label("Flushing volume (mm³) when changing from the row's filament to the column's.");
                 ui.add_space(6.0);
+                let mut changed = false;
                 egui::Grid::new("flush").num_columns(n + 1).spacing([8.0, 6.0]).show(ui, |ui| {
                     ui.label("");
                     for j in 0..n {
-                        ui.label(RichText::new(format!("{}", j + 1)).strong());
+                        let c = parse_hex(colours.get(j).map_or("", String::as_str)).unwrap_or(Color32::GRAY);
+                        ui.label(
+                            RichText::new(format!(" {} ", j + 1))
+                                .strong()
+                                .background_color(c)
+                                .color(crate::theme::ink_on(c)),
+                        );
                     }
                     ui.end_row();
                     for i in 0..n {
-                        ui.label(RichText::new(format!("{}", i + 1)).strong());
+                        let c = parse_hex(colours.get(i).map_or("", String::as_str)).unwrap_or(Color32::GRAY);
+                        ui.label(
+                            RichText::new(format!(" {} ", i + 1))
+                                .strong()
+                                .background_color(c)
+                                .color(crate::theme::ink_on(c)),
+                        );
                         for j in 0..n {
-                            ui.label(if i == j { "0".to_owned() } else { "280".to_owned() });
+                            if i == j {
+                                ui.label("—");
+                            } else if let Some(v) = table.get_mut(i * n + j) {
+                                changed |= ui.add(egui::DragValue::new(v).range(0.0..=5000.0).speed(5.0)).changed();
+                            }
                         }
                         ui.end_row();
                     }
@@ -760,6 +802,46 @@ impl Dialogs {
                 if n < 2 {
                     ui.label(RichText::new("Add a second filament to set flushing volumes.").color(t.text_muted));
                 }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Auto-calculate from colours").clicked() {
+                        table = (0..n * n).map(|k| auto(k / n.max(1), k % n.max(1))).collect();
+                        changed = true;
+                    }
+                    let mut mult: f64 = session
+                        .presets
+                        .value(schema, TabKind::Process, 0, "flush_multiplier")
+                        .trim()
+                        .parse()
+                        .unwrap_or(1.0);
+                    ui.label("Multiplier");
+                    if ui.add(egui::DragValue::new(&mut mult).range(0.0..=3.0).speed(0.01)).changed() {
+                        session.presets.set_value(
+                            schema,
+                            TabKind::Process,
+                            0,
+                            "flush_multiplier",
+                            format!("{mult:.2}"),
+                        );
+                        session.sliced = None;
+                    }
+                });
+                if changed {
+                    let text = table.iter().map(|v| format!("{}", v.round())).collect::<Vec<_>>().join(",");
+                    session.presets.set_value(schema, TabKind::Process, 0, "flush_volumes_matrix", text);
+                    session.sliced = None;
+                }
+                let mut tower = session.presets.value(schema, TabKind::Process, 0, "enable_prime_tower") == "1";
+                if ui.checkbox(&mut tower, "Purge into a prime tower").changed() {
+                    let v = if tower { "1" } else { "0" };
+                    session.presets.set_value(schema, TabKind::Process, 0, "enable_prime_tower", v.to_owned());
+                    session.sliced = None;
+                }
+                ui.label(
+                    RichText::new("The tower's place and size are in Process › Multimaterial.")
+                        .small()
+                        .color(t.text_muted),
+                );
             });
             self.flushing = open;
         }

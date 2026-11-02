@@ -1224,6 +1224,8 @@ mod smoke {
             app.session.add_primitive(name);
         }
         app.session.presets.add_filament();
+        app.session.add_event(0, 1.0, crate::state::EventKind::ColorChange, String::new());
+        app.session.add_event(0, 2.0, crate::state::EventKind::Custom, "; x".into());
         // One object with every kind of volume and a height range, for the object list.
         if let Some(id) = app.session.model.objects.first().map(|o| o.id) {
             for kind in CosmicSlicer_model::PartKind::ALL {

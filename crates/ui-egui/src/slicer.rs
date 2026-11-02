@@ -49,7 +49,11 @@ pub fn fingerprint(session: &Session) -> u64 {
         }
     }
     session.bed_type.hash(&mut h);
-    session.plate_settings.get(session.plate).map(|s| (s.bed_type, s.sequence, s.spiral)).hash(&mut h);
+    session
+        .plate_settings
+        .get(session.plate)
+        .map(|s| (s.bed_type, s.sequence, s.spiral, format!("{:?}", s.events)))
+        .hash(&mut h);
     h.finish()
 }
 
@@ -69,7 +73,29 @@ pub fn job(session: &Session, plate: usize) -> Job {
             2 => process.set("spiral_mode", "0"),
             _ => {}
         }
+        match s.sequence {
+            1 => process.set("print_sequence", "by layer"),
+            2 => process.set("print_sequence", "by object"),
+            _ => {}
+        }
     }
+    let events = session
+        .plate_settings
+        .get(plate)
+        .map(|s| {
+            s.events
+                .iter()
+                .map(|e| {
+                    let ev = match e.kind {
+                        crate::state::EventKind::ColorChange => CosmicSlicer_engine::LayerEvent::ColorChange,
+                        crate::state::EventKind::Pause => CosmicSlicer_engine::LayerEvent::Pause,
+                        crate::state::EventKind::Custom => CosmicSlicer_engine::LayerEvent::Custom(e.gcode.clone()),
+                    };
+                    (f64::from(e.z), ev)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     Job {
         printer: p.effective(TabKind::Printer, 0),
         process,
@@ -117,6 +143,11 @@ pub fn job(session: &Session, plate: usize) -> Job {
                             .collect()
                     })
                     .unwrap_or_default(),
+                color_paint: o
+                    .paint
+                    .as_deref()
+                    .map(|p| p.states(PaintKind::Color).into_iter().filter(|(_, st)| *st > 0).collect())
+                    .unwrap_or_default(),
                 fuzzy_paint: o
                     .paint
                     .as_deref()
@@ -162,6 +193,7 @@ pub fn job(session: &Session, plate: usize) -> Job {
             })
             .collect(),
         plate_name: session.plate_name(plate),
+        events,
     }
 }
 

@@ -63,6 +63,7 @@ impl SupportLayers {
 }
 
 /// One object's share of support generation.
+#[derive(Clone, Copy)]
 pub struct Input<'a> {
     /// The object's layers.
     pub slices: &'a [Vec<Shape>],

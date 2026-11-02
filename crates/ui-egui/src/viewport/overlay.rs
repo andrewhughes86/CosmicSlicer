@@ -27,7 +27,7 @@ pub fn show(vp: &mut Viewport, ui: &mut Ui, rect: Rect, session: &mut Session, t
         }
         Page::Preview => {
             legend(vp, ui, rect, session, t);
-            layer_slider(vp, ui, rect, t);
+            layer_slider(vp, ui, rect, session, t);
             move_slider(vp, ui, rect, t);
         }
         _ => {}
@@ -832,7 +832,7 @@ fn gradient(ui: &mut Ui, t: &Tokens, range: &preview::Range) {
 }
 
 /// OrcaSlicer's vertical layer slider: two handles, top and bottom of the shown layers.
-fn layer_slider(vp: &mut Viewport, ui: &mut Ui, rect: Rect, t: &Tokens) {
+fn layer_slider(vp: &mut Viewport, ui: &mut Ui, rect: Rect, session: &mut Session, t: &Tokens) {
     let count = vp.layers.count;
     if count == 0 {
         return;
@@ -890,6 +890,68 @@ fn layer_slider(vp: &mut Viewport, ui: &mut Ui, rect: Rect, t: &Tokens) {
             );
             ui.painter().galley(r.min + vec2(5.0, 3.0), galley, t.text);
         }
+    }
+    // Colour changes, pauses and custom G-code: marks on the slider, and "+" at the top handle.
+    if session.viewer.is_none() {
+        let plate = session.plate;
+        let events = session.plate_settings.get(plate).map(|p| p.events.clone()).unwrap_or_default();
+        let mut remove = None;
+        for (k, e) in events.iter().enumerate() {
+            // The layer whose top is nearest the event's height.
+            let n = (1..=count)
+                .min_by(|a, b| (vp.layers.z_of(*a) - e.z).abs().total_cmp(&(vp.layers.z_of(*b) - e.z).abs()));
+            let Some(n) = n else { continue };
+            let y = y_of(n);
+            let mark = Rect::from_center_size(pos2(track.right() + 10.0, y), vec2(12.0, 8.0));
+            let colour = match e.kind {
+                crate::state::EventKind::ColorChange => t.accent,
+                crate::state::EventKind::Pause => t.warning,
+                crate::state::EventKind::Custom => t.text_muted,
+            };
+            ui.painter().rect_filled(mark, 2.0, colour);
+            let r = ui.interact(mark, egui::Id::new(("layer-event", k)), Sense::click());
+            let tip = match e.kind {
+                crate::state::EventKind::ColorChange => "Colour change (M600)".to_owned(),
+                crate::state::EventKind::Pause => "Pause".to_owned(),
+                crate::state::EventKind::Custom => format!("Custom G-code: {}", e.gcode),
+            };
+            if r.on_hover_text(format!("{tip} at {:.2} mm — click to remove", e.z)).clicked() {
+                remove = Some(k);
+            }
+        }
+        if let Some(k) = remove {
+            session.remove_event(plate, k);
+        }
+        let c = pos2(track.right() + 22.0, y_of(top));
+        let plus = Rect::from_center_size(c, vec2(18.0, 18.0));
+        let r = ui.interact(plus, egui::Id::new("layer-event-add"), Sense::click());
+        ui.painter().circle_filled(c, 8.0, if r.hovered() { t.accent } else { t.toolbar_bg });
+        ui.painter().text(
+            c,
+            Align2::CENTER_CENTER,
+            "+",
+            FontId::proportional(14.0),
+            if r.hovered() { t.on_accent } else { t.text },
+        );
+        let z = vp.layers.z_of(top);
+        let r = r.on_hover_text(format!("Add a colour change, pause or custom G-code before the layer at {z:.2} mm"));
+        ui_kit::menu_below(&r, t, |ui| {
+            if ui_kit::menu_item(ui, "Add colour change (M600)", "", true) {
+                session.add_event(plate, z, crate::state::EventKind::ColorChange, String::new());
+                ui.close();
+            }
+            if ui_kit::menu_item(ui, "Add pause", "", true) {
+                session.add_event(plate, z, crate::state::EventKind::Pause, String::new());
+                ui.close();
+            }
+            ui.separator();
+            ui.label("Custom G-code:");
+            ui.text_edit_multiline(&mut vp.custom_gcode);
+            if ui.button("Add custom G-code").clicked() && !vp.custom_gcode.trim().is_empty() {
+                session.add_event(plate, z, crate::state::EventKind::Custom, vp.custom_gcode.clone());
+                ui.close();
+            }
+        });
     }
     // The wheel over the slider steps the top layer, as in OrcaSlicer.
     let area = track.expand2(vec2(30.0, 10.0));

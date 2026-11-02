@@ -234,6 +234,8 @@ pub struct Plate {
     pub settings: Vec<(String, String)>,
     /// PNG.
     pub thumbnail: Option<Vec<u8>>,
+    /// Colour changes (0), pauses (1) and custom G-code (2) by height: (z, type, G-code).
+    pub events: Vec<(f32, u8, String)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -763,6 +765,29 @@ pub fn read(bytes: &[u8]) -> ModelResult<Project> {
         object_ids.push(id.clone());
         project.objects.push(obj);
     }
+    if let Ok(b) = z.read("Metadata/custom_gcode_per_layer.xml") {
+        let root = xml::tree(&b).map_err(import_error)?;
+        for (n, plate) in root.descendants("plate").into_iter().enumerate() {
+            let index = plate
+                .child("plate_info")
+                .and_then(|i| i.attr("id"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .and_then(|i| i.checked_sub(1))
+                .unwrap_or(n);
+            let events: Vec<(f32, u8, String)> = plate
+                .children_named("layer")
+                .filter_map(|l| {
+                    let z = l.attr("top_z")?.trim().parse::<f32>().ok().filter(|z| z.is_finite())?;
+                    let kind = l.attr("type").and_then(|t| t.trim().parse::<u8>().ok()).unwrap_or(0);
+                    Some((z, kind, l.attr("gcode").unwrap_or("").to_owned()))
+                })
+                .take(MAX_OBJECTS)
+                .collect();
+            if let Some(p) = project.plates.get_mut(index) {
+                p.events = events;
+            }
+        }
+    }
     if let Ok(b) = z.read("Metadata/brim_ear_points.txt") {
         for (id, ears) in read_brim_ears(&b) {
             if let Some(k) = object_ids.iter().position(|o| *o == id)
@@ -1005,6 +1030,23 @@ pub fn write(project: &Project) -> ModelResult<Vec<u8>> {
     if let Some(settings) = &project.settings {
         files.push(("Metadata/project_settings.config".into(), settings.clone().into_bytes()));
     }
+    if project.plates.iter().any(|p| !p.events.is_empty()) {
+        let mut x = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<custom_gcodes_per_layer>\n");
+        for (n, plate) in project.plates.iter().enumerate().filter(|(_, p)| !p.events.is_empty()) {
+            let _ = writeln!(x, "<plate>\n<plate_info id=\"{}\"/>", n + 1);
+            for (z, kind, gcode) in &plate.events {
+                let _ = writeln!(
+                    x,
+                    r#"<layer top_z="{}" type="{kind}" extruder="1" color="" extra="" gcode="{}"/>"#,
+                    fmt_f(*z),
+                    esc(gcode)
+                );
+            }
+            x.push_str("<mode value=\"SingleExtruder\"/>\n</plate>\n");
+        }
+        x.push_str("</custom_gcodes_per_layer>\n");
+        files.push(("Metadata/custom_gcode_per_layer.xml".into(), x.into_bytes()));
+    }
     if project.objects.iter().any(|o| !o.brim_ears.is_empty()) {
         let mut b = String::from("brim_points_format_version=0\n");
         for (o, (oid, _)) in project.objects.iter().zip(&ids).filter(|(o, _)| !o.brim_ears.is_empty()) {
@@ -1108,6 +1150,7 @@ mod tests {
                     locked: true,
                     settings: vec![("print_sequence".into(), "by object".into())],
                     thumbnail: Some(vec![137, 80, 78, 71]),
+                    events: vec![(2.4, 0, "M600".into()), (5.0, 2, "; a <custom> line".into())],
                 },
                 Plate::default(),
             ],
@@ -1145,6 +1188,7 @@ mod tests {
         assert_eq!(back.plates[0].name, "first");
         assert!(back.plates[0].locked && !back.plates[1].locked);
         assert_eq!(back.plates[0].settings, p.plates[0].settings);
+        assert_eq!(back.plates[0].events, p.plates[0].events);
         assert_eq!(back.plates[0].thumbnail.as_deref(), Some(&[137u8, 80, 78, 71][..]));
         assert_eq!(back.settings, p.settings);
         assert!(back.is_project());
