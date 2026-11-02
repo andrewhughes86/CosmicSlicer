@@ -26,7 +26,20 @@ pub fn narrow_parts(region: &[Shape], width: f64, min_feature: f64) -> Vec<Shape
     if region.is_empty() {
         return Vec::new();
     }
-    let opened = geom::offset(&geom::offset(region, -width / 2.0, Join::Miter), width / 2.0, Join::Miter);
+    narrow_parts_eroded(region, &geom::offset(region, -width / 2.0, Join::Miter), width, min_feature)
+}
+
+/// [`narrow_parts`] given `eroded`, the region already offset in by half the width (the
+/// walls have it: their centre line), which saves an offset.
+fn narrow_parts_eroded(region: &[Shape], eroded: &[Shape], width: f64, min_feature: f64) -> Vec<Shape> {
+    let opened = geom::offset(eroded, width / 2.0, Join::Miter);
+    // The opening lies inside the region, so the narrow parts' total area is at most what it
+    // removed: under the sliver threshold (with a margin for rounding), every piece would be
+    // dropped below. Most regions end here, saving a boolean and two offsets (the bulk of
+    // the walls' time).
+    if geom::area(region) - geom::area(&opened) <= min_feature * min_feature * 0.5 {
+        return Vec::new();
+    }
     let thin = geom::boolean(region, &opened, Op::Difference);
     let thin = geom::offset(&geom::offset(&thin, -min_feature / 2.0, Join::Miter), min_feature / 2.0, Join::Miter);
     geom::without_slivers(thin, min_feature * min_feature)
@@ -101,10 +114,15 @@ pub fn walls(island: &Shape, s: &Settings, h: f64, first_layer: bool, loops: usi
         // What this wall has to cover: from its outer edge inwards.
         let edge = (centre - width / 2.0).max(0.0);
         let available = if edge > 0.0 { geom::offset(source, -edge, Join::Miter) } else { source.to_vec() };
-        let rings = geom::offset(source, -centre, Join::Miter);
-        let rings = geom::without_slivers(rings, wo * wo * 0.25);
+        // The centre line: `available` offset in by half the width.
+        let centred = geom::offset(source, -centre, Join::Miter);
+        let rings = geom::without_slivers(centred.clone(), wo * wo * 0.25);
         // Where this wall cannot reach: thin walls at the outside, gaps further in.
-        let narrow = if rings.is_empty() { available.clone() } else { narrow_parts(&available, width, min_feature) };
+        let narrow = if rings.is_empty() {
+            available.clone()
+        } else {
+            narrow_parts_eroded(&available, &centred, width, min_feature)
+        };
         if !narrow.is_empty() {
             if k == 0 {
                 if s.walls.thin_walls {

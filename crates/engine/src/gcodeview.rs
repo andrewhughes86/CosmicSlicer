@@ -46,21 +46,24 @@ pub struct Viewed {
     pub warnings: Vec<String>,
 }
 
+/// Numbers past this are damage, not G-code (no position, feed or E comes near it); kept out,
+/// their squares in the motion planner made the time estimate infinite.
+const MAX_NUMBER: f64 = 1.0e9;
+
+fn sane(v: &f64) -> bool {
+    v.is_finite() && v.abs() <= MAX_NUMBER
+}
+
 fn word(line: &str, letter: char) -> Option<f64> {
     line.split_whitespace().find_map(|w| {
         let mut c = w.chars();
         let first = c.next()?;
-        (first.eq_ignore_ascii_case(&letter))
-            .then(|| c.as_str().parse::<f64>().ok())
-            .flatten()
-            .filter(|v| v.is_finite())
+        (first.eq_ignore_ascii_case(&letter)).then(|| c.as_str().parse::<f64>().ok()).flatten().filter(sane)
     })
 }
 
 fn param(line: &str, key: &str) -> Option<f64> {
-    line.split_whitespace()
-        .find_map(|w| w.strip_prefix(key)?.strip_prefix('=')?.parse::<f64>().ok())
-        .filter(|v| v.is_finite())
+    line.split_whitespace().find_map(|w| w.strip_prefix(key)?.strip_prefix('=')?.parse::<f64>().ok()).filter(sane)
 }
 
 /// Reads `text`; `s` and `fil` give the printer limits and filament for the estimate.
@@ -316,7 +319,7 @@ pub fn read(text: &str, s: &Settings, fil: &[Filament]) -> Viewed {
     if truncated {
         warnings.push("The file has more moves than the Preview draws; the top is cut off.".into());
     }
-    let times = motion::plan(&blocks, &s.motion.limits, s.motion.flavor);
+    let times = motion::plan(blocks, &s.motion.limits, s.motion.flavor);
     for ((r, l), t) in owners.iter().zip(&times) {
         match r {
             Some(role) => {
@@ -374,7 +377,13 @@ mod tests {
     fn garbage_is_harmless() {
         let schema = Schema::get();
         let s = Settings::read(schema, &Config::default());
-        for g in ["", "G1 X\nG1 Xnan Y1e400 E\nT99\nM106 S-5\nG2 X1 I0 J0\n\u{0}\u{ffff}", "G91\nG1 X1 E1\n"] {
+        // The last, from the fuzzer: an E of 1e308 once made the estimate infinite.
+        for g in [
+            "",
+            "G1 X\nG1 Xnan Y1e400 E\nT99\nM106 S-5\nG2 X1 I0 J0\n\u{0}\u{ffff}",
+            "G91\nG1 X1 E1\n",
+            "G1 X10 Y10 F3000\nG1 Y101.138 E0.1e309\nG1 X1e300 F1e300\n",
+        ] {
             let v = read(g, &s, &[]);
             assert!(v.stats.total_time.is_finite());
         }

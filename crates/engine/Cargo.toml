@@ -21,3 +21,4 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 CosmicSlicer-import = { workspace = true }
+miniz_oxide = { workspace = true }

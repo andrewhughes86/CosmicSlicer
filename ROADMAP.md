@@ -137,10 +137,9 @@ that are wide enough for walls (session 19; thin parts and gaps already get vari
 - Ironing types (top, topmost, all solid) with pattern, spacing, inset and angle; fuzzy skin
   (`fuzzy.rs`).
 
-Not yet verified: the 300 mm gyroid timing. `the_gyroid_is_fast_and_smooth` is `#[ignore]`d
-because running it alongside the editor ran a 7 GB machine out of memory; run it with
-`cargo test --release -p CosmicSlicer-engine the_gyroid -- --ignored` and check the 300 mm
-sample slices in under 20 s (session 18 at the latest).
+Verified in session 18: the 300 mm gyroid fills in 0.39 s (target under 20 s).
+`the_gyroid_is_fast_and_smooth` stays `#[ignore]`d; run it with
+`tools/capped.sh cargo test -p CosmicSlicer-engine the_gyroid -- --ignored`.
 
 ## 8 · Supports — done
 - Normal supports, grid (columns closed into blocks) and snug (following the overhang), from
@@ -487,6 +486,18 @@ Done so far (2026-11-02):
   crate is vendored from.
 - `tools/capped.sh` runs cargo in a memory-capped scope with logs in `target/diag/` (a
   runaway test once took VS Code down).
+- Performance: `Progress::timings` gives seconds per stage; `budget_tests` slices a reference
+  set (Orca's calibration towers, spheres with tree and grid support, a gyroid torus) against
+  time budgets and a 1.5 GB peak, run on its own in CI. Faster: i_overlay in 32-bit integers
+  (2× per offset), narrow-part detection that reuses the walls' centre-line offset and stops
+  early, support toolpaths and travel regions made in parallel, column supports split into
+  parallel growth, a sequential carry and parallel finishing. G-code memory: the motion
+  planner takes blocks as they come and the text is written straight after the header (1.19
+  → 0.90 GB peak on the speed test structure). Benchy 6.5 → 3.7 s, the KSR FDM test with
+  supports and gyroid 38.7 → 14.5 s, the speed test structure 47 → 29 s. The 300 mm gyroid
+  takes 0.39 s.
+- Still open: offsets cost ~1 ms each in i_overlay (the speed test structure's walls); the
+  soak test; mesh booleans.
 
 ## 19 · Parity with OrcaSlicer
 - A reference set (calibration cube, Benchy, thin walls, overhang test, multi-part, multi-colour,

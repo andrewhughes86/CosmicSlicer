@@ -52,6 +52,10 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+      # Slicing time and memory on a reference set, on its own so other tests do not skew it.
+      - name: Performance budgets
+        run: cargo test -p CosmicSlicer-engine --lib budget_tests -- --ignored --nocapture --test-threads=1
+
       - name: Release build
         run: cargo build --release
 

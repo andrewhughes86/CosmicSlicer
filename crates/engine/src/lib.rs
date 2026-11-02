@@ -148,7 +148,11 @@ pub struct Progress {
     permille: AtomicU32,
     stage: Mutex<String>,
     cancel: AtomicBool,
+    timings: Mutex<StageClock>,
 }
+
+/// Seconds spent in each stage so far, and when the current one began.
+type StageClock = (Vec<(String, f64)>, Option<std::time::Instant>);
 
 impl Progress {
     pub fn fraction(&self) -> f32 {
@@ -167,10 +171,24 @@ impl Progress {
         self.cancel.load(Ordering::Relaxed)
     }
 
+    /// Seconds spent in each stage, in order (for finding where a slow slice spends its time).
+    pub fn timings(&self) -> Vec<(String, f64)> {
+        self.timings.lock().map(|t| t.0.clone()).unwrap_or_default()
+    }
+
     fn set(&self, fraction: f64, stage: &str) {
         self.permille.store((fraction.clamp(0.0, 1.0) * 1000.0) as u32, Ordering::Relaxed);
-        if let Ok(mut s) = self.stage.lock() {
-            stage.clone_into(&mut s);
+        let previous = self.stage.lock().map(|mut s| std::mem::replace(&mut *s, stage.to_owned())).unwrap_or_default();
+        if let Ok(mut t) = self.timings.lock() {
+            let now = std::time::Instant::now();
+            if let Some(began) = t.1 {
+                let secs = now.duration_since(began).as_secs_f64();
+                match t.0.iter_mut().find(|(name, _)| *name == previous) {
+                    Some(entry) => entry.1 += secs,
+                    None => t.0.push((previous, secs)),
+                }
+            }
+            t.1 = Some(now);
         }
     }
 }
@@ -531,14 +549,26 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
             }
         }
     }
+    // Support toolpaths per layer, in parallel (patterns and interfaces over every layer
+    // took longer than the support areas themselves).
+    progress.set(0.84, "Generating support toolpaths");
+    let mut support_paths: Vec<Vec<Path>> = if by_object {
+        Vec::new()
+    } else {
+        use rayon::prelude::*;
+        layers
+            .par_iter()
+            .enumerate()
+            .map(|(i, l)| support::paths(&support, i, &s, below + i == 0, l.print_z + lift))
+            .collect()
+    };
     plans.extend(layers.iter().enumerate().filter(|_| !by_object).map(|(i, l)| {
         let g = below + i;
-        let first = g == 0;
         LayerPlan {
             print_z: l.print_z + lift,
             height: l.height,
             skirt: skirt_for(g, l.height),
-            support: support::paths(&support, i, &s, first, l.print_z + lift),
+            support: support_paths.get_mut(i).map(std::mem::take).unwrap_or_default(),
             objects: object_plans
                 .iter_mut()
                 .enumerate()
@@ -954,6 +984,8 @@ fn support_marks(o: &JobObject, placed: &Placed, layers: &[LayerZ], cancelled: &
     (enforce, block)
 }
 
+#[cfg(test)]
+mod budget_tests;
 #[cfg(test)]
 mod fuzz_tests;
 #[cfg(test)]
@@ -1812,7 +1844,11 @@ mod tests {
             j.process.set(k.trim(), v.trim());
         }
         let started = std::time::Instant::now();
-        let out = slice(&j, &Progress::default());
+        let progress = Progress::default();
+        let out = slice(&j, &progress);
+        for (stage, secs) in progress.timings() {
+            println!("  {stage}: {secs:.2}s");
+        }
         assert!(out.is_ok(), "{:?}", out.as_ref().err());
         let Ok(out) = out else { return };
         println!(

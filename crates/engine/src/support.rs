@@ -7,7 +7,6 @@
 //! carry each area down layer by layer until it lands on the plate or on the part, kept a gap
 //! away from the part sideways, above and below.
 
-use std::collections::VecDeque;
 use std::f64::consts::FRAC_PI_2;
 
 use glam::DVec2;
@@ -281,47 +280,63 @@ fn columns(
         Vec::new()
     };
 
-    let mut region: Vec<Vec<Shape>> = vec![Vec::new(); n];
-    let mut top: Vec<Vec<Shape>> = vec![Vec::new(); n];
+    // Each layer's fresh overhang grown into columns: independent of the support above, so
+    // made in parallel; only the carrying down below runs layer by layer.
+    let fresh: Vec<Vec<Shape>> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let at = i + 1 + gap_top;
+            let f = need.get(at).cloned().unwrap_or_default();
+            if f.is_empty() || i + 1 >= n || cancelled() {
+                return Vec::new();
+            }
+            let f = grow(f, at);
+            match shadow.get(i).filter(|sh| !sh.is_empty()) {
+                Some(sh) => geom::boolean(&f, &geom::offset(sh, sp.xy_distance, Join::Round), Op::Difference),
+                None => f,
+            }
+        })
+        .collect();
+    let mut carried: Vec<Vec<Shape>> = vec![Vec::new(); n];
     let mut carry: Vec<Shape> = Vec::new();
-    // The part on the layers just above (past the gap), for the interface layers.
-    let mut above: VecDeque<Vec<Shape>> = VecDeque::new();
     for i in (0..n.saturating_sub(1)).rev() {
         if cancelled() {
             return;
         }
-        let mut fresh = need.get(i + 1 + gap_top).cloned().unwrap_or_default();
-        if !fresh.is_empty() {
-            fresh = grow(fresh, i + 1 + gap_top);
-            if let Some(sh) = shadow.get(i).filter(|sh| !sh.is_empty()) {
-                fresh = geom::boolean(&fresh, &geom::offset(sh, sp.xy_distance, Join::Round), Op::Difference);
-            }
-            carry = geom::boolean(&carry, &fresh, Op::Union);
+        if let Some(f) = fresh.get(i).filter(|f| !f.is_empty()) {
+            carry = geom::boolean(&carry, f, Op::Union);
         }
-        above.push_front(all.get(i + 1 + gap_top).cloned().unwrap_or_default());
-        above.truncate(sp.interface_layers.max(1));
         let Some(here) = all.get(i) else { continue };
         // Support ends where it lands on the part.
         carry = geom::without_slivers(geom::boolean(&carry, here, Op::Difference), w * w * 4.0);
-        if carry.is_empty() {
-            continue;
-        }
-        let gap = if i == 0 { sp.first_layer_gap } else { sp.xy_distance };
-        let clear = geom::offset(here, gap + w / 2.0, Join::Round);
-        let r = geom::boolean(&carry, &clear, Op::Difference);
-        // Smooth the column outlines a little.
-        let k = if snug { w / 2.0 } else { w };
-        let r = geom::offset(&geom::offset(&r, -k, Join::Round), k, Join::Round);
-        if sp.interface_layers > 0 {
-            let near: Vec<Shape> = above.iter().flatten().cloned().collect();
-            if let Some(t) = top.get_mut(i) {
-                *t = geom::boolean(&r, &near, Op::Intersect);
-            }
-        }
-        if let Some(slot) = region.get_mut(i) {
-            *slot = r;
+        if let Some(c) = carried.get_mut(i) {
+            c.clone_from(&carry);
         }
     }
+    // Each layer's column: clear of the part, smoothed, and its top interface under the part
+    // on the layers just above (past the gap).
+    let reach_up = sp.interface_layers.max(1);
+    let (mut region, top): (Vec<Vec<Shape>>, Vec<Vec<Shape>>) = carried
+        .into_par_iter()
+        .enumerate()
+        .map(|(i, carry)| {
+            let Some(here) = all.get(i).filter(|_| !carry.is_empty()) else { return (Vec::new(), Vec::new()) };
+            let gap = if i == 0 { sp.first_layer_gap } else { sp.xy_distance };
+            let clear = geom::offset(here, gap + w / 2.0, Join::Round);
+            let r = geom::boolean(&carry, &clear, Op::Difference);
+            // Smooth the column outlines a little.
+            let k = if snug { w / 2.0 } else { w };
+            let r = geom::offset(&geom::offset(&r, -k, Join::Round), k, Join::Round);
+            let t = if sp.interface_layers > 0 {
+                let near: Vec<Shape> =
+                    (i + 1 + gap_top..=i + gap_top + reach_up).filter_map(|j| all.get(j)).flatten().cloned().collect();
+                geom::boolean(&r, &near, Op::Intersect)
+            } else {
+                Vec::new()
+            };
+            (r, t)
+        })
+        .unzip();
 
     // Standing on the part: a gap over it, then the bottom interface layers.
     let union_of = |layers: std::ops::RangeInclusive<usize>| -> Vec<Shape> {

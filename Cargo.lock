@@ -44,6 +44,7 @@ dependencies = [
  "glam",
  "i_overlay",
  "log",
+ "miniz_oxide 0.8.9",
  "png",
  "rayon",
  "thiserror 2.0.21",

@@ -30,23 +30,25 @@ pub struct Block {
     pub jerk: f64,
 }
 
-/// Times (seconds) of each block.
-pub fn plan(blocks: &[Block], limits: &Limits, flavor: Flavor) -> Vec<f64> {
-    let n = blocks.len();
+/// Times (seconds) of each block. Takes the blocks as they come, so callers need not hold a
+/// copy of every move (millions on a tall print).
+pub fn plan(blocks: impl IntoIterator<Item = Block>, limits: &Limits, flavor: Flavor) -> Vec<f64> {
     struct P {
         len: f64,
         dir: [f64; 4],
         nominal: f64,
         accel: f64,
         max_entry: f64,
+        jerk: f64,
     }
-    let mut ps: Vec<P> = Vec::with_capacity(n);
+    let blocks = blocks.into_iter();
+    let mut ps: Vec<P> = Vec::with_capacity(blocks.size_hint().0);
     for b in blocks {
         let d = b.delta;
         let xyz = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
         let len = b.length.unwrap_or(if xyz > 1e-9 { xyz } else { d[3].abs() }).max(0.0);
         if !(len.is_finite()) || len < 1e-9 {
-            ps.push(P { len: 0.0, dir: [0.0; 4], nominal: 0.0, accel: 1.0, max_entry: 0.0 });
+            ps.push(P { len: 0.0, dir: [0.0; 4], nominal: 0.0, accel: 1.0, max_entry: 0.0, jerk: b.jerk });
             continue;
         }
         let dir = [d[0] / len, d[1] / len, d[2] / len, d[3] / len];
@@ -66,8 +68,9 @@ pub fn plan(blocks: &[Block], limits: &Limits, flavor: Flavor) -> Vec<f64> {
                 a = a.min(max_a / share);
             }
         }
-        ps.push(P { len, dir, nominal: v, accel: a.max(1.0), max_entry: 0.0 });
+        ps.push(P { len, dir, nominal: v, accel: a.max(1.0), max_entry: 0.0, jerk: b.jerk });
     }
+    let n = ps.len();
     // Corner speeds between consecutive moves.
     let mut prev: Option<usize> = None;
     for i in 0..n {
@@ -77,7 +80,7 @@ pub fn plan(blocks: &[Block], limits: &Limits, flavor: Flavor) -> Vec<f64> {
         let entry = match prev {
             None => 0.0,
             Some(j) => {
-                let jerk = if blocks[i].jerk > 0.0 { blocks[i].jerk } else { 0.0 };
+                let jerk = if ps[i].jerk > 0.0 { ps[i].jerk } else { 0.0 };
                 junction(&ps[j].dir, &ps[i].dir, ps[j].nominal, ps[i].nominal, ps[i].accel, limits, flavor, jerk)
             }
         };
@@ -121,7 +124,8 @@ pub fn plan(blocks: &[Block], limits: &Limits, flavor: Flavor) -> Vec<f64> {
             if p.len == 0.0 {
                 return 0.0;
             }
-            trapezoid(p.len, entry[i], exit[i], p.nominal, p.accel)
+            // A move too long or fast for f64 (damaged input) counts as no time, not infinity.
+            Some(trapezoid(p.len, entry[i], exit[i], p.nominal, p.accel)).filter(|t| t.is_finite()).unwrap_or(0.0)
         })
         .collect()
 }
@@ -212,7 +216,7 @@ mod tests {
     #[test]
     fn one_long_move_is_a_trapezoid() {
         // 100 mm at 100 mm/s with 1000 mm/s²: 0.1 s (5 mm) up, 0.1 s down, 90 mm cruising.
-        let t = plan(&[line(100.0, 0.0, 100.0, 1000.0)], &limits(), Flavor::Marlin);
+        let t = plan([line(100.0, 0.0, 100.0, 1000.0)], &limits(), Flavor::Marlin);
         assert!((t[0] - (0.1 + 0.1 + 0.9)).abs() < 1e-9, "{t:?}");
     }
 
@@ -220,7 +224,7 @@ mod tests {
     fn straight_runs_keep_their_speed() {
         // Ten 10 mm pieces in a line take as long as one 100 mm move.
         let pieces: Vec<Block> = (0..10).map(|_| line(10.0, 0.0, 100.0, 1000.0)).collect();
-        let total: f64 = plan(&pieces, &limits(), Flavor::Marlin).iter().sum();
+        let total: f64 = plan(pieces.iter().copied(), &limits(), Flavor::Marlin).iter().sum();
         assert!((total - 1.1).abs() < 1e-6, "{total}");
     }
 
@@ -228,11 +232,11 @@ mod tests {
     fn sharp_corners_cost_time() {
         let square: Vec<Block> =
             vec![line(50.0, 0.0, 200.0, 2000.0), line(0.0, 50.0, 200.0, 2000.0), line(-50.0, 0.0, 200.0, 2000.0)];
-        let marlin: f64 = plan(&square, &limits(), Flavor::Marlin).iter().sum();
-        let straight: f64 = plan(&[line(150.0, 0.0, 200.0, 2000.0)], &limits(), Flavor::Marlin).iter().sum();
+        let marlin: f64 = plan(square.iter().copied(), &limits(), Flavor::Marlin).iter().sum();
+        let straight: f64 = plan([line(150.0, 0.0, 200.0, 2000.0)], &limits(), Flavor::Marlin).iter().sum();
         assert!(marlin > straight, "{marlin} vs {straight}");
         // Klipper's junction deviation behaves the same way.
-        let klipper: f64 = plan(&square, &limits(), Flavor::Klipper).iter().sum();
+        let klipper: f64 = plan(square.iter().copied(), &limits(), Flavor::Klipper).iter().sum();
         assert!(klipper > straight);
     }
 
@@ -246,7 +250,7 @@ mod tests {
             kind: BlockKind::Travel,
             jerk: 0.0,
         };
-        let t = plan(&[z], &limits(), Flavor::Marlin)[0];
+        let t = plan([z], &limits(), Flavor::Marlin)[0];
         // Capped at 20 mm/s by the Z axis: at least half a second.
         assert!(t >= 0.5, "{t}");
         let retract = Block {
@@ -257,16 +261,16 @@ mod tests {
             kind: BlockKind::Retract,
             jerk: 0.0,
         };
-        assert!(plan(&[retract], &limits(), Flavor::Marlin)[0] > 0.8 / 40.0);
+        assert!(plan([retract], &limits(), Flavor::Marlin)[0] > 0.8 / 40.0);
     }
 
     #[test]
     fn nothing_moves_in_no_time() {
         let empty =
             Block { delta: [0.0; 4], length: None, feed: 100.0, accel: 1000.0, kind: BlockKind::Travel, jerk: 0.0 };
-        assert_eq!(plan(&[empty], &limits(), Flavor::Marlin), vec![0.0]);
-        assert!(plan(&[], &limits(), Flavor::Marlin).is_empty());
+        assert_eq!(plan([empty], &limits(), Flavor::Marlin), vec![0.0]);
+        assert!(plan(std::iter::empty(), &limits(), Flavor::Marlin).is_empty());
         let bad = Block { delta: [f64::NAN, 0.0, 0.0, 0.0], ..empty };
-        assert!(plan(&[bad], &limits(), Flavor::Marlin)[0].is_finite());
+        assert!(plan([bad], &limits(), Flavor::Marlin)[0].is_finite());
     }
 }

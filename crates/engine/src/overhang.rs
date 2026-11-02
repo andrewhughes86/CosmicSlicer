@@ -140,7 +140,9 @@ mod tests {
         assert_eq!(b.degree(DVec2::new(11.8, 5.0)), 5);
         // Centred 0.05 mm past the edge: five eighths hang.
         assert_eq!(b.degree(DVec2::new(10.05, 5.0)), 3);
-        assert_eq!(b.degree(DVec2::new(9.9, 5.0)), 2);
+        // 0.05 mm inside: three eighths hang (not 9.9, which is exactly on degree 2's edge and
+        // goes either way with rounding).
+        assert_eq!(b.degree(DVec2::new(9.95, 5.0)), 2);
         let mut wall = Path::new(
             Role::OuterWall,
             crate::geom::rectangle(DVec2::splat(0.2), DVec2::new(11.8, 9.8)).remove(0),
