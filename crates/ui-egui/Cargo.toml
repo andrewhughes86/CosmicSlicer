@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 CosmicSlicer-config = { workspace = true }
+CosmicSlicer-connect = { workspace = true }
 CosmicSlicer-engine = { workspace = true }
 CosmicSlicer-import = { workspace = true }
 CosmicSlicer-model = { workspace = true }

@@ -12,6 +12,7 @@
 
 mod app;
 pub mod automation;
+mod devices;
 mod dialogs;
 mod emboss;
 pub mod icons;

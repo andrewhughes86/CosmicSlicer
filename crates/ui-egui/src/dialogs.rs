@@ -7,10 +7,12 @@ use egui::{Align, Layout, RichText, Sense, Stroke, vec2};
 use CosmicSlicer_config::TabKind;
 
 use crate::icons;
-use crate::pages::{DeviceState, HOST_TYPES};
+use CosmicSlicer_connect::{HostType, PhysicalPrinter};
+
+use crate::pages::DeviceState;
 use crate::settings::{self, Target};
 use crate::sidebar::preset_combo;
-use crate::state::{BED_TYPES, Level, Page, Session};
+use crate::state::{BED_TYPES, Level, Session};
 use crate::theme::{Theme, Tokens, parse_hex};
 use crate::ui_kit::{self, Window};
 use egui::Color32;
@@ -51,6 +53,10 @@ pub struct Dialogs {
     pub print: bool,
     /// The Print dialog's "Export G-code" was clicked.
     pub export_requested: bool,
+    /// The Print dialog's Send: (printer name, start printing).
+    pub send_requested: Option<(String, bool)>,
+    /// The Print dialog's "Upload only" is ticked.
+    pub upload_only: bool,
     /// The setup wizard, while open.
     pub wizard: Option<crate::wizard::Wizard>,
     /// User preset being renamed: (kind, index, new name so far).
@@ -564,47 +570,235 @@ impl Dialogs {
         self.bed_shape = open.then_some(v);
     }
 
+    /// OrcaSlicer's physical printer dialog: add or edit a printer's network connection,
+    /// test it, and (for Bambu printers) find it on the network.
     fn printer_window(&mut self, ctx: &egui::Context, session: &mut Session, t: &Tokens, d: &mut DeviceState) {
         if !self.physical_printer {
             return;
         }
+        if d.edit.is_none() {
+            let n = session.prefs.printers.len() + 1;
+            d.edit = Some((None, PhysicalPrinter { name: format!("Printer {n}"), ..Default::default() }));
+            d.test_result = None;
+        }
+        // Finished background jobs.
+        if let Some(r) = d.test.as_ref().and_then(|j| j.poll()) {
+            d.test = None;
+            d.test_result = Some(r.unwrap_or_else(|| Err("the test stopped unexpectedly".into())));
+        }
+        if let Some(r) = d.storages.as_ref().and_then(|j| j.poll()) {
+            d.storages = None;
+            match r {
+                Some(Ok(list)) => d.storage_list = list,
+                Some(Err(e)) => d.test_result = Some(Err(e)),
+                None => {}
+            }
+        }
+        if let Some(r) = d.discover.as_ref().and_then(|j| j.poll()) {
+            d.discover = None;
+            d.found = r.unwrap_or_else(|| Err("the search stopped unexpectedly".into()));
+        }
+        if d.test.is_some() || d.storages.is_some() || d.discover.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
         let mut open = true;
+        let mut close = false;
         Window::dialog("Physical Printer").show(ctx, t, &mut open, |ui| {
-            ui.set_width(460.0);
-            egui::Grid::new("host").num_columns(2).spacing([20.0, 10.0]).show(ui, |ui| {
-                ui.label("Host Type");
-                egui::ComboBox::from_id_salt("host-type")
-                    .selected_text(HOST_TYPES.get(d.host_type).copied().unwrap_or(""))
-                    .width(260.0)
-                    .show_ui(ui, |ui| {
-                        for (i, h) in HOST_TYPES.iter().enumerate() {
-                            ui.selectable_value(&mut d.host_type, i, *h);
+            ui.set_width(500.0);
+            let Some((index, p)) = d.edit.as_mut() else { return };
+            // Which printer: one already set up, or a new one.
+            let names: Vec<String> = session.prefs.printers.iter().map(|x| x.name.clone()).collect();
+            if !names.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label("Edit");
+                    let shown = index.and_then(|i| names.get(i).cloned()).unwrap_or_else(|| "New printer".into());
+                    egui::ComboBox::from_id_salt("pp-which").selected_text(shown).width(260.0).show_ui(ui, |ui| {
+                        for (i, n) in names.iter().enumerate() {
+                            if ui.selectable_label(*index == Some(i), n).clicked()
+                                && let Some(x) = session.prefs.printers.get(i)
+                            {
+                                *index = Some(i);
+                                *p = x.clone();
+                                d.test_result = None;
+                                d.storage_list.clear();
+                            }
+                        }
+                        if ui.selectable_label(index.is_none(), "New printer").clicked() {
+                            *index = None;
+                            *p = PhysicalPrinter { name: format!("Printer {}", names.len() + 1), ..Default::default() };
+                            d.test_result = None;
                         }
                     });
+                });
+                ui.separator();
+            }
+            egui::Grid::new("host").num_columns(2).spacing([20.0, 10.0]).show(ui, |ui| {
+                ui.label("Name");
+                ui.add(egui::TextEdit::singleline(&mut p.name).desired_width(280.0));
                 ui.end_row();
-                ui.label("Hostname, IP or URL");
-                ui.add(
-                    egui::TextEdit::singleline(&mut d.host)
-                        .hint_text("192.168.1.50 or printer.local")
-                        .desired_width(260.0),
-                );
+                ui.label("Host Type");
+                egui::ComboBox::from_id_salt("host-type").selected_text(p.host.label()).width(280.0).show_ui(ui, |ui| {
+                    for h in HostType::ALL {
+                        ui.selectable_value(&mut p.host, h, h.label());
+                    }
+                });
                 ui.end_row();
-                ui.label("API Key / Password");
-                ui.add(egui::TextEdit::singleline(&mut d.api_key).password(true).desired_width(260.0));
+                let bambu = p.host == HostType::BambuLan;
+                ui.label(if bambu { "IP address" } else { "Hostname, IP or URL" });
+                ui.add(egui::TextEdit::singleline(&mut p.address).hint_text("192.168.1.50 or printer.local").desired_width(280.0));
                 ui.end_row();
-            });
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui.button("Test").clicked() {
-                    session.notify(Level::Warning, "Printer connections arrive in a later step; nothing was sent.");
+                if bambu {
+                    ui.label("Serial number");
+                    ui.add(egui::TextEdit::singleline(&mut p.serial).desired_width(280.0));
+                    ui.end_row();
+                    ui.label("Access code");
+                    ui.add(egui::TextEdit::singleline(&mut p.access_code).password(true).desired_width(280.0));
+                    ui.end_row();
+                    ui.label("AMS");
+                    ui.checkbox(&mut p.use_ams, "Print with the AMS (filament n from slot n)");
+                    ui.end_row();
+                } else if p.host == HostType::PrusaLink {
+                    ui.label("User");
+                    ui.add(egui::TextEdit::singleline(&mut p.user).hint_text("maker").desired_width(280.0));
+                    ui.end_row();
+                    ui.label("Password");
+                    ui.add(egui::TextEdit::singleline(&mut p.password).password(true).desired_width(280.0));
+                    ui.end_row();
+                    ui.label("or API Key");
+                    ui.add(egui::TextEdit::singleline(&mut p.api_key).password(true).desired_width(280.0));
+                    ui.end_row();
+                } else {
+                    ui.label("API Key / Password");
+                    ui.add(egui::TextEdit::singleline(&mut p.api_key).password(true).desired_width(280.0));
+                    ui.end_row();
                 }
-                if ui.button("OK").clicked() {
-                    self.physical_printer = false;
+                if p.host == HostType::Repetier {
+                    ui.label("Printer");
+                    ui.add(egui::TextEdit::singleline(&mut p.slug).hint_text("the printer's slug on the server").desired_width(280.0));
+                    ui.end_row();
+                }
+                if p.host.has_storage() {
+                    ui.label("Storage");
+                    ui.horizontal(|ui| {
+                        let shown = d.storage_list.iter().find(|s| s.id == p.storage).map_or_else(
+                            || if p.storage.is_empty() { "Printer's default".to_owned() } else { p.storage.clone() },
+                            |s| s.name.clone(),
+                        );
+                        egui::ComboBox::from_id_salt("pp-storage").selected_text(shown).width(190.0).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut p.storage, String::new(), "Printer's default");
+                            for st in &d.storage_list {
+                                ui.selectable_value(&mut p.storage, st.id.clone(), &st.name);
+                            }
+                        });
+                        if ui.add_enabled(d.storages.is_none(), egui::Button::new("Refresh")).clicked() {
+                            d.storages = crate::devices::storages(p);
+                        }
+                    });
+                    ui.end_row();
+                }
+                if !bambu {
+                    ui.label("HTTPS");
+                    ui.checkbox(&mut p.verify_tls, "Check the certificate (off for printers that sign their own)");
+                    ui.end_row();
+                }
+            });
+            if let Some(why) = p.host.unsupported() {
+                ui.colored_label(t.warning, format!("{}: {why}.", p.host.label()));
+            }
+            if p.host == HostType::BambuLan {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Turn on LAN mode on the printer (Settings › Network; newer firmware also needs \"LAN only\" or developer mode). The access code and IP address are on the same screen; the serial number is in Settings › Device.",
+                    )
+                    .small()
+                    .color(t.text_muted),
+                );
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(d.discover.is_none(), egui::Button::new("Find printers")).clicked() {
+                        d.discover = crate::devices::discover();
+                        d.found = Ok(Vec::new());
+                    }
+                    if d.discover.is_some() {
+                        ui.spinner();
+                        ui.label("Listening for printers…");
+                    }
+                });
+                match &d.found {
+                    Ok(found) => {
+                        for f in found {
+                            let text = format!("{} ({}) at {} · {}", f.name, f.model, f.ip, f.serial);
+                            if ui.button(text).on_hover_text("Use this printer").clicked() {
+                                p.address = f.ip.clone();
+                                p.serial = f.serial.clone();
+                                if p.name.starts_with("Printer ") && !f.name.is_empty() {
+                                    p.name = f.name.clone();
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        ui.colored_label(t.warning, e);
+                    }
+                }
+            }
+            ui.add_space(10.0);
+            match &d.test_result {
+                Some(Ok(text)) => {
+                    ui.colored_label(t.success, format!("✔ {text}"));
+                }
+                Some(Err(e)) => {
+                    ui.colored_label(t.error, e);
+                }
+                None => {}
+            }
+            ui.horizontal(|ui| {
+                if ui.add_enabled(d.test.is_none(), egui::Button::new("Test")).clicked() {
+                    d.test_result = None;
+                    d.test = crate::devices::test(p);
+                }
+                if d.test.is_some() {
+                    ui.spinner();
+                }
+                let name = p.name.trim().to_owned();
+                let taken = session.prefs.printers.iter().enumerate().any(|(i, x)| x.name == name && Some(i) != *index);
+                let can_save = !name.is_empty() && !taken && !p.address.trim().is_empty();
+                if ui_kit::primary_button(ui, t, "Save").clicked() && can_save {
+                    p.name = name.clone();
+                    match index.and_then(|i| session.prefs.printers.get_mut(i)) {
+                        Some(slot) => *slot = p.clone(),
+                        None => {
+                            session.prefs.printers.push(p.clone());
+                            *index = Some(session.prefs.printers.len() - 1);
+                        }
+                    }
+                    session.prefs.active_printer = name;
+                    d.devices.prune(&session.prefs.printers);
+                    close = true;
+                }
+                if let Some(i) = *index
+                    && ui.button("Delete").clicked()
+                {
+                    if i < session.prefs.printers.len() {
+                        session.prefs.printers.remove(i);
+                    }
+                    d.devices.prune(&session.prefs.printers);
+                    close = true;
+                }
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+                if taken {
+                    ui.colored_label(t.warning, "Another printer has this name.");
+                } else if p.address.trim().is_empty() {
+                    ui.label(RichText::new("The address is needed.").color(t.text_muted));
                 }
             });
         });
-        if !open {
+        if !open || close {
             self.physical_printer = false;
+            d.edit = None;
+            d.test_result = None;
         }
     }
 
@@ -881,20 +1075,49 @@ impl Dialogs {
         if self.print {
             let mut open = true;
             Window::dialog("Print plate").show(ctx, t, &mut open, |ui| {
-                ui.set_width(420.0);
-                ui.label("No printer is connected. Export the G-code to print from a card or USB stick, or set up the printer's connection to send plates to it.");
+                ui.set_width(440.0);
+                let printers: Vec<(String, HostType)> =
+                    session.prefs.printers.iter().map(|p| (p.name.clone(), p.host)).collect();
+                if printers.is_empty() {
+                    ui.label("No printer is set up. Export the G-code to print from a card or USB stick, or set up the printer's network connection to send plates to it.");
+                } else {
+                    let current = session.active_printer().map(|p| p.name.clone()).unwrap_or_default();
+                    ui.horizontal(|ui| {
+                        ui.label("Printer");
+                        egui::ComboBox::from_id_salt("print-to").selected_text(&current).width(260.0).show_ui(ui, |ui| {
+                            for (name, host) in &printers {
+                                if ui.selectable_label(*name == current, format!("{name}  ({})", host.label())).clicked() {
+                                    session.prefs.active_printer = name.clone();
+                                }
+                            }
+                        });
+                    });
+                    ui.checkbox(&mut self.upload_only, "Upload only (start it from the printer)");
+                    let host = session.active_printer().map(|p| p.host);
+                    if let Some(why) = host.and_then(HostType::unsupported) {
+                        ui.colored_label(t.warning, why);
+                    }
+                    ui.label(
+                        RichText::new("The plate is sliced first if it needs to be; the G-code goes to the printer as it is.")
+                            .small()
+                            .color(t.text_muted),
+                    );
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui_kit::primary_button(ui, t, "Export G-code…").clicked() {
+                    if let Some(p) = session.active_printer().filter(|p| p.host.unsupported().is_none()) {
+                        let label = if self.upload_only { "Upload" } else { "Upload and print" };
+                        if ui_kit::primary_button(ui, t, label).clicked() {
+                            self.send_requested = Some((p.name.clone(), !self.upload_only));
+                            self.print = false;
+                        }
+                    }
+                    if ui.button("Export G-code…").clicked() {
                         self.export_requested = true;
                         self.print = false;
                     }
                     if ui.button("Set up a printer…").clicked() {
                         self.physical_printer = true;
-                        self.print = false;
-                    }
-                    if ui.button("Go to Device").clicked() {
-                        session.page = Page::Device;
                         self.print = false;
                     }
                 });

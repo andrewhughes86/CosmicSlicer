@@ -54,6 +54,10 @@ OrcaSlicer's crashes are the reason this exists.
   frame); `load` (every format, zip archives); `threemf` reads and writes 3MF projects in
   OrcaSlicer's layout (objects and parts in `3D/Objects/`, `Metadata/model_settings.config`,
   `project_settings.config`, painted facets kept as Orca's encoded strings).
+- `crates/connect` — printer connections: OrcaSlicer's print hosts over HTTP (`hosts`, on a
+  small blocking `http` client), Bambu Lab LAN mode (`bambu`: MQTT, FTPS, sliced 3MF, SSDP,
+  camera), and `link`, a worker thread per printer. Every read and write has a timeout; the
+  UI only sends requests and picks up events (`ui-egui/src/devices.rs`), never waits.
 - `crates/import` — the model readers (mesh formats and STEP/IGES/SAT with their B-rep kernel),
   vendored from CosmicDMS; keep fixes in step with it.
 - `crates/engine` — the slicer: `slicing` (mesh → layer shapes), `walls`, `plan` (top /

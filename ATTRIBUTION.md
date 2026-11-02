@@ -26,3 +26,11 @@ Taken from OrcaSlicer (commit 95a27321456e73cf6c6270d37dccfe819a96b130, 2026-11-
   SAT are tessellated with, from CosmicDMS (`crates/io`, and `brep`, `nurbs`, `trim`, `mesh`
   of `crates/geom`) by the same author, there MIT OR Apache-2.0, here under the AGPL with
   the rest of CosmicSlicer.
+
+## Printer protocols
+- Bambu Lab printers in LAN mode (`crates/connect/src/bambu.rs`: MQTT reports and commands,
+  implicit FTPS uploads, the sliced `.gcode.3mf`, the P1/A1 camera on port 6000) are written
+  from the community's public descriptions of the protocol (OpenBambuAPI); no Bambu code or
+  network plugin is used.
+- The print hosts follow the APIs OctoPrint, Moonraker, PrusaLink, Duet (RepRapFirmware),
+  Repetier-Server, ESP3D, MKS and FlashAir publish, as OrcaSlicer's `src/slic3r/Utils/` uses them.

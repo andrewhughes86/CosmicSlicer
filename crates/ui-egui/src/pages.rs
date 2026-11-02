@@ -2,57 +2,51 @@
 
 use egui::{Align, Layout, RichText, Sense, Stroke, Ui, vec2};
 
+use CosmicSlicer_connect::{Command, Heater, HostType, PhysicalPrinter, State, Storage, bambu};
+
 use crate::Action;
+use crate::devices::Job;
 use crate::icons;
 use crate::state::{Page, Session};
 use crate::theme::Tokens;
 use crate::ui_kit::{self, Surface};
 
-/// Device page state: the printer connection being set up.
-#[derive(Clone, Debug)]
+/// The Device pages' and printer dialog's state.
 pub struct DeviceState {
-    pub host_type: usize,
-    pub host: String,
-    pub api_key: String,
+    pub devices: crate::devices::Devices,
+    /// The printer in the printer dialog: its place in the list (`None` for a new one) and
+    /// its settings as edited.
+    pub edit: Option<(Option<usize>, PhysicalPrinter)>,
+    pub test: Option<Job<Result<String, String>>>,
+    pub test_result: Option<Result<String, String>>,
+    pub storages: Option<Job<Result<Vec<Storage>, String>>>,
+    pub storage_list: Vec<Storage>,
+    pub discover: Option<Job<Result<Vec<bambu::Found>, String>>>,
+    pub found: Result<Vec<bambu::Found>, String>,
     pub nozzle_target: f32,
     pub bed_target: f32,
     pub fan: f32,
-    pub speed: usize,
     pub jog_step: usize,
 }
 
 impl Default for DeviceState {
     fn default() -> Self {
         Self {
-            host_type: 0,
-            host: String::new(),
-            api_key: String::new(),
+            devices: Default::default(),
+            edit: None,
+            test: None,
+            test_result: None,
+            storages: None,
+            storage_list: Vec::new(),
+            discover: None,
+            found: Ok(Vec::new()),
             nozzle_target: 0.0,
             bed_target: 0.0,
             fan: 0.0,
-            speed: 1,
             jog_step: 1,
         }
     }
 }
-
-/// OrcaSlicer's printer host types.
-pub const HOST_TYPES: &[&str] = &[
-    "Octo/Klipper",
-    "PrusaLink",
-    "PrusaConnect",
-    "Duet",
-    "FlashAir",
-    "AstroBox",
-    "Repetier",
-    "MKS",
-    "ESP3D",
-    "CrealityPrint",
-    "Obico",
-    "Flashforge",
-    "SimplyPrint",
-    "Elegoo Link",
-];
 
 // ---- Home ----
 
@@ -252,16 +246,84 @@ fn card<R>(ui: &mut Ui, t: &Tokens, title: &str, add: impl FnOnce(&mut Ui) -> R)
     .inner
 }
 
+fn hms(secs: f64) -> String {
+    let s = secs.clamp(0.0, 1e7) as u64;
+    if s >= 3600 { format!("{}h {:02}m", s / 3600, s / 60 % 60) } else { format!("{}m {:02}s", s / 60, s % 60) }
+}
+
+/// A line saying what the printer is doing, for headers and the printer list.
+fn state_line(d: &DeviceState, p: &PhysicalPrinter) -> (String, bool) {
+    let info = d.devices.info.get(&p.name);
+    if let Some(why) = info.and_then(|i| i.offline.as_ref()) {
+        return (format!("Offline: {why}"), false);
+    }
+    match info.and_then(|i| i.status.as_ref()) {
+        Some(s) => {
+            let mut text = s.state.label().to_owned();
+            if let Some(f) = s.progress.filter(|_| s.state.busy()) {
+                text.push_str(&format!(" · {:.0}%", f * 100.0));
+            }
+            (text, true)
+        }
+        None if !p.host.live() => ("Takes uploads (no live status for this host type)".into(), true),
+        None => ("Connecting…".into(), true),
+    }
+}
+
 pub fn device(ui: &mut Ui, session: &mut Session, t: &Tokens, d: &mut DeviceState, actions: &mut Vec<Action>) {
-    let printer =
-        session.presets.preset(CosmicSlicer_config::TabKind::Printer, 0).map(|p| p.name.clone()).unwrap_or_default();
+    let Some(p) = session.active_printer().cloned() else {
+        ui.add_space(30.0);
+        ui.vertical_centered(|ui| {
+            let (r, _) = ui.allocate_exact_size(vec2(64.0, 64.0), Sense::hover());
+            icons::paint(ui, r, "monitor_none_printer", t, true);
+            ui.label(RichText::new("No printer is set up").size(17.0).strong());
+            ui.label(
+                RichText::new(
+                    "Add your printer's network connection (Klipper, OctoPrint, PrusaLink, a Bambu Lab printer in LAN mode, …) to send plates to it and follow its prints here.",
+                )
+                .color(t.text_muted),
+            );
+            ui.add_space(8.0);
+            if ui_kit::primary_button(ui, t, "Add printer").clicked() {
+                actions.push(Action::PhysicalPrinter);
+            }
+        });
+        d.devices.camera(None);
+        return;
+    };
+    if p.host.live() {
+        d.devices.watch(&p);
+    }
+    let status = d.devices.info.get(&p.name).and_then(|i| i.status.clone());
+    let online = d.devices.info.get(&p.name).is_some_and(|i| i.offline.is_none() && i.status.is_some());
+    let (line, ok) = state_line(d, &p);
     ui.horizontal(|ui| {
         let (r, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
         icons::paint(ui, r, "monitor_printer", t, true);
-        ui.label(RichText::new(&printer).size(17.0).strong());
-        ui.label(RichText::new("·  Not connected").color(t.text_muted));
+        let names: Vec<String> = session.prefs.printers.iter().map(|x| x.name.clone()).collect();
+        egui::ComboBox::from_id_salt("device-printer").selected_text(RichText::new(&p.name).strong()).show_ui(
+            ui,
+            |ui| {
+                for n in names {
+                    if ui.selectable_label(n == p.name, &n).clicked() {
+                        session.prefs.active_printer = n;
+                    }
+                }
+            },
+        );
+        ui.label(RichText::new(format!("{} · {line}", p.host.label())).color(if ok {
+            t.text_muted
+        } else {
+            t.warning
+        }));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui_kit::primary_button(ui, t, "Connect").clicked() {
+            if ui_kit::primary_button(ui, t, "Add printer").clicked() {
+                actions.push(Action::PhysicalPrinter);
+            }
+            if ui.button("Edit").clicked() {
+                let i = session.prefs.printers.iter().position(|x| x.name == p.name);
+                d.edit = Some((i, p.clone()));
+                d.test_result = None;
                 actions.push(Action::PhysicalPrinter);
             }
         });
@@ -269,27 +331,57 @@ pub fn device(ui: &mut Ui, session: &mut Session, t: &Tokens, d: &mut DeviceStat
     ui.add_space(10.0);
     let width = ui.available_width();
     let left_w = (width * 0.58).max(300.0);
+    let state = status.as_ref().map_or(State::Unknown, |s| s.state);
     ui.horizontal_top(|ui| {
         ui.vertical(|ui| {
             ui.set_width(left_w);
             card(ui, t, "Camera", |ui| {
+                let on = d.devices.camera_on(&p.name);
                 let (r, _) =
                     ui.allocate_exact_size(vec2(ui.available_width(), (left_w * 0.56).min(420.0)), Sense::hover());
                 ui.painter().rect_filled(r, 6.0, t.app_bg);
-                icons::paint(
-                    ui,
-                    egui::Rect::from_center_size(r.center() - vec2(0.0, 14.0), vec2(48.0, 48.0)),
-                    "monitor_camera",
-                    t,
-                    false,
-                );
-                ui.painter().text(
-                    r.center() + vec2(0.0, 26.0),
-                    egui::Align2::CENTER_CENTER,
-                    "No camera feed — the printer is not connected",
-                    egui::FontId::proportional(13.0),
-                    t.text_muted,
-                );
+                match d.devices.info.get(&p.name).and_then(|i| i.frame.as_ref()).filter(|_| on) {
+                    Some(tex) => {
+                        // Fitted, keeping its shape.
+                        let size = tex.size_vec2();
+                        let k = (r.width() / size.x.max(1.0)).min(r.height() / size.y.max(1.0));
+                        let img = egui::Rect::from_center_size(r.center(), size * k);
+                        ui.painter().image(
+                            tex.id(),
+                            img,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                    None => {
+                        icons::paint(
+                            ui,
+                            egui::Rect::from_center_size(r.center() - vec2(0.0, 14.0), vec2(48.0, 48.0)),
+                            "monitor_camera",
+                            t,
+                            false,
+                        );
+                        let text = if on {
+                            "Waiting for the camera…"
+                        } else if online {
+                            "Camera off"
+                        } else {
+                            "No camera feed — the printer is not connected"
+                        };
+                        ui.painter().text(
+                            r.center() + vec2(0.0, 26.0),
+                            egui::Align2::CENTER_CENTER,
+                            text,
+                            egui::FontId::proportional(13.0),
+                            t.text_muted,
+                        );
+                    }
+                }
+                ui.add_space(4.0);
+                let label = if on { "Turn camera off" } else { "Show camera" };
+                if ui.add_enabled(p.host.live(), egui::Button::new(label)).clicked() {
+                    d.devices.camera(if on { None } else { Some(&p) });
+                }
             });
             ui.add_space(10.0);
             card(ui, t, "Printing progress", |ui| {
@@ -298,18 +390,39 @@ pub fn device(ui: &mut Ui, session: &mut Session, t: &Tokens, d: &mut DeviceStat
                     ui.painter().rect_filled(r, 6.0, t.raised_bg);
                     icons::paint(ui, r.shrink(20.0), "monitor_item_print", t, false);
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("Idle").strong());
-                        ui.add(
-                            egui::ProgressBar::new(0.0).desired_width(ui.available_width() - 10.0).show_percentage(),
-                        );
+                        let offline = d.devices.info.get(&p.name).is_some_and(|i| i.offline.is_some());
+                        let title = match status.as_ref().and_then(|s| s.file.clone()) {
+                            Some(f) => f,
+                            None if offline => "Offline".to_owned(),
+                            None => state.label().to_owned(),
+                        };
+                        ui.label(RichText::new(title).strong());
+                        let f = status.as_ref().and_then(|s| s.progress).unwrap_or(0.0);
+                        ui.add(egui::ProgressBar::new(f).desired_width(ui.available_width() - 10.0).show_percentage());
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("Layer: —").color(t.text_muted));
+                            let layer =
+                                status.as_ref().and_then(|s| s.layer).map_or("—".into(), |(c, n)| format!("{c}/{n}"));
+                            let left = status.as_ref().and_then(|s| s.remaining_s).map_or("—".into(), hms);
+                            ui.label(RichText::new(format!("Layer: {layer}")).color(t.text_muted));
                             ui.add_space(16.0);
-                            ui.label(RichText::new("Remaining: —").color(t.text_muted));
+                            ui.label(RichText::new(format!("Remaining: {left}")).color(t.text_muted));
                         });
                         ui.horizontal(|ui| {
-                            for icon in ["print_control_pause", "print_control_stop"] {
-                                icons::button_enabled(ui, icon, t, 28.0, false, false, "Available when printing");
+                            let (icon, tip, cmd) = if state == State::Paused {
+                                ("print_control_resume", "Resume", Command::Resume)
+                            } else {
+                                ("print_control_pause", "Pause", Command::Pause)
+                            };
+                            let busy = state.busy();
+                            if icons::button_enabled(ui, icon, t, 28.0, false, busy, tip).clicked() {
+                                d.devices.control(&p, cmd);
+                            }
+                            if icons::button_enabled(ui, "print_control_stop", t, 28.0, false, busy, "Stop").clicked() {
+                                d.devices.control(&p, Command::Stop);
+                            }
+                            if d.devices.info.get(&p.name).is_some_and(|i| i.sending) {
+                                ui.spinner();
+                                ui.label("Sending…");
                             }
                         });
                     });
@@ -318,106 +431,196 @@ pub fn device(ui: &mut Ui, session: &mut Session, t: &Tokens, d: &mut DeviceStat
         });
         ui.add_space(12.0);
         ui.vertical(|ui| {
-            card(ui, t, "Control", |ui| {
-                ui.add_enabled_ui(false, |ui| {
-                    egui::Grid::new("device-temps").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
-                        for (icon, name, value) in [
-                            ("monitor_nozzle_temp", "Nozzle", &mut d.nozzle_target),
-                            ("monitor_bed_temp", "Bed", &mut d.bed_target),
-                        ] {
-                            ui.horizontal(|ui| {
-                                let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
-                                icons::paint(ui, r, icon, t, true);
-                                ui.label(name);
-                            });
-                            ui.label(RichText::new("— °C").color(t.text_muted));
-                            ui.add(egui::DragValue::new(value).range(0.0..=350.0).suffix(" °C"));
-                            ui.end_row();
-                        }
-                        ui.horizontal(|ui| {
-                            let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
-                            icons::paint(ui, r, "monitor_fan", t, true);
-                            ui.label("Part fan");
-                        });
-                        ui.label(RichText::new("—").color(t.text_muted));
-                        ui.add(egui::Slider::new(&mut d.fan, 0.0..=100.0).suffix("%"));
-                        ui.end_row();
-                    });
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Speed");
-                        for (i, name) in ["Silent", "Standard", "Sport", "Ludicrous"].iter().enumerate() {
-                            ui.selectable_value(&mut d.speed, i, *name);
-                        }
-                    });
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("Jog").strong());
-                    ui.horizontal(|ui| {
-                        for (i, step) in ["0.1", "1", "10", "100"].iter().enumerate() {
-                            ui.selectable_value(&mut d.jog_step, i, format!("{step} mm"));
-                        }
-                    });
-                    egui::Grid::new("jog").spacing([4.0, 4.0]).show(ui, |ui| {
-                        ui.label("");
-                        let _ = ui.button(" Y+ ");
-                        ui.label("");
-                        ui.label("   ");
-                        let _ = ui.button(" Z+ ");
-                        ui.end_row();
-                        let _ = ui.button(" X− ");
-                        let (r, _) = ui.allocate_exact_size(vec2(36.0, 24.0), Sense::hover());
-                        icons::paint(ui, r, "monitor_axis_home", t, false);
-                        let _ = ui.button(" X+ ");
-                        ui.label("   ");
-                        let _ = ui.button(" Z− ");
-                        ui.end_row();
-                        ui.label("");
-                        let _ = ui.button(" Y− ");
-                        ui.end_row();
-                    });
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        let _ = ui.button("Extrude");
-                        let _ = ui.button("Retract");
-                        let _ = ui.button("Load");
-                        let _ = ui.button("Unload");
-                    });
-                });
-                ui.add_space(6.0);
-                ui.label(RichText::new("Connect a printer to control it from here.").small().color(t.text_muted));
-            });
+            card(ui, t, "Control", |ui| control(ui, t, d, &p, status.as_ref(), online));
         });
     });
 }
 
+fn control(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: &mut DeviceState,
+    p: &PhysicalPrinter,
+    status: Option<&CosmicSlicer_connect::Status>,
+    online: bool,
+) {
+    // Moving the head mid-print is refused, as on the printer's own screen.
+    let printing = status.is_some_and(|s| s.state.busy());
+    let prusalink = p.host == HostType::PrusaLink;
+    ui.add_enabled_ui(online && !prusalink, |ui| {
+        egui::Grid::new("device-temps").num_columns(4).spacing([12.0, 8.0]).show(ui, |ui| {
+            for (icon, name, heater) in
+                [("monitor_nozzle_temp", "Nozzle", Heater::Nozzle), ("monitor_bed_temp", "Bed", Heater::Bed)]
+            {
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+                    icons::paint(ui, r, icon, t, true);
+                    ui.label(name);
+                });
+                let reading = status.and_then(|s| s.temps.iter().find(|x| x.name == name));
+                ui.label(reading.map_or("— °C".into(), |r| format!("{:.0} / {:.0} °C", r.actual, r.target)));
+                let value = if heater == Heater::Nozzle { &mut d.nozzle_target } else { &mut d.bed_target };
+                ui.add(egui::DragValue::new(value).range(0.0..=350.0).suffix(" °C"));
+                if ui.button("Set").clicked() {
+                    d.devices.control(p, Command::SetTemp(heater, *value));
+                }
+                ui.end_row();
+            }
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+                icons::paint(ui, r, "monitor_fan", t, true);
+                ui.label("Part fan");
+            });
+            ui.label(status.and_then(|s| s.fan).map_or("—".into(), |f| format!("{:.0}%", f * 100.0)));
+            let fan = ui.add(egui::Slider::new(&mut d.fan, 0.0..=100.0).suffix("%"));
+            if fan.drag_stopped() || (fan.changed() && !fan.dragged()) {
+                d.devices.control(p, Command::Fan(d.fan / 100.0));
+            }
+            ui.end_row();
+        });
+        if p.host == HostType::BambuLan {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Speed");
+                let level = status.and_then(|s| s.speed).unwrap_or(2);
+                for (i, name) in ["Silent", "Standard", "Sport", "Ludicrous"].iter().enumerate() {
+                    if ui.selectable_label(level as usize == i + 1, *name).clicked() {
+                        d.devices.control(p, Command::Speed(i as u8 + 1));
+                    }
+                }
+            });
+        }
+        ui.add_space(8.0);
+        ui.label(RichText::new("Jog").strong());
+        ui.add_enabled_ui(!printing, |ui| {
+            let steps = [0.1f32, 1.0, 10.0, 100.0];
+            ui.horizontal(|ui| {
+                for (i, step) in steps.iter().enumerate() {
+                    ui.selectable_value(&mut d.jog_step, i, format!("{step} mm"));
+                }
+            });
+            let step = steps.get(d.jog_step).copied().unwrap_or(1.0);
+            let mut jog = None;
+            egui::Grid::new("jog").spacing([4.0, 4.0]).show(ui, |ui| {
+                ui.label("");
+                if ui.button(" Y+ ").clicked() {
+                    jog = Some(Command::Jog('Y', step));
+                }
+                ui.label("");
+                ui.label("   ");
+                if ui.button(" Z+ ").clicked() {
+                    jog = Some(Command::Jog('Z', step.min(10.0)));
+                }
+                ui.end_row();
+                if ui.button(" X− ").clicked() {
+                    jog = Some(Command::Jog('X', -step));
+                }
+                let (r, home) = ui.allocate_exact_size(vec2(36.0, 24.0), Sense::click());
+                icons::paint(ui, r, "monitor_axis_home", t, home.hovered());
+                if home.on_hover_text("Home all axes").clicked() {
+                    jog = Some(Command::Home);
+                }
+                if ui.button(" X+ ").clicked() {
+                    jog = Some(Command::Jog('X', step));
+                }
+                ui.label("   ");
+                if ui.button(" Z− ").clicked() {
+                    jog = Some(Command::Jog('Z', -step.min(10.0)));
+                }
+                ui.end_row();
+                ui.label("");
+                if ui.button(" Y− ").clicked() {
+                    jog = Some(Command::Jog('Y', -step));
+                }
+                ui.end_row();
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Extrude 10 mm").clicked() {
+                    jog = Some(Command::Jog('E', 10.0));
+                }
+                if ui.button("Retract 10 mm").clicked() {
+                    jog = Some(Command::Jog('E', -10.0));
+                }
+            });
+            if let Some(cmd) = jog {
+                d.devices.control(p, cmd);
+            }
+        });
+    });
+    ui.add_space(6.0);
+    let note = if !online {
+        "Shown once the printer answers."
+    } else if prusalink {
+        "PrusaLink lets CosmicSlicer pause, resume and stop prints; use the printer for the rest."
+    } else if printing {
+        "Jogging is off while printing."
+    } else {
+        ""
+    };
+    if !note.is_empty() {
+        ui.label(RichText::new(note).small().color(t.text_muted));
+    }
+}
+
 // ---- Multi-device ----
 
-pub fn multi_device(ui: &mut Ui, t: &Tokens, actions: &mut Vec<Action>) {
+pub fn multi_device(ui: &mut Ui, session: &mut Session, t: &Tokens, d: &mut DeviceState, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("Multi-device").size(18.0).strong());
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if ui_kit::primary_button(ui, t, "Add printer").clicked() {
+                d.edit = None;
                 actions.push(Action::PhysicalPrinter);
             }
         });
     });
     ui.add_space(10.0);
+    let printers = session.prefs.printers.clone();
     card(ui, t, "Printers", |ui| {
+        if printers.is_empty() {
+            ui.add_space(30.0);
+            ui.vertical_centered(|ui| {
+                let (r, _) = ui.allocate_exact_size(vec2(64.0, 64.0), Sense::hover());
+                icons::paint(ui, r, "monitor_none_printer", t, true);
+                ui.label(RichText::new("No printers yet. Add printers to follow them all here.").color(t.text_muted));
+            });
+            ui.add_space(30.0);
+            return;
+        }
         egui::Grid::new("multi-device").num_columns(5).striped(true).spacing([30.0, 6.0]).show(ui, |ui| {
             for h in ["Printer", "Status", "Progress", "Task", "Actions"] {
                 ui.label(RichText::new(h).color(t.text_muted));
             }
             ui.end_row();
+            for p in &printers {
+                if p.host.live() {
+                    d.devices.watch(p);
+                }
+                let status = d.devices.info.get(&p.name).and_then(|i| i.status.clone());
+                ui.label(RichText::new(&p.name).strong());
+                let (line, ok) = state_line(d, p);
+                ui.label(RichText::new(line).color(if ok { t.text } else { t.warning }));
+                let f = status.as_ref().and_then(|s| s.progress).unwrap_or(0.0);
+                ui.add(egui::ProgressBar::new(f).desired_width(140.0).show_percentage());
+                ui.label(status.as_ref().and_then(|s| s.file.clone()).unwrap_or_else(|| "—".into()));
+                ui.horizontal(|ui| {
+                    let busy = status.as_ref().is_some_and(|s| s.state.busy());
+                    let paused = status.as_ref().is_some_and(|s| s.state == State::Paused);
+                    if ui.add_enabled(busy, egui::Button::new(if paused { "Resume" } else { "Pause" })).clicked() {
+                        d.devices.control(p, if paused { Command::Resume } else { Command::Pause });
+                    }
+                    if ui.add_enabled(busy, egui::Button::new("Stop")).clicked() {
+                        d.devices.control(p, Command::Stop);
+                    }
+                    if ui.button("Open").clicked() {
+                        session.prefs.active_printer = p.name.clone();
+                        session.page = Page::Device;
+                    }
+                });
+                ui.end_row();
+            }
         });
-        ui.add_space(30.0);
-        ui.vertical_centered(|ui| {
-            let (r, _) = ui.allocate_exact_size(vec2(64.0, 64.0), Sense::hover());
-            icons::paint(ui, r, "monitor_none_printer", t, true);
-            ui.label(
-                RichText::new("No printers yet. Add printers to send plates to several at once.").color(t.text_muted),
-            );
-        });
-        ui.add_space(30.0);
     });
 }
 

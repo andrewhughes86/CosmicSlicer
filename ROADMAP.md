@@ -21,6 +21,7 @@ end of every session (no crashes, tests and clippy clean, smoke tests cover new 
 | 12 | Multi-material | Colour painting sliced into filaments (nearest painted surface, or a set depth); layers printed filament by filament; prime tower sized to the purges, with brim and sparse layers; flushing volumes table (auto from colours, multiplier); change-filament G-code; ooze prevention; support and interface filaments; print by object with clearance checks and per-plate sequence; colour change, pause and custom G-code from the layer slider (3MF `custom_gcode_per_layer.xml`) |
 | 13 | Layer height | Variable layer height tool (draw the curve, adaptive from surface slopes with a quality setting, smooth, reset), saved per object (3MF `layer_heights_profile.txt`); layer stacks from profiles and height ranges with `layer_height`; a continuous-Z spiral vase; each object's brim with it when printing one at a time |
 | 14 | Arrange, orient and plates | No-fit-polygon arrangement of convex footprints (spacing, auto rotate, excluded bed area, prime tower), arrange selection / plate / all plates, overflow and new objects onto new plates; auto orient by overhang and contact area; shared instances (+ / −, 3MF one object placed many times); prime tower drawn and dragged on the canvas, per plate; slice all, export every plate's G-code, Preview plate strip with thumbnails |
+| 15 | Printer connections | Physical printers with Orca's host types; upload / upload-and-print to OctoPrint, Klipper (Moonraker), PrusaLink (digest or key, storage choice), Duet, Repetier, AstroBox, ESP3D, MKS, FlashAir; Bambu Lab printers in LAN mode (MQTT status and control, FTPS upload, `.gcode.3mf`, SSDP discovery, P1/A1 camera); live Device page (state, progress, temperatures, pause/resume/stop, jog, fan, speed, camera) and Multi-device list; every connection on its own thread |
 
 ## Order, and why
 Get a user's own printer printing well and safely first (profiles, correct motion G-code,
@@ -49,7 +50,7 @@ CI comes early because the Windows and macOS builds are not yet checked by anyth
 | 19 | Parity check against OrcaSlicer on a reference set | 6–14 |
 | 20 | Packaging and release for all three platforms | 3, 18 |
 
-6 more sessions. 17 can be split up and done between others.
+5 more sessions. 17 can be split up and done between others.
 
 ---
 
@@ -347,23 +348,45 @@ pockets (footprints are convex, as Orca's default); exporting all plates as one 
 (`.gcode.3mf`); instances shown as their own rows in the object list (here a label says
 "instance k of n"); plate reordering by drag.
 
-## 15 · Printer connections and Device pages
-- Physical printers with Orca's host types: OctoPrint/Klipper (Moonraker), PrusaLink,
-  PrusaConnect, Duet, Repetier, MKS, ESP3D, FlashAir, AstroBox, Obico, SimplyPrint, Flashforge,
-  Elegoo; upload, upload-and-print, test connection, storage selection.
-- Device page live for Moonraker/OctoPrint/PrusaLink: temperatures, progress, camera (MJPEG/
-  WebRTC where possible), pause/stop, jog, fans; Multi-device with several printers.
-- Bambu Lab printers on the local network (LAN-only mode), without Bambu's closed network
-  plugin: discovery (SSDP), status and control over MQTT/TLS (port 8883, access code), upload
-  over FTPS (port 990), start the print with AMS filament mapping, camera stream; Bambu's
-  sliced-3MF format (`.gcode.3mf`) with plate G-code and metadata. Newer firmware needs
-  "LAN only" / developer mode on the printer, which the connect dialog explains.
-- Network code on its own thread with timeouts; a dead printer never blocks the window.
-- Not planned: Bambu's cloud service (account login, remote printing), which needs their
-  closed plugin.
+## 15 · Printer connections and Device pages — done
+- `crates/connect`, with no async runtime: a small HTTP/1.1 client (plain or TLS through
+  rustls, Basic / Digest / API-key auth, chunked replies, multipart uploads, every size capped,
+  every read and write timed out), a minimal MQTT 3.1.1 client, implicit FTPS, MD5.
+- Physical printers (Preferences, by name) with OrcaSlicer's host types. Test connection,
+  upload, and upload-and-print for OctoPrint and Klipper through Moonraker (found out by
+  asking), PrusaLink (digest login or API key; storage listed and chosen), Duet
+  (`rr_upload`, `M32`), Repetier (by printer slug), AstroBox, ESP3D, MKS (upload, then `M23`/
+  `M24` on port 8080) and FlashAir (upload only). PrusaConnect, Obico, SimplyPrint,
+  CrealityPrint, Flashforge and Elegoo Link say plainly that they are not supported yet.
+- Bambu Lab printers in LAN mode, without Bambu's plugin: found by their SSDP announcements;
+  status and control over MQTT/TLS (port 8883, access code; reports merged as they arrive);
+  the plate packed as Bambu's sliced 3MF (`Metadata/plate_1.gcode`, its MD5, `slice_info`,
+  thumbnail) sent over FTPS (port 990, the data connection resuming the TLS session) and
+  started with `project_file` (AMS on or off, filament n from slot n unless mapped); the P1/A1
+  camera (port 6000). The dialog explains LAN mode / developer mode.
+- "Print plate" slices the plate if it needs to, then uploads (and starts) on the chosen
+  printer; "Upload only" leaves it on the printer.
+- Device page, live for Klipper, OctoPrint, PrusaLink and Bambu: state, file, progress, layer,
+  time left, nozzle / bed temperatures with targets to set, pause / resume / stop, jog (off
+  while printing), home, extrude / retract, part fan, Bambu's speed levels, and the camera
+  (Moonraker's webcam snapshot, OctoPrint's, PrusaLink's, Bambu P1/A1's stream). Multi-device
+  lists every printer with its state, progress and pause / stop.
+- Each printer's connection is a worker thread (and the camera another); the window only
+  picks up events, so a dead or slow printer never blocks it (checked by a test against a
+  closed port: the window's calls return at once and the printer shows offline).
+- Checked by tests against fake servers: a Moonraker that takes "Print plate" end to end
+  (slice, multipart upload with `print=true`), Moonraker / OctoPrint / PrusaLink status
+  readings, PrusaLink's `PUT` with `Print-After-Upload`, Digest auth, an MQTT broker
+  exchange, Bambu report merging, commands and the sliced 3MF's checksum.
 
-**Done when:** "Print plate" sends to your Klipper printer and to a Bambu printer in LAN mode,
-and the Device page follows both prints.
+**Not yet checked on real printers:** the "Done when" (your Klipper printer and a Bambu printer
+in LAN mode) needs your printers; Bambu's FTPS session reuse and `project_file` fields
+are the parts most likely to need adjusting against current firmware.
+
+Moved on to session 19: WebRTC cameras and the X1's RTSP camera; live status for Duet,
+Repetier and the other upload-only hosts; PrusaConnect, Obico, SimplyPrint, CrealityPrint,
+Flashforge and Elegoo Link; an AMS slot mapping editor; sending one plate to several printers
+from Multi-device; tying physical printers to printer presets; a custom HTTPS CA file.
 
 ## 16 · Calibration
 - Orca's calibration prints, generated with their settings: temperature tower, flow rate
@@ -405,6 +428,10 @@ and the Device page follows both prints.
   Orca's settings to get `wall_filament`, `sparse_infill_filament`, `solid_infill_filament`).
 - From session 13: per-object layer stacks; independent support layer height; spiral vase
   XY smoothing; leading-edge-only brims; the layer profile drawn beside the object.
+- From session 15: WebRTC and X1 (RTSP) cameras; live status for Duet, Repetier and the other
+  upload-only hosts; PrusaConnect, Obico, SimplyPrint, CrealityPrint, Flashforge, Elegoo Link;
+  AMS mapping editor; one plate to several printers; physical printers tied to presets;
+  HTTPS CA file. Prints on a real Klipper and a real Bambu printer in LAN mode.
 - From session 14: arrange options for multiple materials per plate, Y-axis alignment and the
   calibration region; concave nesting; all plates as one `.gcode.3mf`; instances as their own
   rows in the object list; reordering plates.

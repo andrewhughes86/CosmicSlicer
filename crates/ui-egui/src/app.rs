@@ -78,6 +78,8 @@ pub struct CosmicSlicerApp {
     last_failed: Option<(usize, u64, u64)>,
     /// Export the G-code as soon as the running slice finishes.
     export_when_sliced: bool,
+    /// Send the current plate to this printer once it is sliced: (printer, start printing).
+    send_when_sliced: Option<(String, bool)>,
     /// Plates still to slice after the running one ("Slice all").
     slice_queue: Vec<usize>,
     /// Write every plate's G-code into this folder once "Slice all" is done.
@@ -193,6 +195,7 @@ impl CosmicSlicerApp {
             runner: None,
             last_failed: None,
             export_when_sliced: false,
+            send_when_sliced: None,
             slice_queue: Vec::new(),
             export_all_to: None,
             export_to: None,
@@ -391,6 +394,50 @@ impl CosmicSlicerApp {
                 s.notify(Level::Error, e.to_string());
             }
         }
+    }
+
+    /// Sends the current plate's slice to the printer asked for: G-code, or for a Bambu
+    /// printer the sliced 3MF it prints from.
+    fn send_to_printer(&mut self) {
+        let Some((name, start)) = self.send_when_sliced.take() else { return };
+        let s = &mut self.session;
+        let Some(p) = s.prefs.printers.iter().find(|p| p.name == name).cloned() else {
+            s.notify(Level::Error, format!("There is no printer called {name} any more."));
+            return;
+        };
+        let Some(result) = s.result_for(s.plate) else { return };
+        let base = format!("{}_plate_{}", s.project.name.replace(['/', '\\', ':'], "_"), s.plate + 1);
+        let bambu = p.host == CosmicSlicer_connect::HostType::BambuLan;
+        let (file, data) = if bambu {
+            let thumb = crate::project::plate_image(s, s.plate, 256)
+                .and_then(|rgba| CosmicSlicer_engine::thumbnail::png(&rgba, 256, 256));
+            let stats = &result.stats;
+            let filaments: Vec<CosmicSlicer_connect::bambu::Filament> = (0..s.presets.project_filaments.len())
+                .map(|i| CosmicSlicer_connect::bambu::Filament {
+                    kind: s.presets.value(s.schema, TabKind::Filament, i, "filament_type"),
+                    colour: s.presets.filament_colour(s.schema, i),
+                    used_m: stats.filament_mm.get(i).copied().unwrap_or(0.0) / 1000.0,
+                    used_g: stats.weight_g.get(i).copied().unwrap_or(0.0),
+                })
+                .collect();
+            match CosmicSlicer_connect::bambu::sliced_3mf(
+                result.gcode.as_bytes(),
+                thumb.as_deref(),
+                stats.total_time,
+                &filaments,
+            ) {
+                Ok(bytes) => (format!("{base}.gcode.3mf"), bytes),
+                Err(e) => {
+                    s.notify(Level::Error, format!("Could not pack the plate for the printer: {e}"));
+                    return;
+                }
+            }
+        } else {
+            (format!("{base}.gcode"), result.gcode.as_bytes().to_vec())
+        };
+        s.notify(Level::Info, format!("Sending {file} to {}…", p.name));
+        s.prefs.active_printer = p.name.clone();
+        self.device.devices.send(&p, CosmicSlicer_connect::link::Request::Upload { name: file, data, start });
     }
 
     /// Asks for a folder, then slices every plate and writes each plate's G-code there.
@@ -1263,7 +1310,7 @@ impl CosmicSlicerApp {
             }
             Page::MultiDevice => {
                 egui::CentralPanel::default().frame(ui_kit::frame(Surface::Page, tokens)).show(ui, |ui| {
-                    pages::multi_device(ui, tokens, &mut actions);
+                    pages::multi_device(ui, &mut self.session, tokens, &mut self.device, &mut actions);
                 });
             }
             Page::Project => {
@@ -1276,6 +1323,24 @@ impl CosmicSlicerApp {
         if std::mem::take(&mut self.dialogs.export_requested) {
             actions.push(Action::ExportGcode);
         }
+        if let Some(request) = self.dialogs.send_requested.take() {
+            self.send_when_sliced = Some(request);
+            if self.session.result_for(self.session.plate).is_none() {
+                self.start_slice();
+                if self.runner.is_none() {
+                    self.send_when_sliced = None;
+                }
+            }
+        }
+        if self.send_when_sliced.is_some() {
+            if self.session.result_for(self.session.plate).is_some() {
+                self.send_to_printer();
+            } else if self.runner.is_none() {
+                // The slice failed (its error is shown); nothing is sent.
+                self.send_when_sliced = None;
+            }
+        }
+        self.device.devices.poll(&ctx, &mut self.session);
         if let Some((kind, filament)) = self.dialogs.export_preset.take() {
             actions.push(Action::ExportPreset(kind, filament));
         }
@@ -1516,5 +1581,129 @@ mod smoke {
         assert!(app.session.viewer.is_none());
         app.session.page = Page::Prepare;
         frames(&mut app, &ctx, 2);
+    }
+
+    #[test]
+    fn the_device_pages_and_printer_dialogs_draw() {
+        use CosmicSlicer_connect::{HostType, PhysicalPrinter};
+        let ctx = egui::Context::default();
+        let mut app = app_with_objects();
+        // Nobody answers on port 9 of the loopback: the pages show the printers offline.
+        app.session.prefs.printers = vec![
+            PhysicalPrinter {
+                name: "Voron".into(),
+                host: HostType::OctoPrint,
+                address: "127.0.0.1:9".into(),
+                ..Default::default()
+            },
+            PhysicalPrinter {
+                name: "P1S".into(),
+                host: HostType::BambuLan,
+                address: "127.0.0.1".into(),
+                serial: "01P00A000000000".into(),
+                access_code: "12345678".into(),
+                ..Default::default()
+            },
+            PhysicalPrinter { name: "Cloud".into(), host: HostType::Obico, address: "x".into(), ..Default::default() },
+        ];
+        for active in ["Voron", "P1S", "Cloud"] {
+            app.session.prefs.active_printer = active.into();
+            for page in [Page::Device, Page::MultiDevice] {
+                app.session.page = page;
+                frames(&mut app, &ctx, 2);
+            }
+        }
+        // The camera on, then off.
+        if let Some(p) = app.session.prefs.printers.first().cloned() {
+            app.device.devices.camera(Some(&p));
+            app.session.page = Page::Device;
+            frames(&mut app, &ctx, 2);
+            app.device.devices.camera(None);
+        }
+        // The printer dialog for each kind of host, with search results and a test result.
+        app.dialogs.physical_printer = true;
+        for host in HostType::ALL {
+            app.device.edit = Some((Some(1), PhysicalPrinter { name: "Edited".into(), host, ..Default::default() }));
+            app.device.found = Ok(vec![CosmicSlicer_connect::bambu::Found {
+                ip: "192.168.1.9".into(),
+                serial: "01S".into(),
+                name: "X1C".into(),
+                model: "BL-P001".into(),
+            }]);
+            app.device.test_result = Some(Err("refused".into()));
+            frames(&mut app, &ctx, 2);
+        }
+        // The Print dialog, with no printers and with some.
+        app.dialogs.physical_printer = false;
+        app.dialogs.print = true;
+        frames(&mut app, &ctx, 2);
+        let printers = std::mem::take(&mut app.session.prefs.printers);
+        app.dialogs.print = true;
+        frames(&mut app, &ctx, 2);
+        app.session.prefs.printers = printers;
+        // An empty list after all: the Device page invites adding one.
+        app.session.prefs.printers.clear();
+        app.session.page = Page::Device;
+        frames(&mut app, &ctx, 2);
+    }
+
+    #[test]
+    fn print_plate_slices_and_uploads_to_klipper() {
+        use CosmicSlicer_connect::{HostType, PhysicalPrinter};
+        use std::io::{BufRead, BufReader, Read, Write};
+        // A fake Moonraker: answers /server/info, and takes the upload.
+        let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") else { return };
+        let Ok(addr) = listener.local_addr() else { return };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(20) {
+                let Ok(mut s) = stream else { continue };
+                let Ok(clone) = s.try_clone() else { continue };
+                let mut r = BufReader::new(clone);
+                let (mut head, mut len) = (String::new(), 0usize);
+                loop {
+                    let mut l = String::new();
+                    if r.read_line(&mut l).unwrap_or(0) == 0 || l == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = l.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                    head.push_str(&l);
+                }
+                let mut body = vec![0u8; len];
+                let _ = r.read_exact(&mut body);
+                let reply = if head.starts_with("GET /server/info") {
+                    r#"{"result":{"klippy_state":"ready"}}"#
+                } else {
+                    r#"{"result":{}}"#
+                };
+                let _ = s
+                    .write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{reply}", reply.len()).as_bytes());
+                if head.starts_with("POST /server/files/upload") {
+                    let _ = tx.send(body);
+                }
+            }
+        });
+        let ctx = egui::Context::default();
+        let mut app = CosmicSlicerApp::headless(LaunchOptions { ephemeral: true, ..Default::default() });
+        app.session.add_primitive("Cube");
+        app.session.prefs.printers = vec![PhysicalPrinter {
+            name: "Voron".into(),
+            host: HostType::OctoPrint,
+            address: addr.to_string(),
+            ..Default::default()
+        }];
+        app.dialogs.send_requested = Some(("Voron".into(), true));
+        let start = std::time::Instant::now();
+        let mut body = None;
+        while start.elapsed() < std::time::Duration::from_secs(120) && body.is_none() {
+            frames(&mut app, &ctx, 1);
+            body = rx.try_recv().ok();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let text = body.map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+        assert!(text.contains("filename=\"Untitled_plate_1.gcode\""), "no upload arrived");
+        assert!(text.contains("name=\"print\"\r\n\r\ntrue") && text.contains("G1 "), "{}", text.len());
     }
 }

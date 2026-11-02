@@ -1,0 +1,20 @@
+[package]
+name = "CosmicSlicer-connect"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Printer connections: OrcaSlicer's print hosts and Bambu Lab printers on the local network"
+
+[lints]
+workspace = true
+
+[dependencies]
+CosmicSlicer-import = { workspace = true }
+base64 = { workspace = true }
+log = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+webpki-roots = { workspace = true }
+zune-jpeg = { workspace = true }

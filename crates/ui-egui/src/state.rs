@@ -159,6 +159,10 @@ pub struct Prefs {
     pub arrange_spacing: f32,
     /// Arrange: turn objects about Z where that packs better.
     pub arrange_rotate: bool,
+    /// Printers on the network (OrcaSlicer's physical printers).
+    pub printers: Vec<CosmicSlicer_connect::PhysicalPrinter>,
+    /// The printer the Device page and Print use, by name.
+    pub active_printer: String,
 }
 
 impl Default for Prefs {
@@ -178,6 +182,8 @@ impl Default for Prefs {
             setup_done: false,
             arrange_spacing: 6.0,
             arrange_rotate: false,
+            printers: Vec::new(),
+            active_printer: String::new(),
         }
     }
 }
@@ -1711,6 +1717,12 @@ impl Session {
     /// Plate `plate`'s slice, while it is current.
     pub fn result_for(&self, plate: usize) -> Option<std::sync::Arc<CosmicSlicer_engine::Sliced>> {
         self.sliced.iter().find(|s| s.is_current_for(self, plate)).map(|s| std::sync::Arc::clone(&s.result))
+    }
+
+    /// The printer in use: the active one, else the first set up.
+    pub fn active_printer(&self) -> Option<&CosmicSlicer_connect::PhysicalPrinter> {
+        let p = &self.prefs.printers;
+        p.iter().find(|x| x.name == self.prefs.active_printer).or(p.first())
     }
 
     pub fn title(&self) -> String {
