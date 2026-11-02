@@ -5,10 +5,12 @@
 
 #![allow(non_snake_case)]
 
+pub mod cut;
 pub mod mesh;
 pub mod obj;
 pub mod primitives;
 pub mod repair;
+pub mod shape2d;
 pub mod stl;
 pub mod threemf;
 
@@ -225,6 +227,14 @@ impl Volume {
     }
 }
 
+/// A brim ear placed by hand (for the "Painted" brim type): a disc on the plate under the object.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BrimEar {
+    /// In the object's own frame.
+    pub at: Vec3,
+    pub radius: f32,
+}
+
 /// Settings for the layers between two heights (OrcaSlicer's "height range modifier").
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HeightRange {
@@ -287,6 +297,8 @@ pub struct Object {
     pub parts: Vec<Volume>,
     /// Settings by height.
     pub ranges: Vec<HeightRange>,
+    /// Brim ears placed by hand.
+    pub brim_ears: Vec<BrimEar>,
 }
 
 impl Object {
@@ -355,6 +367,7 @@ impl Model {
             paint: None,
             parts: Vec::new(),
             ranges: Vec::new(),
+            brim_ears: Vec::new(),
         };
         object.drop_to_bed();
         self.objects.push(object);

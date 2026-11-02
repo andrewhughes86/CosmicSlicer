@@ -17,6 +17,7 @@ bytemuck = { workspace = true }
 eframe = { workspace = true, features = ["accesskit", "default_fonts", "persistence", "wgpu", "wayland", "x11"] }
 egui = { workspace = true }
 egui-wgpu = { workspace = true }
+epaint_default_fonts = { workspace = true }
 glam = { workspace = true }
 log = { workspace = true }
 png = { workspace = true }
@@ -24,4 +25,5 @@ resvg = { workspace = true }
 rfd = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+skrifa = { workspace = true }
 wgpu = { workspace = true, features = ["wgsl"] }

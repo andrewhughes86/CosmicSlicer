@@ -93,8 +93,9 @@ pub fn slice(mesh: &Placed, layers: &[LayerZ], cancelled: &(dyn Fn() -> bool + S
 
 /// Where the triangles `tris` of `mesh` lie over each layer: each triangle cut to the slab
 /// from half a layer under the layer's bottom to its top, seen from above. Painted support
-/// uses this: an overhang's painted faces cover the area it needs held.
-pub fn painted(mesh: &Placed, tris: &[u32], layers: &[LayerZ]) -> Vec<Vec<Shape>> {
+/// uses this: an overhang's painted faces cover the area it needs held. Faces that stand
+/// upright (walls) are lines from above; they become strips `pad` either side.
+pub fn painted(mesh: &Placed, tris: &[u32], layers: &[LayerZ], pad: f64) -> Vec<Vec<Shape>> {
     let mut loops: Vec<Vec<Contour>> = vec![Vec::new(); layers.len()];
     let tops: Vec<f64> = layers.iter().map(|l| l.print_z).collect();
     for ti in tris {
@@ -110,6 +111,9 @@ pub fn painted(mesh: &Placed, tris: &[u32], layers: &[LayerZ]) -> Vec<Vec<Shape>
             let piece = clip_z(&clip_z(&c, bottom, true), l.print_z, false);
             if piece.len() >= 3 {
                 let mut flat: Contour = piece.iter().map(|p| DVec2::new(p.x, p.y)).collect();
+                if geom::signed_area2(&flat).abs() < 1e-6 {
+                    flat = strip(&flat, pad);
+                }
                 if geom::signed_area2(&flat) < 0.0 {
                     flat.reverse();
                 }
@@ -120,6 +124,27 @@ pub fn painted(mesh: &Placed, tris: &[u32], layers: &[LayerZ]) -> Vec<Vec<Shape>
         }
     }
     loops.iter().map(|l| if l.is_empty() { Vec::new() } else { geom::union_loops(l) }).collect()
+}
+
+/// A rectangle `pad` either side of (and past the ends of) the longest span of `pts`.
+fn strip(pts: &[DVec2], pad: f64) -> Contour {
+    let mut best = (0.0, DVec2::ZERO, DVec2::ZERO);
+    for (i, a) in pts.iter().enumerate() {
+        for b in pts.iter().skip(i + 1) {
+            let d = a.distance(*b);
+            if d > best.0 {
+                best = (d, *a, *b);
+            }
+        }
+    }
+    let (len, a, b) = best;
+    if len < 1e-9 || pad <= 0.0 {
+        return Vec::new();
+    }
+    let dir = (b - a) / len;
+    let side = dir.perp() * pad;
+    let (a, b) = (a - dir * pad, b + dir * pad);
+    vec![a - side, b - side, b + side, a + side]
 }
 
 /// The part of polygon `poly` above (`keep_above`) or below the plane at `z`.

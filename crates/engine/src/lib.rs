@@ -65,6 +65,12 @@ pub struct JobObject {
     pub support_volumes: Vec<SupportVolume>,
     /// Painted support: triangles of `mesh` and what each asks for.
     pub support_paint: Vec<(u32, SupportPaint)>,
+    /// Painted seams: triangles of `mesh`, enforced or blocked.
+    pub seam_paint: Vec<(u32, SupportPaint)>,
+    /// Painted fuzzy skin: triangles of `mesh`.
+    pub fuzzy_paint: Vec<u32>,
+    /// Brim ears placed by hand: centre on the plate (printer coordinates) and radius.
+    pub brim_ears: Vec<(glam::DVec2, f64)>,
     /// More parts, modifiers and negative volumes, placed like `matrix`.
     pub volumes: Vec<JobVolume>,
     /// Settings by height, millimetres above the plate.
@@ -321,7 +327,8 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
             cfg.set(k.clone(), v.clone());
         }
         let os = Settings::read(schema, &cfg);
-        let regions = layer_regions(schema, &cfg, o, &layers, &vslices);
+        let painted = paint_layers(o, p, &layers, &cancelled);
+        let regions = layer_regions(schema, &cfg, o, &layers, &vslices, &painted);
         if let Some(angle) = os.printable_overhang {
             let heights: Vec<f64> = layers.iter().map(|l| l.height).collect();
             overhang::make_printable(&mut slices, &heights, angle);
@@ -380,10 +387,12 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
             .iter()
             .zip(&object_settings)
             .zip(&heights_of)
-            .map(|((sl, os), h)| skirt::BrimObject {
+            .zip(&job.objects)
+            .map(|(((sl, os), h), o)| skirt::BrimObject {
                 footprint: sl.first().map_or(&[][..], Vec::as_slice),
                 settings: os,
                 height: *h,
+                ears: &o.brim_ears,
             })
             .collect();
         skirt::brims(&objects)
@@ -528,6 +537,7 @@ fn layer_regions(
     o: &JobObject,
     layers: &[LayerZ],
     volume_slices: &[Vec<Vec<Shape>>],
+    painted: &PaintLayers,
 ) -> Vec<plan::LayerRegions> {
     let zones: Vec<usize> = o
         .volumes
@@ -536,9 +546,10 @@ fn layer_regions(
         .filter(|(_, v)| v.kind == VolumeKind::Modifier || (v.kind == VolumeKind::Part && !v.overrides.is_empty()))
         .map(|(k, _)| k)
         .collect();
-    if o.ranges.is_empty() && zones.is_empty() {
+    if o.ranges.is_empty() && zones.is_empty() && painted.is_empty() {
         return Vec::new();
     }
+    let at = |layers: &[Vec<Shape>], i: usize| layers.get(i).cloned().unwrap_or_default();
     // Settings for each mix of height ranges and volume, read once.
     let mut cache: std::collections::HashMap<(Vec<usize>, Option<usize>), Arc<Settings>> = Default::default();
     let mut settings = |active: &[usize], volume: Option<usize>| -> Arc<Settings> {
@@ -570,9 +581,54 @@ fn layer_regions(
                     (!area.is_empty()).then(|| (area.clone(), settings(&active, Some(k))))
                 })
                 .collect();
-            plan::LayerRegions { base, pieces }
+            plan::LayerRegions {
+                base,
+                pieces,
+                seam_enforce: at(&painted.seam_enforce, i),
+                seam_block: at(&painted.seam_block, i),
+                fuzzy: at(&painted.fuzzy, i),
+            }
         })
         .collect()
+}
+
+/// An object's painted seams and fuzzy skin per layer (empty when none are painted).
+#[derive(Default)]
+struct PaintLayers {
+    seam_enforce: Vec<Vec<Shape>>,
+    seam_block: Vec<Vec<Shape>>,
+    fuzzy: Vec<Vec<Shape>>,
+}
+
+impl PaintLayers {
+    fn is_empty(&self) -> bool {
+        self.seam_enforce.is_empty() && self.seam_block.is_empty() && self.fuzzy.is_empty()
+    }
+}
+
+/// Where object `o`'s painted seam and fuzzy facets lie on each layer: a band round the walls
+/// they paint, a little wider than the walls so the wall lines fall inside it.
+fn paint_layers(
+    o: &JobObject,
+    placed: &Placed,
+    layers: &[LayerZ],
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> PaintLayers {
+    let band = |tris: Vec<u32>| -> Vec<Vec<Shape>> {
+        if tris.is_empty() || cancelled() {
+            return Vec::new();
+        }
+        slicing::painted(placed, &tris, layers, 0.6)
+            .into_iter()
+            .map(|l| if l.is_empty() { l } else { geom::offset(&l, 0.4, geom::Join::Round) })
+            .collect()
+    };
+    let of = |want: SupportPaint| o.seam_paint.iter().filter(|(_, k)| *k == want).map(|(t, _)| *t).collect();
+    PaintLayers {
+        seam_enforce: band(of(SupportPaint::Enforce)),
+        seam_block: band(of(SupportPaint::Block)),
+        fuzzy: band(o.fuzzy_paint.clone()),
+    }
 }
 
 /// Support enforcers and blockers per layer.
@@ -592,7 +648,7 @@ fn support_marks(o: &JobObject, placed: &Placed, layers: &[LayerZ], cancelled: &
     for (kind, dst) in [(SupportPaint::Enforce, &mut enforce), (SupportPaint::Block, &mut block)] {
         let tris: Vec<u32> = o.support_paint.iter().filter(|(_, k)| *k == kind).map(|(t, _)| *t).collect();
         if !tris.is_empty() {
-            for (d, sh) in dst.iter_mut().zip(slicing::painted(placed, &tris, layers)) {
+            for (d, sh) in dst.iter_mut().zip(slicing::painted(placed, &tris, layers, 0.2)) {
                 d.extend(sh);
             }
         }
@@ -636,6 +692,9 @@ mod tests {
             overrides: Vec::new(),
             support_volumes: Vec::new(),
             support_paint: Vec::new(),
+            seam_paint: Vec::new(),
+            fuzzy_paint: Vec::new(),
+            brim_ears: Vec::new(),
             volumes: Vec::new(),
             ranges: Vec::new(),
         }
@@ -871,6 +930,72 @@ mod tests {
         assert!(inside > outside * 4.0, "{inside} vs {outside}");
     }
 
+    /// The cube's triangles on its local face `x == 0`.
+    fn x0_face(size: f32) -> Vec<u32> {
+        let m = primitives::cube(size);
+        m.triangles
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.iter().all(|v| m.vertices.get(*v as usize).is_some_and(|p| p.x == 0.0)))
+            .map(|(i, _)| i as u32)
+            .collect()
+    }
+
+    /// Extruding moves of `kind` as (x, y).
+    fn extrusions(gcode: &str, kind: &str) -> Vec<(f64, f64)> {
+        let mut on = false;
+        let mut out = Vec::new();
+        for line in gcode.lines() {
+            if let Some(t) = line.strip_prefix(";TYPE:") {
+                on = t == kind;
+            } else if on && line.starts_with("G1 ") && line.contains(" E") {
+                let get = |c: char| {
+                    line.split_whitespace().find_map(|w| w.strip_prefix(c)).and_then(|v| v.parse::<f64>().ok())
+                };
+                if let (Some(x), Some(y)) = (get('X'), get('Y')) {
+                    out.push((x, y));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn painted_seams_and_fuzzy_skin_go_where_painted() {
+        let face = x0_face(20.0);
+        assert_eq!(face.len(), 2);
+        let mut c = cube(Vec3::new(100.0, 100.0, 0.0), 20.0);
+        c.seam_paint = face.iter().map(|t| (*t, SupportPaint::Enforce)).collect();
+        let mut j = job(vec![c]);
+        j.process.set("seam_position", "back");
+        let Some(out) = sliced(&j) else { return };
+        // Every seam on the painted face (x = 100), not at the back as asked otherwise.
+        assert!(!out.preview.seams.is_empty());
+        assert!(out.preview.seams.iter().all(|s| s[0] < 101.0), "{:?}", &out.preview.seams[..3]);
+
+        let mut c = cube(Vec3::new(100.0, 100.0, 0.0), 20.0);
+        c.fuzzy_paint = face;
+        let Some(out) = sliced(&job(vec![c])) else { return };
+        let walls = extrusions(&out.gcode, "Outer wall");
+        let min_x = walls.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+        // The next face along, away from the corner the paint's band reaches round.
+        let min_y = walls.iter().filter(|p| p.0 > 102.0).map(|p| p.1).fold(f64::INFINITY, f64::min);
+        // Rough on the painted face, straight on the others.
+        assert!(min_x < 100.1, "{min_x}");
+        assert!(min_y > 100.15, "{min_y}");
+    }
+
+    #[test]
+    fn painted_brims_put_ears_where_placed() {
+        let mut c = cube(Vec3::new(100.0, 100.0, 0.0), 20.0);
+        c.overrides.push(("brim_type".into(), "painted".into()));
+        c.brim_ears = vec![(glam::DVec2::new(100.0, 100.0), 4.0)];
+        let Some(out) = sliced(&job(vec![c])) else { return };
+        let brim = extrusions(&out.gcode, "Brim");
+        assert!(!brim.is_empty());
+        assert!(brim.iter().all(|(x, y)| (x - 100.0).hypot(y - 100.0) < 4.5), "{brim:?}");
+    }
+
     #[test]
     fn a_raft_lifts_the_part() {
         let mut j = job(vec![cube(Vec3::new(100.0, 100.0, 0.0), 10.0)]);
@@ -1056,6 +1181,9 @@ mod tests {
             overrides: Vec::new(),
             support_volumes: Vec::new(),
             support_paint: Vec::new(),
+            seam_paint: Vec::new(),
+            fuzzy_paint: Vec::new(),
+            brim_ears: Vec::new(),
             volumes: Vec::new(),
             ranges: Vec::new(),
         }
@@ -1130,6 +1258,9 @@ mod tests {
             overrides: Vec::new(),
             support_volumes: Vec::new(),
             support_paint: Vec::new(),
+            seam_paint: Vec::new(),
+            fuzzy_paint: Vec::new(),
+            brim_ears: Vec::new(),
             volumes: Vec::new(),
             ranges: Vec::new(),
         }]);

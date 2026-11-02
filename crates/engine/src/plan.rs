@@ -109,6 +109,11 @@ pub struct LayerRegions {
     pub base: Option<Arc<Settings>>,
     /// Areas filled by other settings (parts, modifiers), later ones winning.
     pub pieces: Vec<(Vec<Shape>, Arc<Settings>)>,
+    /// Painted seams: where they go, and where they must not.
+    pub seam_enforce: Vec<Shape>,
+    pub seam_block: Vec<Shape>,
+    /// Painted fuzzy skin: walls here are fuzzy.
+    pub fuzzy: Vec<Shape>,
 }
 
 /// One piece of an island's fill and the settings it is filled by (`None`: the layer's).
@@ -437,19 +442,32 @@ pub fn object(
                 _ => None,
             };
             let fuzz = s.fuzzy.on != FuzzyWhere::None && (i > 0 || s.fuzzy.first_layer);
+            let lr = regions.get(i);
+            let painted_fuzz = lr.map_or(&[][..], |r| r.fuzzy.as_slice());
             layer_walled
                 .iter()
                 .map(|w| {
                     let mut walls = w.walled.walls.clone();
                     if fuzz {
                         make_fuzzy(&mut walls, s, layer.print_z, i);
+                    } else if !painted_fuzz.is_empty() {
+                        // Painted fuzzy skin: outer walls, inside the paint only.
+                        for p in walls.iter_mut().take(1).flatten().filter(|p| p.closed) {
+                            fuzzy::apply_masked(p, &s.fuzzy, layer.print_z, i, Some(painted_fuzz));
+                        }
                     }
                     if let Some(b) = &overhangs {
                         for p in walls.iter_mut().flatten() {
                             b.mark(p);
                         }
                     }
-                    let mut out = Island { outline: w.outline.clone(), walls, fills: w.walled.gaps.clone() };
+                    let mut out = Island {
+                        outline: w.outline.clone(),
+                        walls,
+                        fills: w.walled.gaps.clone(),
+                        seam_enforce: lr.map(|r| r.seam_enforce.clone()).unwrap_or_default(),
+                        seam_block: lr.map(|r| r.seam_block.clone()).unwrap_or_default(),
+                    };
                     for p in &w.pieces {
                         match p.settings.as_deref() {
                             None => fills(&mut out.fills, &p.regions, &p.area, s, &around),

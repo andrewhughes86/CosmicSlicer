@@ -38,6 +38,7 @@ bytemuck = { version = "1.25", features = ["derive"] }
 eframe = { version = "0.36.2", default-features = false }
 egui = "0.36.2"
 egui-wgpu = "0.36.2"
+epaint_default_fonts = "0.36.2"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 glam = "0.30"
 i_overlay = { version = "9.1", default-features = false }
@@ -50,6 +51,7 @@ regex = { version = "1.11", default-features = false, features = ["std", "unicod
 resvg = { version = "=0.48.1", default-features = false }
 rfd = "0.17.2"
 serde = { version = "1", features = ["derive"] }
+skrifa = { version = "0.44", default-features = false, features = ["std"] }
 serde_json = "1"
 spade = "2.15"
 thiserror = "2"

@@ -91,6 +91,11 @@ fn push(f: &Fuzzy, p: DVec3, along: f64, length: f64, layer: usize, k: u64) -> f
 /// Makes a closed wall fuzzy at height `z` on layer `layer`. The wall's points are replaced, so
 /// any overhang marks are dropped (they are worked out after).
 pub fn apply(path: &mut Path, f: &Fuzzy, z: f64, layer: usize) {
+    apply_masked(path, f, z, layer, None);
+}
+
+/// As [`apply`], but only where the wall is inside `mask` (painted fuzzy skin), when given.
+pub fn apply_masked(path: &mut Path, f: &Fuzzy, z: f64, layer: usize, mask: Option<&[crate::geom::Shape]>) {
     let n = path.points.len();
     if !path.closed || n < 3 || f.thickness <= 0.0 {
         return;
@@ -119,7 +124,8 @@ pub fn apply(path: &mut Path, f: &Fuzzy, z: f64, layer: usize) {
             let t = next - along;
             let p = a + dir * t;
             let k = push(f, p.extend(z), next, length, layer, seed ^ count);
-            out.push(p + normal * (k * f.thickness));
+            let inside = mask.is_none_or(|m| crate::geom::contains(m, p));
+            out.push(if inside { p + normal * (k * f.thickness) } else { p });
             count += 1;
             // Classic spacing varies a little, as OrcaSlicer's does, so it does not pattern.
             let jitter = if f.noise == Noise::Classic { 0.5 + hash(seed ^ count ^ 0xABCD) } else { 1.0 };

@@ -714,6 +714,13 @@ fn sub_rows(ui: &mut Ui, sb: &mut Sidebar, session: &mut Session, t: &Tokens, id
     }
 }
 
+/// Notes a field's change, and whether it starts an undo step (a drag starting, or a typed
+/// change).
+fn track(r: egui::Response, changed: &mut bool, undo: &mut bool) {
+    *changed |= r.changed();
+    *undo |= r.drag_started() || (r.changed() && !r.dragged());
+}
+
 /// The selected object's own settings, in Objects mode.
 fn object_overrides(ui: &mut Ui, session: &mut Session, t: &Tokens, id: u64, sub: Option<Sub>) {
     let Some(o) = session.model.get(id) else { return };
@@ -727,22 +734,32 @@ fn object_overrides(ui: &mut Ui, session: &mut Session, t: &Tokens, id: u64, sub
                 RichText::new(format!("{vname} ({}): {n} setting(s) of its own", kind.label().to_lowercase())).strong(),
             );
             // Where it sits in the object.
-            let mut changed = false;
+            let (mut changed, mut undo) = (false, false);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Position").small().color(t.text_muted));
                 for (axis, v) in ["X", "Y", "Z"].iter().zip([&mut tr.offset.x, &mut tr.offset.y, &mut tr.offset.z]) {
                     ui.label(RichText::new(*axis).small());
-                    changed |= ui.add(egui::DragValue::new(v).speed(0.1).max_decimals(2).suffix(" mm")).changed();
+                    track(
+                        ui.add(egui::DragValue::new(v).speed(0.1).max_decimals(2).suffix(" mm")),
+                        &mut changed,
+                        &mut undo,
+                    );
                 }
             });
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Scale").small().color(t.text_muted));
                 for (axis, v) in ["X", "Y", "Z"].iter().zip([&mut tr.scale.x, &mut tr.scale.y, &mut tr.scale.z]) {
                     ui.label(RichText::new(*axis).small());
-                    changed |=
-                        ui.add(egui::DragValue::new(v).speed(0.01).range(0.01..=100.0).max_decimals(3)).changed();
+                    track(
+                        ui.add(egui::DragValue::new(v).speed(0.01).range(0.01..=100.0).max_decimals(3)),
+                        &mut changed,
+                        &mut undo,
+                    );
                 }
             });
+            if undo {
+                session.checkpoint();
+            }
             if changed {
                 session.set_volume_transform(id, i, tr);
             }
@@ -751,15 +768,24 @@ fn object_overrides(ui: &mut Ui, session: &mut Session, t: &Tokens, id: u64, sub
             let Some(r) = o.ranges.get(i) else { return };
             let (mut lo, mut hi, n) = (r.lo, r.hi, r.overrides.len());
             ui.label(RichText::new(format!("{name}, height range: {n} setting(s) of its own")).strong());
-            let mut changed = false;
+            let (mut changed, mut undo) = (false, false);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("From").small().color(t.text_muted));
-                changed |=
-                    ui.add(egui::DragValue::new(&mut lo).speed(0.05).range(0.0..=10_000.0).suffix(" mm")).changed();
+                track(
+                    ui.add(egui::DragValue::new(&mut lo).speed(0.05).range(0.0..=10_000.0).suffix(" mm")),
+                    &mut changed,
+                    &mut undo,
+                );
                 ui.label(RichText::new("to").small().color(t.text_muted));
-                changed |=
-                    ui.add(egui::DragValue::new(&mut hi).speed(0.05).range(0.0..=10_000.0).suffix(" mm")).changed();
+                track(
+                    ui.add(egui::DragValue::new(&mut hi).speed(0.05).range(0.0..=10_000.0).suffix(" mm")),
+                    &mut changed,
+                    &mut undo,
+                );
             });
+            if undo {
+                session.checkpoint();
+            }
             if changed {
                 session.set_range(id, i, lo, hi);
             }

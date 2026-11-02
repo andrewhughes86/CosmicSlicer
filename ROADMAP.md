@@ -17,6 +17,7 @@ end of every session (no crashes, tests and clippy clean, smoke tests cover new 
 | 8 | Supports | Grid and snug normal supports, tree supports (organic, slim, strong, hybrid) with trunk brims, top and bottom interfaces with every Orca pattern, top/bottom/xy/first-layer gaps, on build plate only, critical regions only, enforce layers, rafts, per-object brims (outer, inner, both, mouse ears), support enforcer/blocker volumes and painted support in the engine |
 | 9 | Project files and import | 3MF projects in OrcaSlicer's layout (plates, objects and copies, per-object and per-plate settings, presets by name with edits, painted data, thumbnails), Orca / Bambu / plain 3MF opened; CosmicDMS's readers vendored (STEP, IGES, SAT, AMF, PLY, OFF, glTF, COLLADA, VRML, X3D, 3DS, DXF), zip archives, multi-object 3MF import, inches prompt, recent projects with thumbnails |
 | 10 | Object model | Parts, modifiers, negative volumes, support enforcers/blockers and height ranges on objects (model, engine, 3MF, autosave); object list as a tree with Orca's add-part/modifier menus (primitive or file), split to parts, assemble, drag to reorder, per-part and per-range settings; mesh repair on import with a report |
+| 11 | Prepare tools | Support, seam, fuzzy-skin and colour painting (circle, sphere, fill, smart fill, gap fill) with the engine using support, seam and fuzzy paint; Cut with capped faces, flip, cut to parts, plug and dowel connectors; Text and SVG emboss/engrave; Measure; brim ears placed by hand ("Painted" brim); Boolean union/difference; Assemble; lay-on-face highlight, scale to fit; undoable volume edits |
 
 ## Order, and why
 Get a user's own printer printing well and safely first (profiles, correct motion G-code,
@@ -45,7 +46,7 @@ CI comes early because the Windows and macOS builds are not yet checked by anyth
 | 19 | Parity check against OrcaSlicer on a reference set | 6–14 |
 | 20 | Packaging and release for all three platforms | 3, 18 |
 
-10 more sessions. Session 13 can come earlier; 17 can be split up and done between others.
+9 more sessions. Session 13 can come earlier; 17 can be split up and done between others.
 
 ---
 
@@ -220,17 +221,36 @@ Mesh booleans between parts and repair of self-intersections (session 18). OrcaS
 instances: copies are separate objects here (session 14, with plates). Painted facets on volumes
 other than the main mesh are not kept (session 11).
 
-## 11 · Prepare tools
-- Cut: planar cut with connectors (plug, dowel, snap), keep/flip parts, cut to parts.
-- Text shape (emboss) and SVG (emboss/engrave), measure (point, edge, plane), assemble.
-- Painting brushes with per-triangle state saved in 3MF: support, seam, fuzzy skin, colour
-  (circle, sphere, fill, gap fill, smart fill), and the engine consuming them; painted brims
-  (from session 8).
-- Lay on face with face highlighting, scale to fit, drop to bed per tool.
-- From session 10: move, rotate and scale volumes with the canvas gizmos (undoable), and keep
-  painted facets on volumes other than the main mesh.
+## 11 · Prepare tools — done
+- Painting (`viewport/tools.rs`): support, seam, fuzzy skin and colour on the object's main
+  mesh, whole triangles as OrcaSlicer stores them, with circle and sphere brushes (nearest
+  point of each triangle within the radius), fill, smart fill by angle and gap fill; enforce,
+  block or erase (a filament for colour); a stroke is one undo step; saved in 3MF
+  (`paint_supports`, `paint_seam`, `paint_color`, `paint_fuzzy_skin`) and autosave.
+- Engine: painted seams go inside enforcers and never in blockers (`place_seam`); painted
+  fuzzy skin roughens the outer walls inside the paint only, even with fuzzy skin off; upright
+  painted faces become bands round the walls (`slicing::painted` pad).
+- Cut (`model::cut`): a plane at a height with tilt about X and Y, drawn on the canvas; both
+  sides closed (holes kept), keep top and/or bottom, turn the top over, or keep both as parts;
+  plug connectors (a peg on the top, a hole with clearance below) and dowels (holes both sides
+  and a pin object), placed by clicking the plane.
+- Text shape: lines of text in the built-in Sans or Mono font or a loaded TTF/OTF, and SVG
+  files (`emboss.rs`, `model::shape2d`), as an object or embossed, engraved or as a modifier
+  on the selected object's top.
+- Measure: distance and ΔX/ΔY/ΔZ between two picks, the angle between their faces and the
+  gap between parallel faces.
+- Brim ears placed by hand under an object (Shift-click removes), printed with the "Painted"
+  brim type; saved in `Metadata/brim_ear_points.txt` (our layout of Orca's file, unverified).
+- Boolean: union (assemble as parts) and difference (the others become negative volumes);
+  Assemble panel; Split to parts on the toolbar; lay on face highlights the face under the
+  mouse; Scale to fit; Drop to bed in the move, rotate and scale panels; volume and height
+  range edits are undoable.
 
-**Done when:** every toolbar button works; no "arrives later" notes remain in Prepare.
+Not done: colour painting is drawn and saved but prints in one filament until session 12
+slices it into filaments; Boolean intersection needs mesh booleans (session 18); painting
+volumes other than the main mesh, and triangles split finer than the mesh's own (session 19);
+volumes moved with the canvas gizmos rather than their panel (session 19). Variable layer
+height's toolbar button opens a note pointing at session 13.
 
 ## 12 · Multi-material
 - Prime/wipe tower (Orca's), flushing volumes matrix with auto-calculation from colours,
@@ -312,6 +332,8 @@ and the Device page follows both prints.
 - From session 6: Arachne's wall-count transitions where a part narrows but still has room for
   walls; `make_overhang_printable_hole_size`; `scarf_overhang_threshold`.
 - From session 10: wall settings inside modifiers and parts (Orca's per-region perimeters).
+- From session 11: painting on volumes other than the main mesh, brushes that split triangles
+  finer than the mesh (Orca's triangle selector), moving volumes with the canvas gizmos.
 
 ## 20 · Packaging and release
 - Windows installer (MSI) with file associations; macOS `.app` (universal) as a DMG; Linux

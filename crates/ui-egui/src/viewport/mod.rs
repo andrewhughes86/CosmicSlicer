@@ -7,6 +7,7 @@ pub mod camera;
 pub mod gizmo;
 pub mod gpu;
 mod overlay;
+pub mod tools;
 
 use std::sync::Arc;
 
@@ -55,6 +56,10 @@ enum Drag {
         start_len: f32,
         start: Transform,
     },
+    /// A paint stroke on object `id`.
+    Paint {
+        id: u64,
+    },
 }
 
 /// What the Preview sliders show.
@@ -89,6 +94,8 @@ pub struct Viewport {
     gpu: Option<Gpu>,
     bed_key: Option<String>,
     pub tool: Option<Tool>,
+    /// The surface tools' settings and picks.
+    pub tools: tools::ToolState,
     hover: Option<u64>,
     hot: Option<Handle>,
     drag: Option<Drag>,
@@ -130,6 +137,7 @@ impl Default for Viewport {
             gpu: None,
             bed_key: None,
             tool: None,
+            tools: tools::ToolState::default(),
             hover: None,
             hot: None,
             drag: None,
@@ -211,6 +219,30 @@ impl Viewport {
             }
         }
         best
+    }
+
+    /// The point on an object's surface under the mouse, with its face's normal.
+    fn surface(&self, session: &Session, page: Page, mouse: Vec2) -> Option<tools::SurfacePoint> {
+        let (id, dist, tri) = self.pick(session, page, mouse)?;
+        let (o, d) = self.ray(mouse);
+        let point = o + d * dist;
+        let obj = session.model.get(id)?;
+        let m = obj.matrix();
+        let corners = obj.mesh.triangles.get(tri).and_then(|t| obj.mesh.corners(t));
+        let normal = corners
+            .map(|c| c.map(|p| m.transform_point3(p)))
+            .map_or(Vec3::Z, |c| (c[1] - c[0]).cross(c[2] - c[0]).normalize_or(Vec3::Z));
+        Some(tools::SurfacePoint { id, tri: corners.map(|_| tri), point, normal })
+    }
+
+    /// Paints (or fills) at the surface under the mouse with the current paint tool.
+    fn paint_here(&self, session: &mut Session) {
+        let (Some(kind), Some(at)) = (self.tool.and_then(Tool::paint_kind), self.tools.hover) else { return };
+        let Some(o) = session.model.get(at.id) else { return };
+        let tris = tools::brushed(o, &self.tools, &at, -self.camera.back());
+        if !tris.is_empty() {
+            session.paint(at.id, kind, &tris, self.tools.state);
+        }
     }
 
     fn ray(&self, mouse: Vec2) -> (Vec3, Vec3) {
@@ -399,7 +431,11 @@ impl Viewport {
         if let Some(r) = &result {
             self.preview_marks(r, t, &mut overlay_geometry);
         }
+        if page == Page::Prepare {
+            self.surface_marks(session, &mut overlay_geometry);
+        }
         if page == Page::Prepare
+            && !self.tool.is_some_and(Tool::on_surface)
             && let Some(b) = Self::selection_bounds(session)
         {
             let tool = self.tool.filter(|t| t.has_handles()).unwrap_or(Tool::LayOnFace);
@@ -445,6 +481,65 @@ impl Viewport {
         }
         self.gpu = Some(gpu);
         overlay::show(self, ui, rect, session, t, actions);
+    }
+
+    /// What the surface tools show: paint, measured points, brim ears, the cut plane.
+    fn surface_marks(&self, session: &Session, g: &mut FlatGeometry) {
+        let Some(tool) = self.tool else { return };
+        let first = session.selection.first().and_then(|id| session.model.get(*id));
+        if tool == Tool::Cut
+            && let Some(o) = first
+            && self.tools.cut.object == Some(o.id)
+        {
+            tools::cut_overlay(o, &self.tools.cut, g);
+        }
+        if let (Some(kind), Some(o)) = (tool.paint_kind(), first) {
+            tools::paint_overlay(session, o, kind, &self.tools, g);
+        }
+        if tool == Tool::LayOnFace
+            && let Some(h) = self.tools.hover
+            && let Some(o) = session.model.get(h.id)
+        {
+            // The flat face the click would lay down.
+            let flat = tools::ToolState { brush: tools::Brush::SmartFill, smart_angle: 1.0, ..Default::default() };
+            let m = o.matrix();
+            for t in tools::brushed(o, &flat, &h, -self.camera.back()) {
+                let Some(c) = o.mesh.triangles.get(t as usize).and_then(|tri| o.mesh.corners(tri)) else { continue };
+                let [a, b, c] = c.map(|p| m.transform_point3(p));
+                let lift = (b - a).cross(c - a).normalize_or_zero() * 0.03;
+                g.triangle(a + lift, b + lift, c + lift, [0.2, 0.8, 1.0, 0.45]);
+            }
+        }
+        if tool == Tool::Measure {
+            let white = [1.0, 1.0, 1.0, 1.0];
+            for p in &self.tools.measure {
+                tools::ring(g, p.point + p.normal * 0.05, p.normal, 0.6, [1.0, 0.8, 0.1, 1.0]);
+            }
+            if let [a, b] = self.tools.measure.as_slice() {
+                g.line(a.point, b.point, white);
+            }
+            if let Some(h) = self.tools.hover {
+                tools::ring(g, h.point + h.normal * 0.05, h.normal, 0.4, white);
+            }
+        }
+        if tool == Tool::BrimEars {
+            for o in session.model.objects.iter().filter(|o| session.selection.contains(&o.id)) {
+                let m = o.matrix();
+                for e in &o.brim_ears {
+                    let p = m.transform_point3(e.at);
+                    tools::ring(g, Vec3::new(p.x, p.y, 0.05), Vec3::Z, e.radius, [0.2, 0.8, 1.0, 1.0]);
+                }
+            }
+            if let Some(h) = self.tools.hover {
+                tools::ring(
+                    g,
+                    Vec3::new(h.point.x, h.point.y, 0.05),
+                    Vec3::Z,
+                    self.tools.ear_radius,
+                    [1.0, 1.0, 1.0, 0.8],
+                );
+            }
+        }
     }
 
     /// Travel, retraction and seam marks for the shown layers, and the tool at the end of the
@@ -546,6 +641,14 @@ impl Viewport {
             .or(response.interact_pointer_pos())
             .map(|p| Vec2::new(p.x - rect.left(), p.y - rect.top()));
         let selection_box = Self::selection_bounds(session);
+        // The surface tools follow the mouse over objects.
+        let surface_tool = page == Page::Prepare && self.tool.is_some_and(Tool::on_surface);
+        let laying = page == Page::Prepare && self.tool == Some(Tool::LayOnFace);
+        self.tools.hover = if (surface_tool || laying) && response.hovered() {
+            mouse.and_then(|m| self.surface(session, page, m))
+        } else {
+            None
+        };
         // Hover: handles first, then objects.
         if self.drag.is_none() {
             self.hot = None;
@@ -602,10 +705,47 @@ impl Viewport {
             }
         }
 
-        // Clicks select; Lay on face lays the clicked face down.
+        // Clicks select; Lay on face lays the clicked face down; the surface tools act there.
         if response.clicked_by(egui::PointerButton::Primary)
             && let Some(m) = mouse
         {
+            // Cut: clicks on the plane place connectors.
+            if page == Page::Prepare && self.tool == Some(Tool::Cut) && self.tools.cut.placing {
+                let (o, d) = self.ray(m);
+                let first = session.selection.first().and_then(|id| session.model.get(*id));
+                if let Some(obj) = first
+                    && self.tools.cut.object == Some(obj.id)
+                    && let Some(p) = tools::on_cut_plane(obj, &self.tools.cut, o, d)
+                {
+                    self.tools.cut.opts.connectors.push(p);
+                }
+                return;
+            }
+            if surface_tool && let Some(at) = self.tools.hover {
+                match self.tool {
+                    Some(Tool::Measure) => {
+                        if self.tools.measure.len() >= 2 {
+                            self.tools.measure.clear();
+                        }
+                        self.tools.measure.push(at);
+                    }
+                    Some(Tool::BrimEars) => {
+                        if modifiers.shift {
+                            session.remove_brim_ear(at.id, at.point);
+                        } else {
+                            session.add_brim_ear(at.id, at.point, self.tools.ear_radius);
+                        }
+                    }
+                    _ => {
+                        session.checkpoint();
+                        self.paint_here(session);
+                    }
+                }
+                if !session.selection.contains(&at.id) {
+                    session.selection = vec![at.id];
+                }
+                return;
+            }
             let hit = self.pick(session, page, m);
             if page == Page::Prepare && self.tool == Some(Tool::LayOnFace) {
                 if let Some((id, _, tri)) = hit {
@@ -695,6 +835,21 @@ impl Viewport {
         if self.tool == Some(Tool::LayOnFace) {
             return Drag::Orbit;
         }
+        // Painting with a brush: a stroke, one undo step.
+        if self.tool.and_then(Tool::paint_kind).is_some() {
+            return match self.tools.hover.filter(|_| self.tools.brush.drags()) {
+                Some(at) => {
+                    session.checkpoint();
+                    session.selection = vec![at.id];
+                    self.paint_here(session);
+                    Drag::Paint { id: at.id }
+                }
+                None => Drag::Orbit,
+            };
+        }
+        if self.tool.is_some_and(Tool::on_surface) {
+            return Drag::Orbit;
+        }
         match self.pick(session, page, m) {
             Some((id, dist, _)) => {
                 if !session.selection.contains(&id) {
@@ -763,6 +918,12 @@ impl Viewport {
                     o.drop_to_bed();
                 }
                 session.revision = session.revision.wrapping_add(1);
+            }
+            Some(Drag::Paint { id }) => {
+                let id = *id;
+                if self.tools.hover.is_some_and(|h| h.id == id) {
+                    self.paint_here(session);
+                }
             }
             None => {}
         }

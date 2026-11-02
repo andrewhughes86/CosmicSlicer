@@ -14,6 +14,7 @@ use CosmicSlicer_engine::{
     Job, JobObject, JobVolume, Progress, SliceError, Sliced, SupportPaint, SupportVolume, VolumeKind,
 };
 use CosmicSlicer_model::PartKind;
+use CosmicSlicer_model::threemf::PaintKind;
 
 use crate::state::{BED_TYPES, Session};
 
@@ -100,6 +101,33 @@ pub fn job(session: &Session, plate: usize) -> Job {
                             mesh: Arc::clone(&v.mesh),
                             matrix: to_printer * o.matrix() * v.matrix(),
                         })
+                    })
+                    .collect(),
+                seam_paint: o
+                    .paint
+                    .as_deref()
+                    .map(|p| {
+                        p.states(PaintKind::Seam)
+                            .into_iter()
+                            .filter_map(|(t, st)| match st {
+                                1 => Some((t, SupportPaint::Enforce)),
+                                2 => Some((t, SupportPaint::Block)),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                fuzzy_paint: o
+                    .paint
+                    .as_deref()
+                    .map(|p| p.states(PaintKind::Fuzzy).into_iter().filter(|(_, st)| *st > 0).map(|(t, _)| t).collect())
+                    .unwrap_or_default(),
+                brim_ears: o
+                    .brim_ears
+                    .iter()
+                    .map(|e| {
+                        let p = (to_printer * o.matrix()).transform_point3(e.at);
+                        (glam::DVec2::new(f64::from(p.x), f64::from(p.y)), f64::from(e.radius))
                     })
                     .collect(),
                 volumes: o

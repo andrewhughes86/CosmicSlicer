@@ -632,6 +632,41 @@ impl CosmicSlicerApp {
                 }
             }
             Action::OpenProjectPath(path) => self.open_project(&path),
+            Action::PickFont => {
+                let picked = rfd::FileDialog::new()
+                    .set_title("Load font")
+                    .add_filter("Font", &["ttf", "otf", "ttc"])
+                    .pick_file();
+                if let Some(path) = picked {
+                    match std::fs::read(&path) {
+                        Ok(bytes) if bytes.len() < 64 << 20 => {
+                            let name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("Font").to_owned();
+                            let ts = &mut self.viewport.tools.text;
+                            ts.custom = Some((name, Arc::new(bytes)));
+                            ts.font = crate::emboss::FONTS.len();
+                        }
+                        Ok(_) => s.notify(Level::Warning, "That font file is too large."),
+                        Err(e) => s.notify(Level::Error, format!("could not read {}: {e}", path.display())),
+                    }
+                }
+            }
+            Action::EmbossSvg => {
+                let picked = rfd::FileDialog::new().set_title("Emboss an SVG").add_filter("SVG", &["svg"]).pick_file();
+                if let Some(path) = picked {
+                    let ts = self.viewport.tools.text.clone();
+                    let first = s.selection.first().copied();
+                    match std::fs::read(&path)
+                        .map_err(|e| e.to_string())
+                        .and_then(|b| crate::emboss::svg(&b, ts.height))
+                    {
+                        Ok(loops) => {
+                            let name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("SVG").to_owned();
+                            s.add_emboss(&name, &loops, ts.depth, ts.mode, first);
+                        }
+                        Err(e) => s.notify(Level::Error, e),
+                    }
+                }
+            }
             Action::AddVolumeFile(id, kind) => {
                 let picked = rfd::FileDialog::new()
                     .set_title(format!("Load {}", kind.label().to_lowercase()))
@@ -1316,8 +1351,36 @@ mod smoke {
         app.dialogs.restore_choice = Some(true);
         frames(&mut app, &ctx, 2);
         assert!(app.dialogs.restore.is_none());
+        // Paint, picks, a cut plane and connectors, so each tool has something to show.
+        if let Some(id) = app.session.selection.first().copied() {
+            use CosmicSlicer_model::threemf::PaintKind;
+            for kind in [PaintKind::Support, PaintKind::Seam, PaintKind::Fuzzy, PaintKind::Color] {
+                app.session.paint(id, kind, &[0, 1, 2], 1);
+            }
+            let at = crate::viewport::tools::SurfacePoint {
+                id,
+                tri: Some(0),
+                point: glam::Vec3::ZERO,
+                normal: glam::Vec3::Z,
+            };
+            app.viewport.tools.hover = Some(at);
+            app.viewport.tools.measure = vec![at, at];
+            app.session.add_brim_ear(id, glam::Vec3::new(100.0, 100.0, 0.0), 3.0);
+            if let Some(o) = app.session.model.get(id) {
+                app.viewport.tools.cut.follow(o);
+            }
+            app.viewport.tools.cut.opts.connectors.push(glam::Vec3::new(100.0, 100.0, 5.0));
+        }
         for (tool, ..) in Tool::GIZMOS {
             app.viewport.tool = Some(tool);
+            frames(&mut app, &ctx, 2);
+        }
+        // The text tool with a loaded font, in each mode.
+        app.viewport.tools.text.custom = Some(("Mono".into(), Arc::new(crate::emboss::FONTS[1].1.to_vec())));
+        app.viewport.tools.text.font = crate::emboss::FONTS.len();
+        for mode in [crate::viewport::tools::EmbossMode::Engrave, crate::viewport::tools::EmbossMode::Object] {
+            app.viewport.tools.text.mode = mode;
+            app.viewport.tool = Some(Tool::Text);
             frames(&mut app, &ctx, 2);
         }
         app.viewport.tool = Some(Tool::VariableLayerHeight);

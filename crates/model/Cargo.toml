@@ -13,4 +13,5 @@ workspace = true
 CosmicSlicer-import = { workspace = true }
 glam = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
+spade = { workspace = true }
 thiserror = { workspace = true }

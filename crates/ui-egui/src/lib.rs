@@ -13,6 +13,7 @@
 mod app;
 pub mod automation;
 mod dialogs;
+mod emboss;
 pub mod icons;
 mod menus;
 mod pages;
@@ -55,6 +56,10 @@ pub enum Action {
     ImportPath(PathBuf),
     /// Pick a model file to add to an object as a volume of the kind given.
     AddVolumeFile(u64, CosmicSlicer_model::PartKind),
+    /// Pick an SVG file to emboss, as the Text shape tool is set.
+    EmbossSvg,
+    /// Pick a font file for the Text shape tool.
+    PickFont,
     ExportStl,
     ExportGcode,
     Quit,

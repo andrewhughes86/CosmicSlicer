@@ -159,6 +159,8 @@ struct Writer<'a> {
     preview: Preview,
     /// Where the last loop's seam was, per object, for aligned seams.
     seams: Vec<Option<DVec2>>,
+    /// The island being printed's painted seams: where they go, where they must not.
+    seam_paint: (Vec<geom::Shape>, Vec<geom::Shape>),
     /// Speed factor for layer cooling.
     slow: f64,
     /// How far the Preview's copy of a path may stray from it, mm.
@@ -722,18 +724,43 @@ impl<'a> Writer<'a> {
         let here = self.pos.truncate();
         let seam = self.s().seam.clone();
         let hint = object.and_then(|o| self.seams.get(o).copied().flatten());
-        let index = match seam.as_str() {
-            "nearest" => best_seam(path, here),
-            "back" => rear_index(&path.points),
-            "random" => {
-                let n = path.points.len();
-                ((self.layer as u64).wrapping_mul(2_654_435_761).wrapping_add(n as u64 * 40503) % n as u64) as usize
-            }
-            // Aligned: in a corner near the seam of the layer below, starting from the back.
-            _ => {
-                let target = hint.unwrap_or_else(|| path.points.get(rear_index(&path.points)).copied().unwrap_or(here));
-                best_seam(path, target)
-            }
+        // Painted seams win: the best point inside an enforcer, never one inside a blocker.
+        let (enforce, block) = (&self.seam_paint.0, &self.seam_paint.1);
+        let allowed = |p: DVec2| !geom::contains(block, p);
+        let painted = (!enforce.is_empty() || !block.is_empty())
+            .then(|| {
+                let target = hint.unwrap_or(here);
+                let inside: Vec<usize> = (0..path.points.len())
+                    .filter(|&i| path.points.get(i).is_some_and(|p| geom::contains(enforce, *p) && allowed(*p)))
+                    .collect();
+                if !inside.is_empty() {
+                    return best_seam_among(path, target, &inside);
+                }
+                let free: Vec<usize> =
+                    (0..path.points.len()).filter(|&i| path.points.get(i).is_some_and(|p| allowed(*p))).collect();
+                if free.is_empty() || free.len() == path.points.len() {
+                    None
+                } else {
+                    best_seam_among(path, target, &free)
+                }
+            })
+            .flatten();
+        let index = match (painted, seam.as_str()) {
+            (Some(i), _) => i,
+            (None, seam) => match seam {
+                "nearest" => best_seam(path, here),
+                "back" => rear_index(&path.points),
+                "random" => {
+                    let n = path.points.len();
+                    ((self.layer as u64).wrapping_mul(2_654_435_761).wrapping_add(n as u64 * 40503) % n as u64) as usize
+                }
+                // Aligned: in a corner near the seam of the layer below, starting from the back.
+                _ => {
+                    let target =
+                        hint.unwrap_or_else(|| path.points.get(rear_index(&path.points)).copied().unwrap_or(here));
+                    best_seam(path, target)
+                }
+            },
         };
         path.rotate(index);
         // Staggered inner seams: each wall in starts a little further back.
@@ -810,6 +837,7 @@ impl<'a> Writer<'a> {
         // first extrusion on.
         self.region = None;
         self.pending_region = Region::new(&island.outline, self.s().nozzle);
+        self.seam_paint = (island.seam_enforce.clone(), island.seam_block.clone());
         let depth = island.walls.len();
         let order: Vec<usize> = if self.s().outer_first { (0..depth).collect() } else { (0..depth).rev().collect() };
         for k in order {
@@ -944,25 +972,30 @@ fn corner_angle(points: &[DVec2], i: usize) -> f64 {
 /// Where a loop's seam hides best near `target`: concave corners most, sharp convex corners
 /// less, never on an overhang (OrcaSlicer's seam placer scores points the same way).
 fn best_seam(path: &Path, target: DVec2) -> usize {
+    let all: Vec<usize> = (0..path.points.len()).collect();
+    best_seam_among(path, target, &all).unwrap_or(0)
+}
+
+/// How badly a seam at point `i` shows: distance from `target`, less how well a corner hides
+/// it, more if it hangs.
+fn seam_cost(path: &Path, target: DVec2, i: usize, orient: f64) -> f64 {
     let pts = &path.points;
     let n = pts.len();
-    let orient = if geom::signed_area2(pts) >= 0.0 { 1.0 } else { -1.0 };
-    let mut best = (f64::INFINITY, 0usize);
-    for i in 0..n {
-        let (Some(&p), Some(&prev), Some(&next)) = (pts.get(i), pts.get((i + n - 1) % n), pts.get((i + 1) % n)) else {
-            continue;
-        };
-        let (a, b) = ((p - prev).normalize_or_zero(), (next - p).normalize_or_zero());
-        // Positive turning into the part (convex), negative away from it (concave).
-        let turn = a.perp_dot(b).atan2(a.dot(b)) * orient;
-        let hidden = if turn < 0.0 { -turn * 3.0 } else { turn * 1.2 };
-        let hanging = path.overhang_at(i).max(path.overhang_at((i + n - 1) % n));
-        let cost = p.distance(target) - hidden + if hanging >= 2 { 20.0 } else { 0.0 };
-        if cost < best.0 {
-            best = (cost, i);
-        }
-    }
-    best.1
+    let (Some(&p), Some(&prev), Some(&next)) = (pts.get(i), pts.get((i + n - 1) % n), pts.get((i + 1) % n)) else {
+        return f64::INFINITY;
+    };
+    let (a, b) = ((p - prev).normalize_or_zero(), (next - p).normalize_or_zero());
+    // Positive turning into the part (convex), negative away from it (concave).
+    let turn = a.perp_dot(b).atan2(a.dot(b)) * orient;
+    let hidden = if turn < 0.0 { -turn * 3.0 } else { turn * 1.2 };
+    let hanging = path.overhang_at(i).max(path.overhang_at((i + n - 1) % n));
+    p.distance(target) - hidden + if hanging >= 2 { 20.0 } else { 0.0 }
+}
+
+/// [`best_seam`] among the points `allowed`.
+fn best_seam_among(path: &Path, target: DVec2, allowed: &[usize]) -> Option<usize> {
+    let orient = if geom::signed_area2(&path.points) >= 0.0 { 1.0 } else { -1.0 };
+    allowed.iter().map(|&i| (i, seam_cost(path, target, i, orient))).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(i, _)| i)
 }
 
 /// Moves a loop's start `back` mm backwards along it.
@@ -1152,6 +1185,7 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         },
         preview: Preview::default(),
         seams: vec![None; cx.object_names.len()],
+        seam_paint: (Vec::new(), Vec::new()),
         slow: 1.0,
         preview_tolerance: preview_tolerance(plans),
         region: None,

@@ -41,6 +41,80 @@ impl Page {
     }
 }
 
+/// How the Cut tool cuts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CutOptions {
+    pub keep_above: bool,
+    pub keep_below: bool,
+    /// Turn the top piece over, its cut face on the plate.
+    pub flip_above: bool,
+    /// Keep the pieces as parts of one object.
+    pub to_parts: bool,
+    pub connector: Connector,
+    pub connector_radius: f32,
+    /// How far a connector reaches into each side, mm.
+    pub connector_depth: f32,
+    /// Clearance round a connector in its hole, mm.
+    pub tolerance: f32,
+    /// Where connectors go, on the cut plane (scene coordinates).
+    pub connectors: Vec<Vec3>,
+}
+
+impl Default for CutOptions {
+    fn default() -> Self {
+        Self {
+            keep_above: true,
+            keep_below: true,
+            flip_above: false,
+            to_parts: false,
+            connector: Connector::Plug,
+            connector_radius: 2.5,
+            connector_depth: 5.0,
+            tolerance: 0.15,
+            connectors: Vec::new(),
+        }
+    }
+}
+
+/// OrcaSlicer's cut connectors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Connector {
+    /// A peg on the top piece that fits a hole in the bottom one.
+    Plug,
+    /// Holes in both pieces and a separate pin to glue in.
+    Dowel,
+}
+
+/// A cylinder of radius `r` from `from` along `dir` for `len`.
+fn pin(r: f32, from: Vec3, dir: Vec3, len: f32) -> CosmicSlicer_model::Mesh {
+    let mut m = primitives::cylinder(r, len.max(0.01), 32);
+    let turn = glam::Quat::from_rotation_arc(Vec3::Z, dir.normalize_or(Vec3::Z));
+    for v in &mut m.vertices {
+        *v = from + turn * *v;
+    }
+    m
+}
+
+/// A volume of `kind` from a mesh in scene coordinates, for an object whose frame is `frame`.
+fn volume_in(
+    frame: glam::Mat4,
+    name: &str,
+    kind: CosmicSlicer_model::PartKind,
+    mut mesh: CosmicSlicer_model::Mesh,
+) -> CosmicSlicer_model::Volume {
+    let inv = frame.inverse();
+    for v in &mut mesh.vertices {
+        *v = inv.transform_point3(*v);
+    }
+    CosmicSlicer_model::Volume {
+        name: name.to_owned(),
+        kind,
+        mesh: std::sync::Arc::new(mesh),
+        transform: Transform::default(),
+        overrides: Vec::new(),
+    }
+}
+
 /// A volume or height range of an object, as the object list selects it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sub {
@@ -609,6 +683,46 @@ impl Session {
         }
     }
 
+    /// Cuts the other selected objects out of the first: they become its negative volumes.
+    pub fn subtract(&mut self) {
+        let Some(&first) = self.selection.first() else { return };
+        if self.selection.len() < 2 {
+            return;
+        }
+        let before = self.model.get(first).map_or(0, |o| o.parts.len());
+        self.assemble();
+        if let Some(o) = self.model.get_mut(first) {
+            for p in o.parts.iter_mut().skip(before) {
+                p.kind = CosmicSlicer_model::PartKind::Negative;
+            }
+            o.drop_to_bed();
+        }
+    }
+
+    /// Scales object `id` evenly to the largest size its plate and the printer's height allow,
+    /// in the middle of the plate.
+    pub fn scale_to_fit(&mut self, id: u64) {
+        let (_, bed) = self.bed();
+        let height = self.printable_height();
+        let Some(o) = self.model.get(id) else { return };
+        let size = o.bounds().size();
+        if size.min_element() <= 0.0 {
+            return;
+        }
+        let k = (bed.x * 0.95 / size.x).min(bed.y * 0.95 / size.y).min(height * 0.99 / size.z);
+        if !(k.is_finite() && k > 0.0) {
+            return;
+        }
+        let centre = self.plate_centre(o.plate);
+        self.checkpoint();
+        if let Some(o) = self.model.get_mut(id) {
+            o.transform.scale *= k;
+            let b = o.bounds();
+            o.transform.offset += Vec3::new(centre.x - b.centre().x, centre.y - b.centre().y, 0.0);
+            o.drop_to_bed();
+        }
+    }
+
     /// Adds a height range over the middle third of object `id`.
     pub fn add_range(&mut self, id: u64) -> Option<usize> {
         let b = self.model.get(id)?.bounds();
@@ -645,6 +759,254 @@ impl Session {
     pub fn reorder(&mut self, id: u64, to: usize) {
         self.checkpoint();
         self.model.reorder(id, to);
+    }
+
+    /// Paints triangles `tris` of object `id` (no undo step: a stroke takes one at its start).
+    pub fn paint(&mut self, id: u64, kind: CosmicSlicer_model::threemf::PaintKind, tris: &[u32], state: u8) {
+        let Some(o) = self.model.get_mut(id) else { return };
+        let paint = o.paint.get_or_insert_with(Default::default);
+        std::sync::Arc::make_mut(paint).set(kind, tris, state);
+        if paint.is_empty() {
+            o.paint = None;
+        }
+        self.touch();
+    }
+
+    /// Clears what is painted on the selected objects for `kind`.
+    pub fn clear_paint(&mut self, kind: CosmicSlicer_model::threemf::PaintKind) {
+        self.checkpoint();
+        for id in self.selection.clone() {
+            if let Some(o) = self.model.get_mut(id)
+                && let Some(p) = o.paint.as_mut()
+            {
+                std::sync::Arc::make_mut(p).clear(kind);
+                if p.is_empty() {
+                    o.paint = None;
+                }
+            }
+        }
+    }
+
+    /// Adds a brim ear under object `id` at scene point `at`.
+    pub fn add_brim_ear(&mut self, id: u64, at: Vec3, radius: f32) {
+        let Some(o) = self.model.get(id) else { return };
+        let inv = o.matrix().inverse();
+        // On the plate, under the point.
+        let local = inv.transform_point3(Vec3::new(at.x, at.y, o.bounds().min.z));
+        if !local.is_finite() || !(radius.is_finite() && radius > 0.0) {
+            return;
+        }
+        self.checkpoint();
+        if let Some(o) = self.model.get_mut(id) {
+            o.brim_ears.push(CosmicSlicer_model::BrimEar { at: local, radius });
+        }
+    }
+
+    pub fn clear_brim_ears(&mut self, id: u64) {
+        self.checkpoint();
+        if let Some(o) = self.model.get_mut(id) {
+            o.brim_ears.clear();
+        }
+    }
+
+    /// Sets one of object `id`'s own settings.
+    pub fn set_override(&mut self, id: u64, key: &str, value: &str) {
+        self.checkpoint();
+        if let Some(o) = self.model.get_mut(id) {
+            match o.overrides.iter_mut().find(|(k, _)| k == key) {
+                Some(slot) => slot.1 = value.to_owned(),
+                None => o.overrides.push((key.to_owned(), value.to_owned())),
+            }
+        }
+    }
+
+    /// Removes object `id`'s brim ear nearest scene point `at`.
+    pub fn remove_brim_ear(&mut self, id: u64, at: Vec3) {
+        let Some(o) = self.model.get(id) else { return };
+        let m = o.matrix();
+        let nearest = o
+            .brim_ears
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (i, m.transform_point3(e.at).truncate().distance(at.truncate())))
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        if let Some((i, _)) = nearest {
+            self.checkpoint();
+            if let Some(o) = self.model.get_mut(id) {
+                o.brim_ears.remove(i);
+            }
+        }
+    }
+
+    /// Adds an object from a mesh in scene coordinates, keeping where it is; returns its id.
+    fn add_in_place(
+        &mut self,
+        name: &str,
+        mut mesh: CosmicSlicer_model::Mesh,
+        like: &CosmicSlicer_model::Object,
+    ) -> u64 {
+        let b = mesh.bounds();
+        let c = Vec3::new(b.centre().x, b.centre().y, b.min.z);
+        for v in &mut mesh.vertices {
+            *v -= c;
+        }
+        let mut o = like.clone();
+        o.name = name.to_owned();
+        o.mesh = std::sync::Arc::new(mesh);
+        o.transform = Transform { offset: c, ..Default::default() };
+        o.paint = None;
+        o.parts.clear();
+        o.brim_ears.clear();
+        self.model.insert(o)
+    }
+
+    /// Adds outlines `loops` extruded `depth` mm: as an object of its own, or on the top of
+    /// object `target` as a raised part, an engraving or a modifier.
+    pub fn add_emboss(
+        &mut self,
+        name: &str,
+        loops: &[Vec<glam::Vec2>],
+        depth: f32,
+        mode: crate::viewport::tools::EmbossMode,
+        target: Option<u64>,
+    ) {
+        use crate::viewport::tools::EmbossMode;
+        use CosmicSlicer_model::PartKind;
+        let engrave = matches!(mode, EmbossMode::Engrave | EmbossMode::Modifier);
+        // Engravings reach a little above the surface so they cut it cleanly.
+        let mesh = CosmicSlicer_model::shape2d::extrude(loops, if engrave { depth + 0.1 } else { depth });
+        if mesh.triangles.is_empty() {
+            self.notify(Level::Warning, "There is nothing to emboss.");
+            return;
+        }
+        let kind = match mode {
+            EmbossMode::Object => None,
+            EmbossMode::Emboss => Some(PartKind::Normal),
+            EmbossMode::Engrave => Some(PartKind::Negative),
+            EmbossMode::Modifier => Some(PartKind::Modifier),
+        };
+        match (kind, target.and_then(|id| self.model.get(id)).map(|o| (o.id, o.mesh.bounds()))) {
+            (Some(kind), Some((id, b))) => {
+                let h = mesh.bounds().size().z;
+                // Centred on the top: raised sits on it, engraved sinks into it.
+                let z = if engrave { b.max.z - depth + h / 2.0 } else { b.max.z + h / 2.0 };
+                self.checkpoint();
+                self.model.add_volume(id, name, kind, mesh, Vec3::new(b.centre().x, b.centre().y, z));
+                self.selection = vec![id];
+            }
+            _ => {
+                self.checkpoint();
+                let id = self.model.add(name, mesh, self.plate_centre(self.plate), self.plate);
+                self.place_clear_of_others(id);
+                self.selection = vec![id];
+            }
+        }
+    }
+
+    /// Cuts object `id` by the plane through `origin` (scene coordinates) with `normal`.
+    pub fn cut(&mut self, id: u64, origin: Vec3, normal: Vec3, opts: &CutOptions) {
+        use CosmicSlicer_model::PartKind;
+        let Some(o) = self.model.get(id).cloned() else { return };
+        let n = normal.normalize_or(Vec3::Z);
+        // Everything that prints, in scene coordinates.
+        let mut world = CosmicSlicer_model::Mesh::default();
+        for (mesh, m) in o.solids() {
+            let base = world.vertices.len() as u32;
+            world.vertices.extend(mesh.vertices.iter().map(|v| m.transform_point3(*v)));
+            world.triangles.extend(mesh.triangles.iter().map(|t| t.map(|i| i + base)));
+        }
+        let halves = CosmicSlicer_model::cut::cut(&world, origin, n);
+        if halves.above.triangles.is_empty() || halves.below.triangles.is_empty() {
+            self.notify(Level::Warning, "The cut plane does not cross the object.");
+            return;
+        }
+        self.checkpoint();
+        let (r, depth, tol) = (opts.connector_radius.max(0.2), opts.connector_depth.max(0.2), opts.tolerance.max(0.0));
+        let mut above_volumes = Vec::new();
+        let mut below_volumes = Vec::new();
+        let mut dowels = Vec::new();
+        for c in &opts.connectors {
+            match opts.connector {
+                Connector::Plug => {
+                    above_volumes.push(("Plug", PartKind::Normal, pin(r, *c - n * depth, n, depth + 0.01)));
+                    below_volumes.push((
+                        "Plug hole",
+                        PartKind::Negative,
+                        pin(r + tol, *c - n * (depth + 0.2), n, depth + 0.4),
+                    ));
+                }
+                Connector::Dowel => {
+                    above_volumes.push(("Dowel hole", PartKind::Negative, pin(r + tol, *c - n * 0.2, n, depth + 0.2)));
+                    below_volumes.push((
+                        "Dowel hole",
+                        PartKind::Negative,
+                        pin(r + tol, *c - n * depth, n, depth + 0.2),
+                    ));
+                    dowels.push(primitives::cylinder(r, (2.0 * depth - 0.4).max(0.5), 32));
+                }
+            }
+        }
+        // The top piece turned over puts its cut face down.
+        let flip = opts.flip_above && !opts.to_parts;
+        let turn =
+            if flip { glam::Mat4::from_quat(glam::Quat::from_rotation_arc(n, Vec3::Z)) } else { glam::Mat4::IDENTITY };
+        let mut above = halves.above;
+        for v in &mut above.vertices {
+            *v = turn.transform_point3(*v);
+        }
+        self.model.remove(&[id]);
+        let mut ids = Vec::new();
+        let name = o.name.clone();
+        if opts.to_parts {
+            let new = self.add_in_place(&name, above, &o);
+            let frame = self.model.get(new).map(CosmicSlicer_model::Object::matrix).unwrap_or_default();
+            if let Some(obj) = self.model.get_mut(new) {
+                obj.parts.push(volume_in(frame, &format!("{name} (bottom)"), PartKind::Normal, halves.below));
+            }
+            ids.push(new);
+        } else {
+            if opts.keep_above {
+                let new = self.add_in_place(&format!("{name} (top)"), above, &o);
+                let frame = self.model.get(new).map(CosmicSlicer_model::Object::matrix).unwrap_or_default();
+                if let Some(obj) = self.model.get_mut(new) {
+                    for (vn, kind, mut mesh) in above_volumes {
+                        for v in &mut mesh.vertices {
+                            *v = turn.transform_point3(*v);
+                        }
+                        obj.parts.push(volume_in(frame, vn, kind, mesh));
+                    }
+                }
+                ids.push(new);
+            }
+            if opts.keep_below {
+                let new = self.add_in_place(&format!("{name} (bottom)"), halves.below, &o);
+                let frame = self.model.get(new).map(CosmicSlicer_model::Object::matrix).unwrap_or_default();
+                if let Some(obj) = self.model.get_mut(new) {
+                    for (vn, kind, mesh) in below_volumes {
+                        obj.parts.push(volume_in(frame, vn, kind, mesh));
+                    }
+                }
+                ids.push(new);
+            }
+            for d in dowels {
+                let at = self.plate_centre(o.plate);
+                let new = self.model.add("Dowel", d, at, o.plate);
+                if let Some(obj) = self.model.get_mut(new) {
+                    obj.filament = o.filament;
+                }
+                ids.push(new);
+            }
+        }
+        for id in &ids {
+            if let Some(obj) = self.model.get_mut(*id) {
+                obj.drop_to_bed();
+            }
+        }
+        // Pieces beside each other rather than on top of one another.
+        for id in ids.iter().skip(1) {
+            self.place_clear_of_others(*id);
+        }
+        self.selection = ids;
     }
 
     /// Puts `path` at the top of the recent files.
@@ -1000,6 +1362,89 @@ pub fn plate_columns(plates: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use CosmicSlicer_model::PartKind;
+    use CosmicSlicer_model::threemf::PaintKind;
+
+    fn cube_session() -> (Session, u64) {
+        let mut s = Session::new();
+        s.add_primitive("Cube");
+        let id = s.model.objects.first().map_or(0, |o| o.id);
+        (s, id)
+    }
+
+    #[test]
+    fn cutting_makes_closed_pieces_and_connectors() {
+        let (mut s, id) = cube_session();
+        let b = s.model.get(id).map(|o| o.bounds()).unwrap_or(Aabb::EMPTY);
+        let origin = Vec3::new(b.centre().x, b.centre().y, b.min.z + 5.0);
+        let mut opts = CutOptions { connectors: vec![origin], ..Default::default() };
+        s.cut(id, origin, Vec3::Z, &opts);
+        assert_eq!(s.model.objects.len(), 2);
+        let vol = |o: &CosmicSlicer_model::Object| o.mesh.volume() * o.transform.scale.x.powi(3);
+        let total: f32 = s.model.objects.iter().map(vol).sum();
+        assert!((total - 8000.0).abs() < 2.0, "{total}");
+        // Plug on top, hole below; both rest on the plate.
+        let kinds: Vec<Vec<PartKind>> =
+            s.model.objects.iter().map(|o| o.parts.iter().map(|p| p.kind).collect()).collect();
+        assert_eq!(kinds, vec![vec![PartKind::Normal], vec![PartKind::Negative]]);
+        assert!(s.model.objects.iter().all(|o| o.bounds().min.z.abs() < 1e-3));
+        // Undo brings the cube back whole.
+        s.undo();
+        assert_eq!(s.model.objects.len(), 1);
+        // Dowels: holes both sides and a pin; the top turned over.
+        opts.connector = Connector::Dowel;
+        opts.flip_above = true;
+        s.cut(id, origin, Vec3::Z, &opts);
+        assert_eq!(s.model.objects.len(), 3);
+        // As parts of one object.
+        s.undo();
+        let opts = CutOptions { to_parts: true, ..Default::default() };
+        s.cut(id, origin, Vec3::Z, &opts);
+        assert_eq!(s.model.objects.len(), 1);
+        assert!(s.model.objects.first().is_some_and(|o| o.parts.len() == 1));
+    }
+
+    #[test]
+    fn painting_and_undo() {
+        let (mut s, id) = cube_session();
+        s.checkpoint();
+        s.paint(id, PaintKind::Seam, &[0, 1], 1);
+        s.paint(id, PaintKind::Seam, &[1], 2);
+        let states = s.model.get(id).and_then(|o| o.paint.clone()).map(|p| p.states(PaintKind::Seam));
+        assert_eq!(states.map(|m| (m.get(&0).copied(), m.get(&1).copied())), Some((Some(1), Some(2))));
+        s.undo();
+        assert!(s.model.get(id).is_some_and(|o| o.paint.is_none()));
+        s.paint(id, PaintKind::Fuzzy, &[3], 1);
+        s.selection = vec![id];
+        s.clear_paint(PaintKind::Fuzzy);
+        assert!(s.model.get(id).is_some_and(|o| o.paint.is_none()));
+    }
+
+    #[test]
+    fn emboss_difference_and_fit() {
+        let (mut s, id) = cube_session();
+        let loops = vec![vec![
+            glam::Vec2::ZERO,
+            glam::Vec2::new(5.0, 0.0),
+            glam::Vec2::new(5.0, 5.0),
+            glam::Vec2::new(0.0, 5.0),
+        ]];
+        s.add_emboss("Tag", &loops, 1.0, crate::viewport::tools::EmbossMode::Engrave, Some(id));
+        assert!(s.model.get(id).is_some_and(|o| o.parts.last().is_some_and(|p| p.kind == PartKind::Negative)));
+        s.add_emboss("Tag", &loops, 1.0, crate::viewport::tools::EmbossMode::Object, None);
+        assert_eq!(s.model.objects.len(), 2);
+        // Difference: the second becomes a negative volume of the first.
+        s.selection = s.model.objects.iter().map(|o| o.id).collect();
+        s.subtract();
+        assert_eq!(s.model.objects.len(), 1);
+        assert!(s.model.get(id).is_some_and(|o| o.parts.iter().all(|p| p.kind == PartKind::Negative)));
+        // Scale to fit fills the plate's width or the printer's height.
+        s.scale_to_fit(id);
+        assert!(s.fits(id));
+        let size = s.model.get(id).map(|o| o.size()).unwrap_or(Vec3::ZERO);
+        let (_, bed) = s.bed();
+        assert!(size.x > bed.x * 0.9 || size.z > s.printable_height() * 0.9, "{size:?}");
+    }
 
     #[test]
     fn undo_and_redo_round_trip() {

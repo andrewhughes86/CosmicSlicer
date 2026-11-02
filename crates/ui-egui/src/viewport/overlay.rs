@@ -11,6 +11,7 @@ use crate::state::{Level, Page, Session};
 use crate::theme::Tokens;
 use crate::ui_kit::{self, Surface};
 use CosmicSlicer_model::Transform;
+use CosmicSlicer_model::threemf::PaintKind;
 
 use crate::preview::{self, FEATURES, VIEW_TYPES};
 
@@ -21,7 +22,7 @@ pub fn show(vp: &mut Viewport, ui: &mut Ui, rect: Rect, session: &mut Session, t
             labels(vp, ui, rect, session, t);
             toolbar(vp, ui, rect, session, t, actions);
             if let Some(tool) = vp.tool {
-                tool_panel(vp, ui, rect, session, t, tool);
+                tool_panel(vp, ui, rect, session, t, tool, actions);
             }
         }
         Page::Preview => {
@@ -86,15 +87,11 @@ fn toolbar(vp: &mut Viewport, ui: &mut Ui, rect: Rect, session: &mut Session, t:
                     {
                         session.split_selected();
                     }
-                    icons::button_enabled(
-                        ui,
-                        "split_parts",
-                        t,
-                        side,
-                        false,
-                        false,
-                        "Split to parts (needs object parts)",
-                    );
+                    if icons::button_enabled(ui, "split_parts", t, side, false, has_selection, "Split to parts")
+                        .clicked()
+                    {
+                        session.split_to_parts();
+                    }
                     separator(ui, t, side);
                     let vlh = vp.tool == Some(Tool::VariableLayerHeight);
                     if icons::button_enabled(
@@ -205,7 +202,15 @@ fn labels(vp: &Viewport, ui: &Ui, rect: Rect, session: &Session, t: &Tokens) {
     }
 }
 
-fn tool_panel(vp: &mut Viewport, ui: &mut Ui, rect: Rect, session: &mut Session, t: &Tokens, tool: Tool) {
+fn tool_panel(
+    vp: &mut Viewport,
+    ui: &mut Ui,
+    rect: Rect,
+    session: &mut Session,
+    t: &Tokens,
+    tool: Tool,
+    actions: &mut Vec<Action>,
+) {
     let mut open = true;
     egui::Area::new(egui::Id::new("tool-panel"))
         .fixed_pos(pos2(rect.left() + 12.0, rect.top() + 64.0))
@@ -233,10 +238,28 @@ fn tool_panel(vp: &mut Viewport, ui: &mut Ui, rect: Rect, session: &mut Session,
                     (Tool::LayOnFace, _) => {
                         ui.label("Click a face of an object to lay it on the plate.");
                     }
+                    (tool, _) if tool.paint_kind().is_some() => {
+                        if let Some(kind) = tool.paint_kind() {
+                            paint_panel(ui, vp, session, t, kind);
+                        }
+                    }
+                    (Tool::Measure, _) => measure_panel(ui, vp, t),
+                    (Tool::Cut, None) => {
+                        ui.label(RichText::new("Select an object to cut.").color(t.text_muted));
+                    }
+                    (Tool::Cut, Some(id)) => cut_panel(ui, vp, session, t, id),
+                    (Tool::Text, first) => text_panel(ui, vp, session, t, first, actions),
+                    (Tool::Boolean, _) => boolean_panel(ui, session, t),
+                    (Tool::Assembly, _) => assembly_panel(ui, session, t),
+                    (Tool::BrimEars, first) => ears_panel(ui, vp, session, t, first),
                     _ => {
+                        // Only variable layer height is left: the layer-height step builds it.
                         ui.label(
-                            RichText::new(format!("{} is not built yet; it arrives in a later step.", tool.name()))
-                                .color(t.text_muted),
+                            RichText::new(format!(
+                                "{} is built with variable and adaptive layer heights (roadmap session 13).",
+                                tool.name()
+                            ))
+                            .color(t.text_muted),
                         );
                     }
                 }
@@ -244,6 +267,257 @@ fn tool_panel(vp: &mut Viewport, ui: &mut Ui, rect: Rect, session: &mut Session,
         });
     if !open {
         vp.tool = None;
+    }
+}
+
+fn paint_panel(ui: &mut Ui, vp: &mut Viewport, session: &mut Session, t: &Tokens, kind: PaintKind) {
+    use super::tools::Brush;
+    let ts = &mut vp.tools;
+    ui.label(RichText::new("Brush").weak());
+    ui.horizontal_wrapped(|ui| {
+        for (b, name) in Brush::ALL {
+            if ui.selectable_label(ts.brush == b, name).clicked() {
+                ts.brush = b;
+            }
+        }
+    });
+    if ts.brush.drags() {
+        ui.add(egui::Slider::new(&mut ts.radius, 0.2..=20.0).text("Radius (mm)").logarithmic(true));
+    }
+    if ts.brush == Brush::SmartFill {
+        ui.add(egui::Slider::new(&mut ts.smart_angle, 0.0..=90.0).text("Angle (°)"));
+    }
+    ui.add_space(4.0);
+    ui.label(RichText::new("Paint").weak());
+    ui.horizontal_wrapped(|ui| match kind {
+        PaintKind::Color => {
+            for f in 1..=session.presets.project_filaments.len().min(16) {
+                let colour = super::tools::state_colour(session, kind, f as u8);
+                let c = egui::Color32::from(egui::Rgba::from_rgb(colour[0], colour[1], colour[2]));
+                let on = ts.state == f as u8;
+                let b =
+                    egui::Button::new(RichText::new(f.to_string()).color(crate::theme::ink_on(c))).fill(c).selected(on);
+                if ui.add(b).clicked() {
+                    ts.state = f as u8;
+                }
+            }
+            if ui.selectable_label(ts.state == 0, "Erase").clicked() {
+                ts.state = 0;
+            }
+        }
+        PaintKind::Fuzzy => {
+            if ui.selectable_label(ts.state != 0, "Fuzzy skin").clicked() {
+                ts.state = 1;
+            }
+            if ui.selectable_label(ts.state == 0, "Erase").clicked() {
+                ts.state = 0;
+            }
+        }
+        _ => {
+            for (state, name) in [(1u8, "Enforce"), (2, "Block"), (0, "Erase")] {
+                if ui.selectable_label(ts.state == state, name).clicked() {
+                    ts.state = state;
+                }
+            }
+        }
+    });
+    // Kinds take different states; keep the one picked valid for this kind.
+    if kind == PaintKind::Fuzzy && ts.state > 1 {
+        ts.state = 1;
+    }
+    if kind != PaintKind::Color && ts.state > 2 {
+        ts.state = 1;
+    }
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        let first = session.selection.first().copied();
+        if ui.add_enabled(first.is_some() && ts.state != 0, egui::Button::new("Fill gaps")).clicked()
+            && let Some(id) = first
+            && let Some(o) = session.model.get(id)
+        {
+            let tris = super::tools::gaps(o, kind, ts.gap_area);
+            if !tris.is_empty() {
+                session.checkpoint();
+                session.paint(id, kind, &tris, ts.state);
+            }
+        }
+        ui.add(egui::DragValue::new(&mut ts.gap_area).range(0.01..=1000.0).speed(0.1).suffix(" mm²"));
+    });
+    if ui.button("Clear all").clicked() {
+        session.clear_paint(kind);
+    }
+    let hint = match kind {
+        PaintKind::Support => "Supports are added where painted to enforce and left out where blocked.",
+        PaintKind::Seam => "Seams go where painted to enforce and stay out of blocked areas.",
+        PaintKind::Fuzzy => "Painted walls print with fuzzy skin, by the object's fuzzy skin settings.",
+        PaintKind::Color => "Painted areas print in the filament painted.",
+    };
+    ui.label(RichText::new(hint).weak().small());
+    ui.label(
+        RichText::new("Drag on the object to paint; drag off it to turn the view, right-drag to pan.")
+            .weak()
+            .small()
+            .color(t.text_muted),
+    );
+}
+
+fn cut_panel(ui: &mut Ui, vp: &mut Viewport, session: &mut Session, t: &Tokens, id: u64) {
+    use crate::state::Connector;
+    let Some(o) = session.model.get(id) else { return };
+    let cs = &mut vp.tools.cut;
+    cs.follow(o);
+    let height = o.bounds().size().z;
+    ui.add(egui::Slider::new(&mut cs.height, 0.0..=height.max(0.1)).text("Height (mm)"));
+    ui.add(egui::Slider::new(&mut cs.tilt[0], -90.0..=90.0).text("Tilt X (°)"));
+    ui.add(egui::Slider::new(&mut cs.tilt[1], -90.0..=90.0).text("Tilt Y (°)"));
+    ui.separator();
+    let opts = &mut cs.opts;
+    ui.checkbox(&mut opts.to_parts, "Keep both as parts of one object");
+    ui.add_enabled_ui(!opts.to_parts, |ui| {
+        ui.checkbox(&mut opts.keep_above, "Keep the top piece");
+        ui.checkbox(&mut opts.keep_below, "Keep the bottom piece");
+        ui.checkbox(&mut opts.flip_above, "Turn the top piece over (cut face down)");
+    });
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label("Connectors");
+        for (kind, name) in [(Connector::Plug, "Plug"), (Connector::Dowel, "Dowel")] {
+            if ui.selectable_label(opts.connector == kind, name).clicked() {
+                opts.connector = kind;
+            }
+        }
+    });
+    ui.add(egui::Slider::new(&mut opts.connector_radius, 0.5..=20.0).text("Radius (mm)"));
+    ui.add(egui::Slider::new(&mut opts.connector_depth, 0.5..=50.0).text("Depth (mm)"));
+    ui.add(egui::Slider::new(&mut opts.tolerance, 0.0..=1.0).text("Clearance (mm)"));
+    ui.horizontal(|ui| {
+        ui.toggle_value(&mut cs.placing, "Place on the plane");
+        ui.label(RichText::new(format!("{} placed", cs.opts.connectors.len())).color(t.text_muted));
+        if ui.add_enabled(!cs.opts.connectors.is_empty(), egui::Button::new("Clear")).clicked() {
+            cs.opts.connectors.clear();
+        }
+    });
+    ui.separator();
+    let any = cs.opts.to_parts || cs.opts.keep_above || cs.opts.keep_below;
+    if any && ui_kit::primary_button(ui, t, "Cut").clicked() {
+        let (origin, normal) = cs.plane(o);
+        let opts = cs.opts.clone();
+        cs.object = None;
+        cs.placing = false;
+        session.cut(id, origin, normal, &opts);
+    }
+}
+
+fn text_panel(
+    ui: &mut Ui,
+    vp: &mut Viewport,
+    session: &mut Session,
+    t: &Tokens,
+    first: Option<u64>,
+    actions: &mut Vec<Action>,
+) {
+    use super::tools::EmbossMode;
+    let ts = &mut vp.tools.text;
+    ui.add(egui::TextEdit::multiline(&mut ts.text).desired_rows(2).desired_width(f32::INFINITY));
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Font");
+        for (i, (name, _)) in crate::emboss::FONTS.iter().enumerate() {
+            if ui.selectable_label(ts.font == i, *name).clicked() {
+                ts.font = i;
+            }
+        }
+        if let Some((name, _)) = &ts.custom {
+            let i = crate::emboss::FONTS.len();
+            if ui.selectable_label(ts.font == i, name.as_str()).clicked() {
+                ts.font = i;
+            }
+        }
+        if ui.small_button("Load font…").clicked() {
+            actions.push(Action::PickFont);
+        }
+    });
+    ui.add(egui::Slider::new(&mut ts.height, 1.0..=200.0).text("Height (mm)").logarithmic(true));
+    ui.add(egui::Slider::new(&mut ts.depth, 0.2..=20.0).text("Depth (mm)"));
+    ui.horizontal_wrapped(|ui| {
+        for (mode, name, needs) in [
+            (EmbossMode::Object, "New object", false),
+            (EmbossMode::Emboss, "Emboss", true),
+            (EmbossMode::Engrave, "Engrave", true),
+            (EmbossMode::Modifier, "Modifier", true),
+        ] {
+            let ok = !needs || first.is_some();
+            if ui.add_enabled(ok, egui::Button::selectable(ts.mode == mode, name)).clicked() {
+                ts.mode = mode;
+            }
+        }
+    });
+    if first.is_none() && ts.mode != EmbossMode::Object {
+        ts.mode = EmbossMode::Object;
+    }
+    ui.horizontal(|ui| {
+        if ui_kit::primary_button(ui, t, "Add text").clicked() {
+            match crate::emboss::text(ts.font_bytes(), &ts.text, ts.height) {
+                Ok(loops) => {
+                    let name = ts.text.lines().next().unwrap_or("Text").chars().take(24).collect::<String>();
+                    let (depth, mode) = (ts.depth, ts.mode);
+                    session.add_emboss(&name, &loops, depth, mode, first);
+                }
+                Err(e) => session.notify(Level::Warning, e),
+            }
+        }
+        if ui.button("Emboss an SVG…").clicked() {
+            actions.push(Action::EmbossSvg);
+        }
+    });
+    ui.label(
+        RichText::new(
+            "Emboss, Engrave and Modifier go on the top of the selected object; move them in its parts list.",
+        )
+        .weak()
+        .small(),
+    );
+}
+
+fn measure_panel(ui: &mut Ui, vp: &mut Viewport, t: &Tokens) {
+    match vp.tools.measure.as_slice() {
+        [] => {
+            ui.label("Click a point or face on an object.");
+        }
+        [a] => {
+            ui.label("Click a second point or face.");
+            ui.label(
+                RichText::new(format!("First: {:.2}, {:.2}, {:.2} mm", a.point.x, a.point.y, a.point.z))
+                    .small()
+                    .color(t.text_muted),
+            );
+        }
+        [a, b, ..] => {
+            for line in super::tools::measure_text(a, b) {
+                ui.label(line);
+            }
+        }
+    }
+    if ui.add_enabled(!vp.tools.measure.is_empty(), egui::Button::new("Clear")).clicked() {
+        vp.tools.measure.clear();
+    }
+}
+
+fn ears_panel(ui: &mut Ui, vp: &mut Viewport, session: &mut Session, t: &Tokens, first: Option<u64>) {
+    ui.add(egui::Slider::new(&mut vp.tools.ear_radius, 0.5..=20.0).text("Ear radius (mm)"));
+    ui.label("Click an object to put an ear on the plate under that point; Shift-click removes the nearest.");
+    let Some(id) = first else { return };
+    let count = session.model.get(id).map_or(0, |o| o.brim_ears.len());
+    ui.label(RichText::new(format!("{count} ear(s) on this object")).color(t.text_muted));
+    let painted =
+        session.model.get(id).is_some_and(|o| o.overrides.iter().any(|(k, v)| k == "brim_type" && v == "painted"));
+    if !painted {
+        ui.label(RichText::new("Ears print when the object's brim type is Painted.").small().color(t.warning));
+        if ui.button("Use painted brim for this object").clicked() {
+            session.set_override(id, "brim_type", "painted");
+        }
+    }
+    if ui.add_enabled(count > 0, egui::Button::new("Remove all ears")).clicked() {
+        session.clear_brim_ears(id);
     }
 }
 
@@ -298,6 +572,9 @@ fn rotate_fields(ui: &mut Ui, session: &mut Session, id: u64) {
             o.drop_to_bed();
         }
     }
+    if ui.button("Drop to bed").clicked() {
+        session.drop_to_bed();
+    }
     ui.label(RichText::new("Drag a ring to turn; hold Shift for 15° steps.").weak().small());
 }
 
@@ -325,9 +602,17 @@ fn scale_fields(ui: &mut Ui, session: &mut Session, id: u64, uniform: &mut bool)
         }
     }
     ui.checkbox(uniform, "Uniform scale");
-    if ui.button("Reset scale").clicked() {
-        new_scale = Some(Vec3::new(t0.scale.x.signum(), t0.scale.y.signum(), t0.scale.z.signum()));
-    }
+    ui.horizontal(|ui| {
+        if ui.button("Reset scale").clicked() {
+            new_scale = Some(Vec3::new(t0.scale.x.signum(), t0.scale.y.signum(), t0.scale.z.signum()));
+        }
+        if ui.button("Scale to fit").on_hover_text("As large as the plate and printer height allow").clicked() {
+            session.scale_to_fit(id);
+        }
+        if ui.button("Drop to bed").clicked() {
+            session.drop_to_bed();
+        }
+    });
     if let Some(s) = new_scale {
         let mut t = t0;
         t.scale = s;
@@ -335,6 +620,54 @@ fn scale_fields(ui: &mut Ui, session: &mut Session, id: u64, uniform: &mut bool)
         if let Some(o) = session.model.get_mut(id) {
             o.drop_to_bed();
         }
+    }
+}
+
+fn boolean_panel(ui: &mut Ui, session: &mut Session, t: &Tokens) {
+    let n = session.selection.len();
+    ui.label("Select two or more objects; the first selected is kept.");
+    ui.label(RichText::new(format!("{n} selected")).color(t.text_muted));
+    let ok = n >= 2;
+    if ui
+        .add_enabled(ok, egui::Button::new("Union"))
+        .on_hover_text("Join them into one object of several parts")
+        .clicked()
+    {
+        session.assemble();
+    }
+    if ui
+        .add_enabled(ok, egui::Button::new("Difference"))
+        .on_hover_text("Cut the others out of the first: they become its negative volumes")
+        .clicked()
+    {
+        session.subtract();
+    }
+    ui.add_enabled(false, egui::Button::new("Intersection"))
+        .on_disabled_hover_text("Intersection needs true mesh booleans, planned for the hardening step (session 18)");
+    ui.label(
+        RichText::new(
+            "Union and Difference work as the slicer slices parts and negative volumes; the meshes stay as they are.",
+        )
+        .weak()
+        .small(),
+    );
+}
+
+fn assembly_panel(ui: &mut Ui, session: &mut Session, t: &Tokens) {
+    let n = session.selection.len();
+    ui.label(RichText::new(format!("{n} selected")).color(t.text_muted));
+    if ui
+        .add_enabled(n >= 2, egui::Button::new("Assemble"))
+        .on_hover_text("Join the selected objects into one object of several parts")
+        .clicked()
+    {
+        session.assemble();
+    }
+    if ui.add_enabled(n >= 1, egui::Button::new("Split to parts")).clicked() {
+        session.split_to_parts();
+    }
+    if ui.add_enabled(n >= 1, egui::Button::new("Split to objects")).clicked() {
+        session.split_selected();
     }
 }
 

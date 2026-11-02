@@ -34,11 +34,69 @@ pub struct Paint {
     pub supports: Vec<(u32, String)>,
     pub seam: Vec<(u32, String)>,
     pub color: Vec<(u32, String)>,
+    pub fuzzy: Vec<(u32, String)>,
+}
+
+/// What a painting tool paints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PaintKind {
+    /// 1 enforce, 2 block.
+    Support,
+    /// 1 enforce, 2 block.
+    Seam,
+    /// 1 fuzzy.
+    Fuzzy,
+    /// The filament number.
+    Color,
 }
 
 impl Paint {
     pub fn is_empty(&self) -> bool {
-        self.supports.is_empty() && self.seam.is_empty() && self.color.is_empty()
+        self.supports.is_empty() && self.seam.is_empty() && self.color.is_empty() && self.fuzzy.is_empty()
+    }
+
+    fn list(&self, kind: PaintKind) -> &Vec<(u32, String)> {
+        match kind {
+            PaintKind::Support => &self.supports,
+            PaintKind::Seam => &self.seam,
+            PaintKind::Fuzzy => &self.fuzzy,
+            PaintKind::Color => &self.color,
+        }
+    }
+
+    fn list_mut(&mut self, kind: PaintKind) -> &mut Vec<(u32, String)> {
+        match kind {
+            PaintKind::Support => &mut self.supports,
+            PaintKind::Seam => &mut self.seam,
+            PaintKind::Fuzzy => &mut self.fuzzy,
+            PaintKind::Color => &mut self.color,
+        }
+    }
+
+    /// Each painted triangle's state for `kind` (a triangle painted in pieces counts as the
+    /// state covering most of it).
+    pub fn states(&self, kind: PaintKind) -> HashMap<u32, u8> {
+        self.list(kind).iter().filter_map(|(t, code)| decode_state(code).map(|s| (*t, s))).collect()
+    }
+
+    /// Paints triangles `tris` with `state` (0 clears them).
+    pub fn set(&mut self, kind: PaintKind, tris: &[u32], state: u8) {
+        let mut states = self.states(kind);
+        for t in tris {
+            if state == 0 {
+                states.remove(t);
+            } else {
+                states.insert(*t, state);
+            }
+        }
+        let mut list: Vec<(u32, String)> = states.into_iter().map(|(t, s)| (t, encode_state(s))).collect();
+        list.sort_unstable_by_key(|(t, _)| *t);
+        *self.list_mut(kind) = list;
+    }
+
+    /// Clears everything painted for `kind`.
+    pub fn clear(&mut self, kind: PaintKind) {
+        self.list_mut(kind).clear();
     }
 
     /// Appends `other`, whose triangles follow this mesh's `offset` triangles.
@@ -48,6 +106,7 @@ impl Paint {
         self.supports.extend(shift(&other.supports));
         self.seam.extend(shift(&other.seam));
         self.color.extend(shift(&other.color));
+        self.fuzzy.extend(shift(&other.fuzzy));
     }
 
     /// Each painted triangle's support state: 1 enforced, 2 blocked (for a triangle painted
@@ -61,9 +120,12 @@ impl Paint {
 
     fn attrs(&self) -> HashMap<u32, Vec<(&'static str, &str)>> {
         let mut out: HashMap<u32, Vec<(&'static str, &str)>> = HashMap::new();
-        for (key, list) in
-            [("paint_supports", &self.supports), ("paint_seam", &self.seam), ("paint_color", &self.color)]
-        {
+        for (key, list) in [
+            ("paint_supports", &self.supports),
+            ("paint_seam", &self.seam),
+            ("paint_color", &self.color),
+            ("paint_fuzzy_skin", &self.fuzzy),
+        ] {
             for (t, code) in list {
                 out.entry(*t).or_default().push((key, code.as_str()));
             }
@@ -144,6 +206,8 @@ pub struct ProjectObject {
     pub settings: Vec<(String, String)>,
     /// Settings by height: (from, to, settings), millimetres.
     pub ranges: Ranges,
+    /// Brim ears placed by hand: point in the object's frame, radius.
+    pub brim_ears: Vec<(Vec3, f32)>,
 }
 
 impl ProjectObject {
@@ -312,6 +376,7 @@ fn read_model_file(bytes: &[u8]) -> ModelResult<ModelFile> {
                                 "paint_supports" | "custom_supports" => &mut o.paint.supports,
                                 "paint_seam" | "custom_seam" => &mut o.paint.seam,
                                 "paint_color" | "mmu_segmentation" => &mut o.paint.color,
+                                "paint_fuzzy_skin" | "fuzzy_skin" => &mut o.paint.fuzzy,
                                 _ => continue,
                             };
                             if !v.is_empty() {
@@ -476,6 +541,29 @@ fn read_model_settings(bytes: &[u8]) -> ModelResult<(HashMap<String, ObjectConfi
     Ok((objects, plates))
 }
 
+/// `Metadata/brim_ear_points.txt`: a line per object, `object_id=N|x y z r|x y z r…`.
+fn read_brim_ears(bytes: &[u8]) -> Vec<(String, Vec<(Vec3, f32)>)> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split('|');
+        let Some(id) = fields.next().and_then(|f| f.trim().strip_prefix("object_id=")) else { continue };
+        let ears = fields
+            .take(MAX_OBJECTS)
+            .filter_map(|f| {
+                let v: Vec<f32> =
+                    f.split_whitespace().filter_map(|x| x.parse::<f32>().ok()).filter(|x| x.is_finite()).collect();
+                match v.as_slice() {
+                    [x, y, z, r] => Some((Vec3::new(*x, *y, *z), *r)),
+                    _ => None,
+                }
+            })
+            .collect();
+        out.push((id.to_owned(), ears));
+    }
+    out
+}
+
 /// Settings by height, as (from, to, settings).
 pub type Ranges = Vec<(f32, f32, Vec<(String, String)>)>;
 
@@ -565,8 +653,12 @@ fn checked_mesh(def: ObjDef) -> (Mesh, Paint) {
     let remap = |v: Vec<(u32, String)>| -> Vec<(u32, String)> {
         v.into_iter().filter_map(|(t, s)| map.get(t as usize).copied().flatten().map(|t| (t, s))).collect()
     };
-    let paint =
-        Paint { supports: remap(def.paint.supports), seam: remap(def.paint.seam), color: remap(def.paint.color) };
+    let paint = Paint {
+        supports: remap(def.paint.supports),
+        seam: remap(def.paint.seam),
+        color: remap(def.paint.color),
+        fuzzy: remap(def.paint.fuzzy),
+    };
     (Mesh { vertices: def.vertices, triangles }, paint)
 }
 
@@ -670,6 +762,15 @@ pub fn read(bytes: &[u8]) -> ModelResult<Project> {
         }
         object_ids.push(id.clone());
         project.objects.push(obj);
+    }
+    if let Ok(b) = z.read("Metadata/brim_ear_points.txt") {
+        for (id, ears) in read_brim_ears(&b) {
+            if let Some(k) = object_ids.iter().position(|o| *o == id)
+                && let Some(o) = project.objects.get_mut(k)
+            {
+                o.brim_ears = ears;
+            }
+        }
     }
     if let Ok(b) = z.read("Metadata/layer_config_ranges.xml") {
         let ranges = read_ranges(&b)?;
@@ -904,6 +1005,17 @@ pub fn write(project: &Project) -> ModelResult<Vec<u8>> {
     if let Some(settings) = &project.settings {
         files.push(("Metadata/project_settings.config".into(), settings.clone().into_bytes()));
     }
+    if project.objects.iter().any(|o| !o.brim_ears.is_empty()) {
+        let mut b = String::from("brim_points_format_version=0\n");
+        for (o, (oid, _)) in project.objects.iter().zip(&ids).filter(|(o, _)| !o.brim_ears.is_empty()) {
+            let _ = write!(b, "object_id={oid}");
+            for (p, r) in &o.brim_ears {
+                let _ = write!(b, "|{} {} {} {}", fmt_f(p.x), fmt_f(p.y), fmt_f(p.z), fmt_f(*r));
+            }
+            b.push('\n');
+        }
+        files.push(("Metadata/brim_ear_points.txt".into(), b.into_bytes()));
+    }
     if project.objects.iter().any(|o| !o.ranges.is_empty()) {
         let mut r = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<objects>\n");
         for (o, (oid, _)) in project.objects.iter().zip(&ids).filter(|(o, _)| !o.ranges.is_empty()) {
@@ -975,6 +1087,7 @@ mod tests {
                     ],
                     settings: vec![("wall_loops".into(), "4".into())],
                     ranges: vec![(2.0, 4.5, vec![("sparse_infill_density".into(), "40%".into())])],
+                    brim_ears: vec![(Vec3::new(5.0, -5.0, 0.0), 2.5)],
                 },
                 ProjectObject {
                     name: "Ball".into(),
@@ -986,6 +1099,7 @@ mod tests {
                     }],
                     settings: vec![],
                     ranges: vec![],
+                    brim_ears: vec![],
                 },
             ],
             plates: vec![
@@ -1014,6 +1128,7 @@ mod tests {
         assert_eq!(a.extruder, 2);
         assert_eq!(a.settings, b.settings);
         assert_eq!(a.ranges, b.ranges);
+        assert_eq!(a.brim_ears, b.brim_ears);
         assert!(back.objects[1].ranges.is_empty());
         assert_eq!(a.parts.len(), 2);
         assert_eq!(a.parts[1].kind, PartKind::Modifier);

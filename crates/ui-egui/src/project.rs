@@ -279,6 +279,7 @@ pub fn to_project(session: &Session) -> Project {
             instances: vec![Instance { matrix: o.matrix(), plate: Some(o.plate) }],
             settings: o.overrides.clone(),
             ranges: o.ranges.iter().map(|r| (r.lo, r.hi, r.overrides.clone())).collect(),
+            brim_ears: o.brim_ears.iter().map(|e| (e.at, e.radius)).collect(),
         });
     }
     let colours: Vec<[u8; 3]> = (0..session.presets.project_filaments.len())
@@ -488,6 +489,12 @@ pub fn open(session: &Session, path: &Path) -> Result<(Restored, Vec<String>), S
                 paint: (!paint.is_empty()).then(|| Arc::new(paint.clone())),
                 parts,
                 ranges: ranges.clone(),
+                // Ears are kept in the frame the main mesh had in the file.
+                brim_ears: o
+                    .brim_ears
+                    .iter()
+                    .map(|(p, r)| CosmicSlicer_model::BrimEar { at: frame.transform_point3(*p), radius: *r })
+                    .collect(),
             });
         }
     }
@@ -648,6 +655,7 @@ mod tests {
             ],
             settings: vec![("sparse_infill_density".into(), "35%".into()), ("not_an_option".into(), "x".into())],
             ranges: vec![],
+            brim_ears: vec![],
         }];
         p.plates = vec![Plate::default(), Plate { name: "two".into(), ..Default::default() }];
         p.settings = Some(

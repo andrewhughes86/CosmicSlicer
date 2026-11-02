@@ -206,6 +206,9 @@ pub struct Island {
     /// Walls by depth: `walls[0]` are the outer walls.
     pub walls: Vec<Vec<Path>>,
     pub fills: Vec<Path>,
+    /// Painted seams on this layer: where seams should go, and where they must not.
+    pub seam_enforce: Vec<crate::geom::Shape>,
+    pub seam_block: Vec<crate::geom::Shape>,
 }
 
 /// Everything printed on one layer.

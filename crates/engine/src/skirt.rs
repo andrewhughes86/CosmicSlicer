@@ -27,6 +27,8 @@ pub struct BrimObject<'a> {
     /// The object's settings (its overrides on the plate's).
     pub settings: &'a Settings,
     pub height: f64,
+    /// Brim ears placed by hand (centre, radius), for the "Painted" brim type.
+    pub ears: &'a [(DVec2, f64)],
 }
 
 /// Every object's brim, each by its own settings and kept off the other objects, and the area
@@ -35,7 +37,11 @@ pub fn brims(objects: &[BrimObject]) -> (Vec<Path>, Vec<Shape>) {
     let mut paths = Vec::new();
     let mut covered = Vec::new();
     for (k, o) in objects.iter().enumerate() {
-        let (mut p, area) = brim(o.footprint, o.settings, o.height);
+        let (mut p, area) = if o.settings.brim_type == "painted" {
+            painted_brim(o.footprint, o.settings, o.ears)
+        } else {
+            brim(o.footprint, o.settings, o.height)
+        };
         if p.is_empty() {
             continue;
         }
@@ -120,21 +126,7 @@ pub fn brim(footprint: &[Shape], s: &Settings, object_height: f64) -> (Vec<Path>
         });
     };
     if kind == "brim_ears" {
-        let ears = ears(&outlines, s, width);
-        let clear = geom::offset(&outlines, s.brim_gap, Join::Round);
-        let area = geom::boolean(&ears, &clear, Op::Difference);
-        let mut ring = geom::offset(&area, -w / 2.0, Join::Round);
-        let mut guard = 0;
-        while !ring.is_empty() && guard < 200 {
-            for c in ring.iter().flatten() {
-                push(c, &mut paths);
-            }
-            ring = geom::offset(&ring, -spacing, Join::Round);
-            guard += 1;
-        }
-        // Inside out, as the other brims print.
-        paths.reverse();
-        return (paths, area);
+        return ear_loops(&ears(&outlines, s, width), &outlines, s);
     }
     if kind != "inner_only" {
         // The outside of each part: the usual brim.
@@ -173,6 +165,57 @@ pub fn brim(footprint: &[Shape], s: &Settings, object_height: f64) -> (Vec<Path>
         ));
     }
     (paths, covered)
+}
+
+/// The "Painted" brim: ears placed by hand.
+pub fn painted_brim(footprint: &[Shape], s: &Settings, ears: &[(DVec2, f64)]) -> (Vec<Path>, Vec<Shape>) {
+    let discs: Vec<Vec<DVec2>> = ears
+        .iter()
+        .filter(|(c, r)| c.is_finite() && r.is_finite() && *r > 0.0)
+        .map(|(c, r)| {
+            (0..32)
+                .map(|i| {
+                    let t = std::f64::consts::TAU * i as f64 / 32.0;
+                    *c + DVec2::new(t.cos(), t.sin()) * r.min(100.0)
+                })
+                .collect()
+        })
+        .collect();
+    if discs.is_empty() || footprint.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let outlines: Vec<Shape> = footprint.iter().filter_map(|sh| sh.first().map(|outer| vec![outer.clone()])).collect();
+    ear_loops(&geom::union_loops(&discs), &outlines, s)
+}
+
+/// Loops filling ear discs `ears`, kept the brim gap off `outlines`.
+fn ear_loops(ears: &[Shape], outlines: &[Shape], s: &Settings) -> (Vec<Path>, Vec<Shape>) {
+    let w = s.widths.first_layer;
+    let spacing = Settings::spacing(w, s.first_layer_height);
+    let clear = geom::offset(outlines, s.brim_gap, Join::Round);
+    let area = geom::boolean(ears, &clear, Op::Difference);
+    let mut paths = Vec::new();
+    let mut ring = geom::offset(&area, -w / 2.0, Join::Round);
+    let mut guard = 0;
+    while !ring.is_empty() && guard < 200 {
+        for c in ring.iter().flatten() {
+            paths.push(Path {
+                role: Role::Brim,
+                points: geom::simplify_loop(c, 0.01),
+                closed: true,
+                width: w,
+                speed: s.speeds.first_layer,
+                flow: 1.0,
+                overhang: Vec::new(),
+                group: 0,
+            });
+        }
+        ring = geom::offset(&ring, -spacing, Join::Round);
+        guard += 1;
+    }
+    // Inside out, as the other brims print.
+    paths.reverse();
+    (paths, area)
 }
 
 /// Mouse ears: discs `width` across at each corner sharper than `brim_ears_max_angle`.

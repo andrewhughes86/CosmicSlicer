@@ -51,6 +51,8 @@ struct ObjectEntry {
     parts: Vec<PartEntry>,
     #[serde(default)]
     ranges: Vec<HeightRange>,
+    #[serde(default)]
+    brim_ears: Vec<CosmicSlicer_model::BrimEar>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -129,6 +131,7 @@ pub fn encode(session: &Session) -> Vec<u8> {
             paint: o.paint.as_deref().cloned(),
             parts,
             ranges: o.ranges.clone(),
+            brim_ears: o.brim_ears.clone(),
         });
     }
     let manifest = Manifest {
@@ -262,6 +265,7 @@ pub fn decode(bytes: &[u8]) -> Result<Restored, String> {
                 })
                 .collect(),
             ranges: o.ranges.into_iter().filter(|r| r.lo.is_finite() && r.hi.is_finite()).collect(),
+            brim_ears: o.brim_ears.into_iter().filter(|e| e.at.is_finite() && e.radius.is_finite()).collect(),
         });
     }
     let mut presets = manifest.presets;

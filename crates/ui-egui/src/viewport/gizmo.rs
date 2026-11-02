@@ -55,6 +55,23 @@ impl Tool {
         Self::GIZMOS.iter().find(|g| g.0 == self).map_or("", |g| g.2)
     }
 
+    /// What a painting tool paints.
+    pub fn paint_kind(self) -> Option<CosmicSlicer_model::threemf::PaintKind> {
+        use CosmicSlicer_model::threemf::PaintKind;
+        match self {
+            Tool::SupportPaint => Some(PaintKind::Support),
+            Tool::SeamPaint => Some(PaintKind::Seam),
+            Tool::FuzzySkin => Some(PaintKind::Fuzzy),
+            Tool::ColorPaint => Some(PaintKind::Color),
+            _ => None,
+        }
+    }
+
+    /// Tools that work on the point of an object's surface under the mouse.
+    pub fn on_surface(self) -> bool {
+        self.paint_kind().is_some() || matches!(self, Tool::Measure | Tool::BrimEars)
+    }
+
     /// Tools with handles on the selection.
     pub fn has_handles(self) -> bool {
         matches!(self, Tool::Move | Tool::Rotate | Tool::Scale)
