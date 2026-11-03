@@ -254,6 +254,69 @@ fn bridge_bead(s: &Settings, thick: bool, w: f64, h: f64, flow: f64) -> (f64, f6
     }
 }
 
+/// How far apart bridge lines go (OrcaSlicer's): round threads their diameter and 0.05 mm,
+/// flat ones as solid infill does.
+fn bridge_spacing(thick: bool, w: f64, solid_w: f64, h: f64) -> f64 {
+    if thick { w + 0.05 } else { Settings::spacing(solid_w, h) }
+}
+
+/// The sparse infill angle on layer `i` before turning by layer.
+fn sparse_angle_at(s: &Settings, i: usize) -> f64 {
+    s.infill_angle + settings::template_angle(&s.infill.sparse_template, i)
+}
+
+/// OrcaSlicer's internal bridge direction: square to the lines it crosses. Every 2 mm round the
+/// bridge's edge, the nearest line below votes for the direction across it; the direction
+/// with most votes within 18° wins.
+fn across_lines(area: &[Shape], lines: &[Polyline]) -> Option<f64> {
+    use std::f64::consts::PI;
+    let segs: Vec<(glam::DVec2, glam::DVec2)> =
+        lines.iter().flat_map(|l| l.windows(2).filter_map(|w| Some((*w.first()?, *w.get(1)?)))).collect();
+    if segs.is_empty() {
+        return None;
+    }
+    let mut votes: Vec<f64> = Vec::new();
+    for c in area.iter().flatten() {
+        let n = c.len();
+        for k in 0..n {
+            let (Some(&a), Some(&b)) = (c.get(k), c.get((k + 1) % n)) else { continue };
+            let steps = (a.distance(b) / 2.0).ceil().max(1.0) as usize;
+            for j in 0..steps {
+                let q = a.lerp(b, j as f64 / steps as f64);
+                let nearest = segs.iter().min_by(|x, y| {
+                    geom::point_segment_distance(q, x.0, x.1).total_cmp(&geom::point_segment_distance(q, y.0, y.1))
+                });
+                if let Some((p0, p1)) = nearest {
+                    let d = *p1 - *p0;
+                    votes.push((d.y.atan2(d.x) + PI / 2.0).rem_euclid(PI));
+                }
+            }
+            if votes.len() > 20_000 {
+                break;
+            }
+        }
+    }
+    if votes.is_empty() {
+        return None;
+    }
+    // Votes by degree, then the best 36° window round, averaged.
+    let mut bins = [0usize; 180];
+    for v in &votes {
+        if let Some(b) = bins.get_mut((v.to_degrees() as usize).min(179)) {
+            *b += 1;
+        }
+    }
+    let window = |c: usize| (0..37).map(|k| bins.get((c + 180 + k - 18) % 180).copied().unwrap_or(0)).sum::<usize>();
+    let centre = (0..180).max_by_key(|c| window(*c))?;
+    let mid = (centre as f64 + 0.5).to_radians();
+    let near: Vec<f64> = votes
+        .iter()
+        .map(|&u| mid + ((u - mid + PI / 2.0).rem_euclid(PI) - PI / 2.0))
+        .filter(|u| (u - mid).abs() <= PI * 0.1)
+        .collect();
+    (!near.is_empty()).then(|| (near.iter().sum::<f64>() / near.len() as f64).rem_euclid(PI))
+}
+
 /// How far in from the outline infill starts with all walls: where each layer's "core" is,
 /// for comparing layers.
 fn infill_inset(s: &Settings, h: f64) -> f64 {
@@ -271,11 +334,13 @@ fn infill_inset(s: &Settings, h: f64) -> f64 {
 /// next to them is made solid.
 fn vertical_shells(slices: &[Vec<Shape>], layers: &[LayerZ], s: &Settings) -> Vec<Vec<Shape>> {
     let n = slices.len();
+    // OrcaSlicer's windows: with N shell layers, the N - 1 layers past this one (this layer
+    // makes the Nth).
     let reach = |count: usize| match s.infill.vertical_shell {
         VerticalShell::None => 0,
         VerticalShell::Critical => count.min(1),
         VerticalShell::Moderate => count.div_ceil(2),
-        VerticalShell::All => count,
+        VerticalShell::All => count.saturating_sub(1),
     };
     let (up, down) = (reach(s.top_layers), reach(s.bottom_layers));
     if (up == 0 && down == 0) || s.density >= 0.999 || s.spiral {
@@ -418,6 +483,8 @@ fn lightning_lines(
 #[derive(Clone)]
 struct Around<'a> {
     i: usize,
+    /// The middle of the object on the plate: infill patterns are fixed to it.
+    origin: glam::DVec2,
     layer: &'a LayerZ,
     below: Option<&'a Vec<Shape>>,
     sparse_below: Option<&'a Vec<Shape>>,
@@ -488,6 +555,12 @@ pub fn object(
         .then(|| lightning_lines(&walled, &sparse, layers, s, cancelled));
     let combined = combine(&sparse, layers, s);
     let topmost = slices.iter().rposition(|sl| !sl.is_empty()).unwrap_or(0);
+    // The middle of the object's footprint over all its layers (OrcaSlicer's object origin).
+    let origin = slices
+        .iter()
+        .filter_map(|sl| geom::bounds(sl))
+        .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
+        .map_or(glam::DVec2::ZERO, |(lo, hi)| (lo + hi) / 2.0);
     // Second pass: paths.
     (0..walled.len())
         .into_par_iter()
@@ -500,6 +573,7 @@ pub fn object(
             let below = i.checked_sub(1).and_then(|b| slices.get(b));
             let around = Around {
                 i,
+                origin,
                 layer,
                 below,
                 sparse_below: i.checked_sub(1).and_then(|b| sparse.get(b)),
@@ -640,6 +714,8 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
     let sparse_angle = s.infill_angle + settings::template_angle(&inf.sparse_template, i);
     let params = |w: f64, density: f64, angle: f64, templated: bool| {
         let mut p = Params::new(w, density, angle, i, z);
+        p.origin = at.origin;
+        p.height = h;
         p.turn_by_layer = !templated;
         p
     };
@@ -675,6 +751,7 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
         let angle = if iron.fixed { iron.angle } else { solid_angle + std::f64::consts::FRAC_PI_4 + iron.angle };
         let kind = if iron.concentric { Kind::Concentric } else { Kind::Rectilinear { alternate: false } };
         let mut p = Params::new(iron.spacing, 1.0, angle, i, z);
+        p.origin = at.origin;
         p.turn_by_layer = false;
         // A film: the set share of a full line at the ironing spacing.
         let flow = iron.flow * h * iron.spacing / bead_area(top_w, h).max(1e-6);
@@ -705,7 +782,8 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
                 continue;
             }
             let angle = b.angle.map_or_else(|| bridge_angle(part, anchors, w), f64::to_radians);
-            let mut p = Params::new(w, b.density, angle, i, z);
+            let mut p = Params::new(bridge_spacing(b.thick, w, solid_w, h), b.density, angle, i, z);
+            p.origin = at.origin;
             p.turn_by_layer = false;
             out.extend(paths_of(
                 infill::fill_with(part, Kind::Rectilinear { alternate: false }, &p),
@@ -729,10 +807,27 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
             (Some(bl), Some(sb)) => geom::boolean(bl, sb, Op::Difference),
             _ => Vec::new(),
         };
+        // The sparse infill below, which the bridge crosses (OrcaSlicer runs it square to
+        // those lines).
+        let below_lines: Vec<Polyline> = match at.sparse_below {
+            Some(sb) if b.internal_angle.is_none() && i > 0 => {
+                let near = geom::boolean(sb, &geom::offset(&internal, 3.0, Join::Miter), Op::Intersect);
+                let mut p = Params::new(s.widths.sparse, s.density, sparse_angle_at(s, i - 1), i - 1, z - h);
+                p.origin = at.origin;
+                p.height = h;
+                p.turn_by_layer = inf.sparse_template.is_empty();
+                infill::fill_with(&near, infill::kind_of(&s.sparse_pattern), &p).into_iter().map(|l| l.points).collect()
+            }
+            _ => Vec::new(),
+        };
         for part in &internal {
             let part = std::slice::from_ref(part);
-            let angle = b.internal_angle.map_or_else(|| bridge_angle(part, &anchors, w), f64::to_radians);
-            let mut p = Params::new(w, b.internal_density, angle, i, z);
+            let angle = match b.internal_angle {
+                Some(a) => a.to_radians(),
+                None => across_lines(part, &below_lines).unwrap_or_else(|| bridge_angle(part, &anchors, w)),
+            };
+            let mut p = Params::new(bridge_spacing(b.thick_internal, w, solid_w, h), b.internal_density, angle, i, z);
+            p.origin = at.origin;
             p.turn_by_layer = false;
             out.extend(paths_of(
                 infill::fill_with(part, Kind::Rectilinear { alternate: false }, &p),
@@ -745,12 +840,13 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
     }
     let (solid, gaps) = with_gap_fill(solid, s, solid_w, s.walls.gap_fill == GapFill::Everywhere, gap_speed);
     // Narrow strips of solid infill go round concentrically, quicker than short zig-zags.
-    let (narrow, solid): (Vec<Shape>, Vec<Shape>) = if s.walls.narrow_solid {
-        solid
-            .into_iter()
-            .partition(|part| geom::offset(std::slice::from_ref(part), -solid_w * 1.5, Join::Miter).is_empty())
+    let (solid, narrow) = if s.walls.narrow_solid {
+        // The lines' direction on this layer, as the fill will lay them.
+        let as_set = !inf.solid_template.is_empty() || i.is_multiple_of(2);
+        let angle = solid_angle + if as_set { 0.0 } else { std::f64::consts::FRAC_PI_2 };
+        infill::split_narrow_solid(&solid, Settings::spacing(solid_w, h), angle)
     } else {
-        (Vec::new(), solid)
+        (solid, Vec::new())
     };
     out.extend(paths_of(
         infill::fill_with(&narrow, Kind::Concentric, &solid_params(solid_w, 1.0)),
@@ -791,6 +887,8 @@ fn sparse_fill(out: &mut Vec<Path>, r: &Regions, s: &Settings, at: &Around<'_>, 
     }
     let inf = &s.infill;
     let mut p = Params::new(w, s.density, angle, at.i, at.layer.print_z);
+    p.origin = at.origin;
+    p.height = at.layer.height;
     p.turn_by_layer = inf.sparse_template.is_empty();
     p.anchor = inf.anchor;
     p.lattice = inf.lattice;

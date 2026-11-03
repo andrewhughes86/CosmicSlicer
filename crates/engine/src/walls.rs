@@ -81,6 +81,12 @@ fn oriented(shape: &Shape, ccw: bool) -> Vec<Vec<glam::DVec2>> {
         .collect()
 }
 
+/// OrcaSlicer's narrow outer loops: islands under `wo + spacing × (1 - this)` across get a
+/// loop narrowed by half this share of the spacing...
+const NARROW_OVERLAP: f64 = 0.22;
+/// ...when their area is under that width times this many millimetres.
+const NARROW_LOOP_LENGTH: f64 = 10.0;
+
 /// Walls for one island at layer height `h`. `loops` overrides the wall count (top layers
 /// with "only one wall on top", spiral vase).
 pub fn walls(island: &Shape, s: &Settings, h: f64, first_layer: bool, loops: usize, speed_scale: f64) -> Walled {
@@ -95,6 +101,15 @@ pub fn walls(island: &Shape, s: &Settings, h: f64, first_layer: bool, loops: usi
     let gap_speed = if first_layer { s.speeds.first_layer } else { s.speeds.gap * speed_scale };
     let loops = if first_layer && s.walls.one_wall_first_layer { loops.min(1) } else { loops };
     let source = std::slice::from_ref(island);
+    // OrcaSlicer's narrow loops (classic walls without thin-wall detection): an island too
+    // narrow for an outer wall at its usual spacing, and not long, gets one a little thinner,
+    // kept however small (pin tips).
+    let narrow_loop = !s.walls.thin_walls && !s.walls.arachne && {
+        let m = so * (1.0 - NARROW_OVERLAP);
+        geom::offset(&geom::offset(source, -(wo + m) / 2.0, Join::Miter), m / 2.0, Join::Miter).is_empty()
+            && geom::area(source) < (wo + m) * NARROW_LOOP_LENGTH
+    };
+    let wo = if narrow_loop { wo - 0.5 * NARROW_OVERLAP * so } else { wo };
     let mut walls: Vec<Vec<Path>> = Vec::new();
     let mut gaps: Vec<Path> = Vec::new();
     let min_feature = s.walls.min_feature;
@@ -116,7 +131,7 @@ pub fn walls(island: &Shape, s: &Settings, h: f64, first_layer: bool, loops: usi
         let available = if edge > 0.0 { geom::offset(source, -edge, Join::Miter) } else { source.to_vec() };
         // The centre line: `available` offset in by half the width.
         let centred = geom::offset(source, -centre, Join::Miter);
-        let rings = geom::without_slivers(centred.clone(), wo * wo * 0.25);
+        let rings = geom::without_slivers(centred.clone(), if narrow_loop { 0.0 } else { wo * wo * 0.25 });
         // Where this wall cannot reach: thin walls at the outside, gaps further in.
         let narrow = if rings.is_empty() {
             available.clone()
@@ -203,6 +218,22 @@ mod tests {
         let mut c = Config::default();
         c.set("wall_generator", generator);
         Settings::read(Schema::get(), &c)
+    }
+
+    #[test]
+    fn pin_tips_get_a_thinner_loop() {
+        // A 0.62 mm square (a pin's tip) is too narrow for a 0.42 mm outer wall with its
+        // spacing; classic walls give it one loop of a thinner line, as OrcaSlicer does.
+        let mut s = settings("classic");
+        s.walls.thin_walls = false;
+        let tip = geom::rectangle(DVec2::ZERO, DVec2::splat(0.62));
+        let w = walls(&tip, &s, 0.2, false, 2, 1.0);
+        let loops: Vec<&Path> = w.walls.iter().flatten().collect();
+        assert_eq!(loops.len(), 1);
+        assert!(loops[0].width < s.widths.outer && loops[0].width > 0.3, "{}", loops[0].width);
+        // A 2 mm square keeps the usual width.
+        let w = walls(&geom::rectangle(DVec2::ZERO, DVec2::splat(2.0)), &s, 0.2, false, 2, 1.0);
+        assert!(w.walls.iter().flatten().all(|p| p.width >= s.widths.outer.min(s.widths.inner) - 1e-9));
     }
 
     #[test]

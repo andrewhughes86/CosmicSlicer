@@ -107,8 +107,9 @@ pub fn slice(mesh: &Placed, layers: &[LayerZ], cancelled: &(dyn Fn() -> bool + S
         let Some(corners) = corners(mesh, t) else { continue };
         let lo = corners.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
         let hi = corners.iter().map(|p| p.z).fold(f64::NEG_INFINITY, f64::max);
-        let first = zs.partition_point(|z| *z < lo);
-        let last = zs.partition_point(|z| *z <= hi);
+        // With room for the plane to step off a vertex (`clear_of_vertices`).
+        let first = zs.partition_point(|z| *z < lo - MAX_NUDGE);
+        let last = zs.partition_point(|z| *z <= hi + MAX_NUDGE);
         for b in buckets.iter_mut().take(last).skip(first) {
             b.push(ti as u32);
         }
@@ -211,7 +212,30 @@ fn key(a: u32, b: u32) -> EdgeKey {
 }
 
 /// One layer: crossing segments, chained into loops, then filled.
+/// The furthest a layer's plane moves off a vertex.
+const MAX_NUDGE: f64 = 3.0e-4;
+
+/// `z` moved a hair off every vertex of `tris` when one lies on it: a vertex on the plane
+/// collapses its triangles' crossings to a point, which breaks the loops apart there.
+fn clear_of_vertices(mesh: &Placed, tris: &[u32], z: f64) -> f64 {
+    const NEAR: f64 = 1.0e-7;
+    let hits = |zz: f64| {
+        tris.iter()
+            .filter_map(|t| mesh.triangles.get(*t as usize).and_then(|t| corners(mesh, t)))
+            .any(|c| c.iter().any(|q| (q.z - zz).abs() < NEAR))
+    };
+    if !hits(z) {
+        return z;
+    }
+    [1.0e-5, -1.0e-5, 3.0e-5, -3.0e-5, 1.0e-4, -1.0e-4, MAX_NUDGE, -MAX_NUDGE]
+        .into_iter()
+        .map(|d| z + d)
+        .find(|zz| !hits(*zz))
+        .unwrap_or(z)
+}
+
 fn slice_layer(mesh: &Placed, tris: &[u32], z: f64) -> Vec<Shape> {
+    let z = clear_of_vertices(mesh, tris, z);
     // Each segment runs from the edge it enters by to the edge it leaves by, oriented so the
     // solid is on its left (outer loops counter-clockwise).
     let mut next: HashMap<EdgeKey, (EdgeKey, DVec2)> = HashMap::with_capacity(tris.len());
@@ -325,6 +349,51 @@ mod tests {
         for s in &slices {
             assert_eq!(s.len(), 1);
             assert!((geom::area(s) - 400.0).abs() < 1e-6, "{}", geom::area(s));
+        }
+    }
+
+    #[test]
+    fn vertices_on_the_plane_keep_the_loop_whole() {
+        // A 10 mm block with a 5 mm column on it; the ledge between them lies exactly at
+        // 0.5 mm, where the third layer (0.4 to 0.6) is cut. Vertices on the plane once broke
+        // the loops there into scraps.
+        let square = |half: f32, z: f32| {
+            [(-half, -half), (half, -half), (half, half), (-half, half)].map(|(x, y)| Vec3::new(x, y, z))
+        };
+        let mut vertices = Vec::new();
+        for (half, z) in [(5.0, 0.0), (5.0, 0.5), (2.5, 0.5), (2.5, 10.0)] {
+            vertices.extend(square(half, z));
+        }
+        // Rings 0 (bottom), 1 (ledge, outside), 2 (ledge, inside), 3 (top).
+        let mut triangles = vec![[0, 2, 1], [0, 3, 2], [12, 13, 14], [12, 14, 15]];
+        for (lower, upper) in [(0u32, 1u32), (1, 2), (2, 3)] {
+            for k in 0..4u32 {
+                let (a, b) = (lower * 4 + k, lower * 4 + (k + 1) % 4);
+                let (c, d) = (upper * 4 + (k + 1) % 4, upper * 4 + k);
+                triangles.push([a, b, c]);
+                triangles.push([a, c, d]);
+            }
+        }
+        let mesh = Mesh { vertices, triangles };
+        let placed = Placed::new(&mesh, &glam::Mat4::IDENTITY);
+        // The plane steps off the ledge's vertices (Benchy's hull at 6.5 mm lost the layer).
+        let all: Vec<u32> = (0..placed.triangles.len() as u32).collect();
+        let z = clear_of_vertices(&placed, &all, 0.5);
+        assert!(z != 0.5 && (z - 0.5).abs() < 1e-3, "{z}");
+        assert_eq!(clear_of_vertices(&placed, &all, 0.3), 0.3);
+        let layers = layer_heights(placed.top(), 0.2, 0.2);
+        let out = slice(&placed, &layers, &|| false);
+        for (l, s) in layers.iter().zip(&out) {
+            let a = geom::area(s);
+            assert_eq!(s.len(), 1, "z {}: {a}", l.print_z);
+            let want: &[f64] = if l.slice_z() < 0.49 {
+                &[100.0]
+            } else if l.slice_z() > 0.51 {
+                &[25.0]
+            } else {
+                &[100.0, 25.0]
+            };
+            assert!(want.iter().any(|w| (a - w).abs() < 1e-3), "z {}: {a}", l.print_z);
         }
     }
 

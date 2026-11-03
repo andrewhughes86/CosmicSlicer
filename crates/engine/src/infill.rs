@@ -36,10 +36,10 @@ pub enum Kind {
     Rectilinear {
         alternate: bool,
     },
-    /// Lines printed side by side in one sweep, joined into zig-zags or each on its own.
-    Monotonic {
-        joined: bool,
-    },
+    /// Lines printed side by side in one sweep, joined into zig-zags along the edge.
+    /// OrcaSlicer's "monotonic line" is the same without infill anchors (which ordered lines
+    /// never get here).
+    Monotonic,
     /// Parallel lines, each on its own.
     Line,
     ZigZag,
@@ -72,8 +72,7 @@ pub enum Kind {
 pub fn kind_of(pattern: &str) -> Kind {
     match pattern {
         "alignedrectilinear" => Kind::Rectilinear { alternate: false },
-        "monotonic" => Kind::Monotonic { joined: true },
-        "monotonicline" => Kind::Monotonic { joined: false },
+        "monotonic" | "monotonicline" => Kind::Monotonic,
         "line" => Kind::Line,
         "zigzag" => Kind::ZigZag,
         "crosszag" => Kind::CrossZag,
@@ -131,6 +130,12 @@ pub struct Params {
     /// Cross zag's shift per layer, mm.
     pub shift_step: f64,
     pub skin: Skin,
+    /// The layer height, when lines are spaced as beads side by side (OrcaSlicer's flow
+    /// spacing: `width - height × (1 - π/4)` apart at full density); 0 spaces them a width apart.
+    pub height: f64,
+    /// Where the patterns' grid is fixed: OrcaSlicer fills in the object's own coordinates,
+    /// centred on it, so lines sit the same way wherever the object is on the plate.
+    pub origin: DVec2,
 }
 
 impl Params {
@@ -146,6 +151,8 @@ impl Params {
             lattice: [-std::f64::consts::FRAC_PI_4, std::f64::consts::FRAC_PI_4],
             shift_step: 0.4,
             skin: Skin { depth: 2.0, density: 0.25, skeleton: 0.25 },
+            origin: DVec2::ZERO,
+            height: 0.0,
         }
     }
 }
@@ -166,17 +173,36 @@ pub fn fill_with(area: &[Shape], kind: Kind, p: &Params) -> Vec<Line> {
     if !p.density.is_finite() {
         return Vec::new();
     }
+    if p.origin != DVec2::ZERO && p.origin.is_finite() {
+        // Filled where the origin is zero, then moved back.
+        let o = p.origin;
+        let moved: Vec<Shape> =
+            area.iter().map(|sh| sh.iter().map(|c| c.iter().map(|q| *q - o).collect()).collect()).collect();
+        let mut lines = fill_with(&moved, kind, &Params { origin: DVec2::ZERO, ..*p });
+        for l in &mut lines {
+            for q in &mut l.points {
+                *q += o;
+            }
+        }
+        return lines;
+    }
     let (w, d) = (p.width, p.density.min(1.0));
     if area.is_empty() || !(d > 0.0 && w > 0.0 && w.is_finite() && p.angle.is_finite() && p.z.is_finite()) {
         return Vec::new();
     }
-    let s = w / d;
+    let bead = if p.height > 0.0 && p.height.is_finite() { crate::settings::Settings::spacing(w, p.height) } else { w };
+    let s = bead / d;
     let turned = |a: f64| if p.turn_by_layer && p.layer % 2 == 1 { a + FRAC_PI_2 } else { a };
     let a = p.angle;
+    // Solid fills sit half a line off the grid (OrcaSlicer's), so a square's lines are centred.
+    let half = if d >= 0.9999 { s / 2.0 } else { 0.0 };
+    // OrcaSlicer links rectilinear lines along the edge: up to three lines' spacing for solid
+    // fills, however far for sparse ones.
+    let link = if d > 0.8 { 3.0 * bead } else { f64::INFINITY };
     let mut lines = match kind {
-        Kind::Rectilinear { alternate } => parallel(area, s, if alternate { turned(a) } else { a }, 0.0, w),
-        Kind::Monotonic { joined } => monotonic(area, s, turned(a), w, joined),
-        Kind::Line => rows(area, s, turned(a), 0.0, w).into_iter().map(Line::open).collect(),
+        Kind::Rectilinear { alternate } => parallel(area, s, if alternate { turned(a) } else { a }, half, w, link),
+        Kind::Monotonic => monotonic(area, s, turned(a), half, w, link),
+        Kind::Line => rows(area, s, turned(a), half, w).into_iter().map(Line::open).collect(),
         Kind::Grid => directions(area, w, s * 2.0, &[(a, 0.0), (a + FRAC_PI_2, 0.0)]),
         Kind::Triangles | Kind::Lightning => {
             directions(area, w, s * 3.0, &[(a, 0.0), (a + FRAC_PI_3, 0.0), (a + 2.0 * FRAC_PI_3, 0.0)])
@@ -197,7 +223,7 @@ pub fn fill_with(area: &[Shape], kind: Kind, p: &Params) -> Vec<Line> {
             let fam = |k: usize| {
                 let tilt = p.lattice.get(k).copied().unwrap_or(0.0).clamp(-1.4, 1.4);
                 let spacing = s * 2.0;
-                parallel(area, spacing, a, (p.z * tilt.tan()).rem_euclid(spacing), w)
+                parallel(area, spacing, a, (p.z * tilt.tan()).rem_euclid(spacing), w, 0.0)
             };
             let mut out = fam(0);
             out.extend(fam(1));
@@ -258,7 +284,7 @@ fn rows(area: &[Shape], spacing: f64, a: f64, phase: f64, width: f64) -> Vec<Pol
 /// Pieces of lines along `a` as regions OrcaSlicer prints in one go: runs of rows where each
 /// piece has exactly one piece next to it in the row before (a hole splits the rows into a
 /// region each side of it). Each region's pieces run the same way, row by row.
-fn regions(pieces: Vec<Polyline>, a: f64, spacing: f64) -> Vec<Vec<Polyline>> {
+fn regions(pieces: Vec<Polyline>, a: f64, spacing: f64, phase: f64) -> Vec<Vec<Polyline>> {
     let dir = DVec2::new(a.cos(), a.sin());
     let normal = dir.perp();
     // (row, from, to along the row, piece)
@@ -271,7 +297,7 @@ fn regions(pieces: Vec<Polyline>, a: f64, spacing: f64) -> Vec<Vec<Polyline>> {
             }
             let (from, to) =
                 l.iter().fold((f64::MAX, f64::MIN), |(lo, hi), q| (lo.min(q.dot(dir)), hi.max(q.dot(dir))));
-            let row = (l.first().copied().unwrap_or_default().dot(normal) / spacing).round();
+            let row = ((l.first().copied().unwrap_or_default().dot(normal) - phase) / spacing).round();
             Some((row.clamp(-1.0e15, 1.0e15) as i64, from, to, l))
         })
         .collect();
@@ -326,29 +352,96 @@ fn regions(pieces: Vec<Polyline>, a: f64, spacing: f64) -> Vec<Vec<Polyline>> {
     done
 }
 
+/// Splits solid infill into what fills well with lines and the narrow rest, which fills better
+/// concentrically (OrcaSlicer's "detect narrow internal solid infill", after PrusaSlicer's
+/// anti-vibration filter): strips under about four lines across are narrow, and so are runs of
+/// five or more neighbouring lines at `angle` shorter than 4 mm. Returns (lines, narrow).
+pub fn split_narrow_solid(area: &[Shape], spacing: f64, angle: f64) -> (Vec<Shape>, Vec<Shape>) {
+    const SHORT: f64 = 4.0;
+    const RUN: usize = 5;
+    if area.is_empty() || !(spacing > 0.0 && spacing.is_finite()) {
+        return (area.to_vec(), Vec::new());
+    }
+    let core = geom::offset(&geom::offset(area, -2.0 * spacing, Join::Miter), 3.0 * spacing, Join::Miter);
+    let core = geom::offset(&geom::boolean(area, &core, geom::Op::Intersect), -spacing * 0.5, Join::Miter);
+    if core.is_empty() {
+        return (Vec::new(), area.to_vec());
+    }
+    let pieces: Vec<Polyline> =
+        rows(&core, spacing, angle, 0.0, spacing).into_iter().filter(|l| geom::length(l) > spacing).collect();
+    let normal = DVec2::new(angle.cos(), angle.sin()).perp() * (spacing / 2.0);
+    let mut strips: Vec<Shape> = Vec::new();
+    for region in regions(pieces, angle, spacing, 0.0) {
+        let short: Vec<bool> = region.iter().map(|l| geom::length(l) < SHORT).collect();
+        let mut k = 0;
+        while k < region.len() {
+            let run = short.iter().skip(k).take_while(|s| **s).count();
+            let skip = run >= RUN;
+            for l in region.iter().skip(k).take(run.max(1)) {
+                if (skip && run > 0) || l.len() < 2 {
+                    continue;
+                }
+                let (Some(&a), Some(&b)) = (l.first(), l.last()) else { continue };
+                strips.push(vec![vec![a - normal, b - normal, b + normal, a + normal]]);
+            }
+            k += run.max(1);
+        }
+    }
+    if strips.is_empty() {
+        return (Vec::new(), area.to_vec());
+    }
+    let lines_area = geom::union(&strips);
+    let mut narrow = geom::boolean(area, &lines_area, geom::Op::Difference);
+    // Scraps too small to fill that touch the line area join it.
+    let (scraps, rest): (Vec<Shape>, Vec<Shape>) = narrow.into_iter().partition(|p| {
+        geom::offset(std::slice::from_ref(p), -spacing * 0.5, Join::Miter).is_empty()
+            && !geom::boolean(
+                &geom::offset(std::slice::from_ref(p), spacing * 0.3, Join::Miter),
+                &lines_area,
+                geom::Op::Intersect,
+            )
+            .is_empty()
+    });
+    narrow = rest;
+    if narrow.is_empty() {
+        return (area.to_vec(), Vec::new());
+    }
+    let mut grown = lines_area;
+    grown.extend(scraps);
+    let lines =
+        geom::boolean(&geom::offset(&geom::union(&grown), spacing * 0.5, Join::Miter), area, geom::Op::Intersect);
+    let narrow = geom::boolean(area, &lines, geom::Op::Difference);
+    (lines, narrow)
+}
+
 /// Pieces of lines along `a`, joined zig-zag within each region.
-fn join_rows(pieces: Vec<Polyline>, a: f64, spacing: f64, area: &[Shape], max_step: f64) -> Vec<Line> {
-    regions(pieces, a, spacing).into_iter().flat_map(|r| join_zigzag(r, area, max_step)).collect()
+fn join_rows(
+    pieces: Vec<Polyline>,
+    a: f64,
+    spacing: f64,
+    phase: f64,
+    area: &[Shape],
+    max_step: f64,
+    link: f64,
+) -> Vec<Line> {
+    let around = Around::new(area, max_step, link);
+    regions(pieces, a, spacing, phase).into_iter().flat_map(|r| join_zigzag(r, &around, max_step, link)).collect()
 }
 
 /// Lines `spacing` apart at angle `a`, clipped and joined zig-zag where they meet.
-fn parallel(area: &[Shape], spacing: f64, a: f64, phase: f64, width: f64) -> Vec<Line> {
-    join_rows(rows(area, spacing, a, phase, width), a, spacing, area, spacing * 1.9)
+fn parallel(area: &[Shape], spacing: f64, a: f64, phase: f64, width: f64, link: f64) -> Vec<Line> {
+    join_rows(rows(area, spacing, a, phase, width), a, spacing, phase, area, spacing * 1.9, link)
 }
 
 /// Parallel lines in several directions, each `(angle, phase)`.
 fn directions(area: &[Shape], width: f64, spacing: f64, dirs: &[(f64, f64)]) -> Vec<Line> {
-    dirs.iter().flat_map(|&(a, phase)| parallel(area, spacing, a, phase.rem_euclid(spacing), width)).collect()
+    dirs.iter().flat_map(|&(a, phase)| parallel(area, spacing, a, phase.rem_euclid(spacing), width, 0.0)).collect()
 }
 
 /// Monotonic: every line runs the same way, printed in order across the region.
-fn monotonic(area: &[Shape], spacing: f64, a: f64, width: f64, joined: bool) -> Vec<Line> {
-    let pieces = rows(area, spacing, a, 0.0, width);
-    let mut out = if joined {
-        join_rows(pieces, a, spacing, area, spacing * 1.9)
-    } else {
-        regions(pieces, a, spacing).into_iter().flatten().map(Line::open).collect()
-    };
+fn monotonic(area: &[Shape], spacing: f64, a: f64, phase: f64, width: f64, link: f64) -> Vec<Line> {
+    let pieces = rows(area, spacing, a, phase, width);
+    let mut out = join_rows(pieces, a, spacing, phase, area, spacing * 1.9, link);
     for l in &mut out {
         l.ordered = true;
     }
@@ -374,9 +467,9 @@ fn cubic(area: &[Shape], p: &Params, s: f64, dirs: usize, graded: Option<(f64, f
         let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
         let slide = p.z * sign * std::f64::consts::FRAC_1_SQRT_2;
         let phase = slide.rem_euclid(spacing * coarse);
-        out.extend(parallel(&near, spacing, a, phase.rem_euclid(spacing), p.width));
+        out.extend(parallel(&near, spacing, a, phase.rem_euclid(spacing), p.width, 0.0));
         if !far.is_empty() {
-            out.extend(parallel(&far, spacing * coarse, a, phase, p.width));
+            out.extend(parallel(&far, spacing * coarse, a, phase, p.width, 0.0));
         }
     }
     out
@@ -410,7 +503,7 @@ fn wave_rows(area: &[Shape], a: f64, spacing: f64, period: f64, amp: f64, shift:
             })
             .collect()
     });
-    join_rows(lines, a, spacing, area, spacing * 1.9)
+    join_rows(lines, a, spacing, 0.0, area, spacing * 1.9, 0.0)
 }
 
 /// Cross zag: zig-zag waves along the infill direction, shifted along by `shift_step` each
@@ -421,25 +514,86 @@ fn cross_zag(area: &[Shape], a: f64, w: f64, d: f64, p: &Params) -> Vec<Line> {
     waves(area, a, spacing, shift, false)
 }
 
-/// Cross hatch: straight lines that keep their direction for a while, then bend through
-/// zig-zags into the other direction, so layers bond without abrupt crossings.
+/// Cross hatch, as OrcaSlicer (Bambu Lab) draws it: straight lines one way for a stretch of
+/// height, then a few transition layers of waves that turn them, then straight lines the
+/// other way. At low density the straight stretches are shorter and the lines a little
+/// further apart. The grid is fixed four lines at a time from the object's origin.
 fn cross_hatch(area: &[Shape], p: &Params, s: f64) -> Vec<Line> {
-    // Each layer runs one way, so its lines carry the whole density.
-    let grid = s;
-    let (repeat, transition) = (grid * 2.0, grid * 0.8);
-    let period = repeat + transition;
-    let cycle = (p.z / period).floor();
-    let phase = p.z - cycle * period;
-    let a = p.angle + if (cycle as i64).rem_euclid(2) == 1 { FRAC_PI_2 } else { 0.0 };
-    if phase < repeat {
-        parallel(area, grid, a, 0.0, p.width)
-    } else {
-        // Waves growing to 45°, the rows spread as they lengthen so the density holds; at the
-        // end neighbouring rows touch.
-        let t = ((phase - repeat) / transition).clamp(0.0, 1.0);
-        let spacing = grid * (1.0 + t * t).sqrt();
-        wave_rows(area, a, spacing, spacing * 2.0, t * spacing / 2.0, 0.0, true)
+    let density = p.density.min(1.0);
+    let ls = if density < 0.999 { s * 1.08 } else { s };
+    let repeat_ratio = if density < 0.3 { (1.0 - (-5.0 * density).exp()).clamp(0.2, 1.0) } else { 1.0 };
+    let (trans, repeat) = (ls * 0.4, ls * repeat_ratio);
+    let z = p.z + repeat / 2.0 + trans;
+    let period = trans + repeat;
+    let trans_z = z.rem_euclid(period) - repeat;
+    // Along the frame's x axis (1) or across it (-1); the second half of a transition turns.
+    let direction = if z.rem_euclid(period * 2.0) - period <= 1e-6 { -1 } else { 1 };
+    let progress = if trans_z < 0.0 { 0.0 } else { (trans_z % trans) / trans };
+    let rows_along = if trans_z >= 0.0 && progress >= 0.5 { -direction } else { direction };
+    let lines = framed(area, p.angle, |lo, hi| {
+        let module = ls * 4.0;
+        let base = DVec2::new((lo.x / module).floor() * module, (lo.y / module).floor() * module);
+        let size = hi - base;
+        if !(size.x / ls < 1.0e5 && size.y / ls < 1.0e5) {
+            return Vec::new();
+        }
+        let lines = if trans_z < 0.0 {
+            hatch_repeat(direction, ls, size)
+        } else if progress < 0.5 {
+            hatch_transform((progress + 0.1) * 2.0, rows_along, ls, size)
+        } else {
+            hatch_transform((1.1 - progress) * 2.0, rows_along, ls, size)
+        };
+        lines.into_iter().map(|l| l.into_iter().map(|q| q + base).collect()).collect()
+    });
+    // Bits shorter than most of a line go (OrcaSlicer's).
+    let lines: Vec<Polyline> = lines.into_iter().filter(|l| geom::length(l) >= 0.8 * s * density).collect();
+    let row_angle = if rows_along > 0 { p.angle } else { p.angle + FRAC_PI_2 };
+    join_rows(lines, row_angle, ls, 0.0, area, ls * 1.9, 0.0)
+}
+
+/// Cross hatch's straight layers: lines `grid` apart over a `size` box from the origin, along
+/// x (`direction` 1) or y.
+fn hatch_repeat(direction: i32, grid: f64, size: DVec2) -> Vec<Polyline> {
+    let (w, h) = if direction < 0 { (size.y, size.x) } else { (size.x, size.y) };
+    let n = (h / grid) as usize + 1;
+    (0..n)
+        .map(|i| {
+            let line = vec![DVec2::new(0.0, grid * i as f64), DVec2::new(w, grid * i as f64)];
+            if direction < 0 { line.into_iter().map(|q| DVec2::new(q.y, q.x)).collect() } else { line }
+        })
+        .collect()
+}
+
+/// Cross hatch's transition layers: rows of a four-point wave whose bends grow with
+/// `progress`, odd and even rows half a cycle apart.
+fn hatch_transform(progress: f64, direction: i32, grid: f64, size: DVec2) -> Vec<Polyline> {
+    let period = grid * 2.0;
+    let offset = progress / 8.0 * period;
+    let cycle = [
+        DVec2::new(0.25 * period - offset, offset),
+        DVec2::new(0.25 * period + offset, offset),
+        DVec2::new(0.75 * period - offset, -offset),
+        DVec2::new(0.75 * period + offset, -offset),
+    ];
+    let (w, h) = if direction < 0 { (size.y, size.x) } else { (size.x, size.y) };
+    let cycles = (w / period) as usize + 2;
+    let row: Polyline =
+        (0..cycles).flat_map(|i| cycle.iter().map(move |q| *q + DVec2::new(i as f64 * period, 0.0))).collect();
+    let rows = (h / period) as usize + 2;
+    let mut out: Vec<Polyline> =
+        (0..rows).map(|i| row.iter().map(|q| *q + DVec2::new(0.0, period * i as f64)).collect()).collect();
+    out.extend(
+        (0..rows).map(|i| row.iter().map(|q| *q + DVec2::new(-0.5 * period, (i as f64 + 0.5) * period)).collect()),
+    );
+    if direction < 0 {
+        for l in &mut out {
+            for q in l.iter_mut() {
+                *q = DVec2::new(q.y, q.x);
+            }
+        }
     }
+    out
 }
 
 /// Honeycomb as OrcaSlicer (Slic3r) draws it: columns of zig-zags up one side of a row of
@@ -521,7 +675,7 @@ fn lateral_honeycomb(area: &[Shape], p: &Params) -> Vec<Line> {
             })
             .collect()
     });
-    join_rows(lines, p.angle, wid / 2.0, area, wid)
+    join_rows(lines, p.angle, wid / 2.0, 0.0, area, wid, 0.0)
 }
 
 /// Curves of an implicit surface solved along one axis: for each `u` sample, the `v` values
@@ -724,12 +878,11 @@ fn iso_lines(lo: DVec2, hi: DVec2, cell: f64, f: impl Fn(DVec2) -> f64) -> Vec<P
     lines
 }
 
-/// Joins each line to the next when the step between their ends is short and stays inside
-/// `area`, flipping every other line, so neighbouring rows print as one zig-zag.
-fn join_zigzag(lines: Vec<Polyline>, area: &[Shape], max_step: f64) -> Vec<Line> {
-    // Line ends lie on the boundary, so the step between them runs along it: test against the
-    // area grown by a little.
-    let area = &geom::offset(area, max_step * 0.25, Join::Miter);
+/// Joins each line to the next, flipping every other line, so neighbouring rows print as one
+/// zig-zag: along the area's edge between their ends when that is at most `link` long
+/// (OrcaSlicer's link along the perimeter), else straight across when the step is under
+/// `max_step` and stays inside.
+fn join_zigzag(lines: Vec<Polyline>, around: &Around<'_>, max_step: f64, link: f64) -> Vec<Line> {
     let mut out: Vec<Line> = Vec::new();
     let mut current: Option<Polyline> = None;
     for mut l in lines {
@@ -741,8 +894,13 @@ fn join_zigzag(lines: Vec<Polyline>, area: &[Shape], max_step: f64) -> Vec<Line>
                 l.reverse();
             }
             let start = l.first().copied().unwrap_or_default();
+            if let Some(path) = around.edges.as_ref().and_then(|ed| ed.along(end, start, link)) {
+                cur.extend(path);
+                cur.extend(l);
+                continue;
+            }
             let step = start.distance(end);
-            if step < max_step && geom::contains(area, (start + end) / 2.0) {
+            if step < max_step && geom::contains(around.grown(), (start + end) / 2.0) {
                 cur.extend(l);
                 continue;
             }
@@ -756,6 +914,129 @@ fn join_zigzag(lines: Vec<Polyline>, area: &[Shape], max_step: f64) -> Vec<Line>
         out.push(Line::open(done));
     }
     out
+}
+
+/// What joining lines needs of their area, made once per fill: its edges, and the area grown a
+/// little (line ends lie on the boundary, so a straight step between them runs along it), made
+/// only if a straight step is tried.
+struct Around<'a> {
+    area: &'a [Shape],
+    grow: f64,
+    grown: std::cell::OnceCell<Vec<Shape>>,
+    edges: Option<Edges<'a>>,
+}
+
+impl<'a> Around<'a> {
+    fn new(area: &'a [Shape], max_step: f64, link: f64) -> Around<'a> {
+        Around {
+            area,
+            grow: max_step * 0.25,
+            grown: std::cell::OnceCell::new(),
+            edges: (link > 0.0).then(|| Edges::new(area, max_step)),
+        }
+    }
+
+    fn grown(&self) -> &[Shape] {
+        self.grown.get_or_init(|| geom::offset(self.area, self.grow, Join::Miter))
+    }
+}
+
+/// An area's contours, bucketed on a grid to find which edge a point lies on.
+struct Edges<'a> {
+    contours: Vec<&'a Vec<DVec2>>,
+    cell: f64,
+    grid: HashMap<(i64, i64), Vec<(usize, usize)>>,
+}
+
+impl<'a> Edges<'a> {
+    fn new(area: &'a [Shape], step: f64) -> Edges<'a> {
+        let contours: Vec<&Vec<DVec2>> = area.iter().flatten().filter(|c| c.len() >= 3).collect();
+        let extent = geom::bounds(area).map_or(1.0, |(lo, hi)| (hi - lo).max_element());
+        let cell = step.max(extent / 1024.0).max(1e-3);
+        let mut grid: HashMap<(i64, i64), Vec<(usize, usize)>> = HashMap::new();
+        for (ci, c) in contours.iter().enumerate() {
+            let n = c.len();
+            for i in 0..n {
+                let (Some(&a), Some(&b)) = (c.get(i), c.get((i + 1) % n)) else { continue };
+                // The cells along the segment (and their neighbours catch the rest).
+                let steps = ((a.distance(b) / (cell / 2.0)).ceil() as usize).clamp(1, 100_000);
+                let mut last = None;
+                for k in 0..=steps {
+                    let q = a.lerp(b, k as f64 / steps as f64);
+                    let key = ((q.x / cell).floor() as i64, (q.y / cell).floor() as i64);
+                    if last != Some(key) {
+                        grid.entry(key).or_default().push((ci, i));
+                        last = Some(key);
+                    }
+                }
+            }
+        }
+        Edges { contours, cell, grid }
+    }
+
+    /// The contour and segment `p` lies on, and how far along the segment.
+    fn locate(&self, p: DVec2) -> Option<(usize, usize, f64)> {
+        let (cx, cy) = ((p.x / self.cell).floor() as i64, (p.y / self.cell).floor() as i64);
+        let mut best: Option<(f64, usize, usize, f64)> = None;
+        for x in cx - 1..=cx + 1 {
+            for y in cy - 1..=cy + 1 {
+                for &(ci, i) in self.grid.get(&(x, y)).into_iter().flatten() {
+                    let Some(c) = self.contours.get(ci) else { continue };
+                    let (Some(&a), Some(&b)) = (c.get(i), c.get((i + 1) % c.len())) else { continue };
+                    let d = geom::point_segment_distance(p, a, b);
+                    if d < 1e-3 && best.is_none_or(|bst| d < bst.0) {
+                        let t = (p - a).dot(b - a) / (b - a).length_squared().max(1e-18);
+                        best = Some((d, ci, i, t));
+                    }
+                }
+            }
+        }
+        best.map(|(_, ci, i, t)| (ci, i, t))
+    }
+
+    /// The points along the edge from `a` to `b` (both on the same contour), the shorter way
+    /// round, when that is at most `limit` long.
+    fn along(&self, a: DVec2, b: DVec2, limit: f64) -> Option<Vec<DVec2>> {
+        let (ca, ia, ta) = self.locate(a)?;
+        let (cb, ib, tb) = self.locate(b)?;
+        if ca != cb {
+            return None;
+        }
+        let c = self.contours.get(ca)?;
+        let n = c.len();
+        let walk = |forward: bool| -> Option<(f64, Vec<DVec2>)> {
+            if ia == ib && (tb >= ta) == forward {
+                let d = a.distance(b);
+                return (d <= limit).then(|| (d, Vec::new()));
+            }
+            let mut pts = Vec::new();
+            let mut at = a;
+            let mut length = 0.0;
+            let mut k = if forward { (ia + 1) % n } else { ia };
+            let stop = if forward { ib } else { (ib + 1) % n };
+            for _ in 0..n {
+                let q = *c.get(k)?;
+                length += at.distance(q);
+                if length > limit {
+                    return None;
+                }
+                pts.push(q);
+                at = q;
+                if k == stop {
+                    let total = length + at.distance(b);
+                    return (total <= limit).then_some((total, pts));
+                }
+                k = if forward { (k + 1) % n } else { (k + n - 1) % n };
+            }
+            None
+        };
+        match (walk(true), walk(false)) {
+            (Some(f), Some(r)) => Some(if f.0 <= r.0 { f.1 } else { r.1 }),
+            (Some(f), None) => Some(f.1),
+            (None, Some(r)) => Some(r.1),
+            (None, None) => None,
+        }
+    }
 }
 
 /// Loops inset `spacing` apart until the area runs out.
@@ -1128,11 +1409,28 @@ mod tests {
     }
 
     #[test]
-    fn monotonic_lines_run_one_way_in_order() {
+    fn solid_lines_round_a_hole_join_along_the_edge() {
+        // A 20 mm square with a 10 mm hole, filled solid at 45°: rows split by the hole join
+        // along the edges into a few zig-zags (OrcaSlicer's links along the perimeter), not
+        // one line per row.
+        let mut ring = geom::rectangle(DVec2::ZERO, DVec2::splat(20.0));
+        let mut hole = geom::rectangle(DVec2::splat(5.0), DVec2::splat(15.0)).remove(0);
+        hole.reverse();
+        ring.push(hole);
+        let mut p = Params::new(0.42, 1.0, std::f64::consts::FRAC_PI_4, 0, 0.2);
+        p.height = 0.2;
+        let lines = fill_with(&[ring], kind_of("monotonic"), &p);
+        assert!(lines.len() <= 8, "{} lines", lines.len());
+        assert!(total(&lines) > 300.0 / 0.38 * 0.9, "{}", total(&lines));
+    }
+
+    #[test]
+    fn monotonic_lines_sweep_across_in_order() {
+        // OrcaSlicer's monotonic lines: one zig-zag across the square, printed in order.
         let lines = fill(&square(10.0), kind_of("monotonicline"), 0.42, 1.0, 0.0, 0, 0.0);
-        assert!(lines.len() > 20 && lines.iter().all(|l| l.ordered));
-        assert!(lines.iter().all(|l| l.points[l.points.len() - 1].x > l.points[0].x));
-        assert!(lines.windows(2).all(|w| w[1].points[0].y > w[0].points[0].y));
+        assert!(!lines.is_empty() && lines.len() <= 2 && lines.iter().all(|l| l.ordered), "{}", lines.len());
+        let ys: Vec<f64> = lines.iter().flat_map(|l| l.points.iter().map(|p| p.y)).collect();
+        assert!(ys.windows(2).all(|w| w[1] >= w[0] - 1e-9));
     }
 
     #[test]
