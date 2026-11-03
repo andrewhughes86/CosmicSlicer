@@ -634,14 +634,14 @@ impl<'a> Writer<'a> {
     /// close short of the start by the seam gap, or ramp in and out as a scarf seam.
     fn steps(&self, path: &Path, scarf: bool) -> Vec<Step> {
         let n = path.points.len();
-        let plain = |to: DVec2, deg: u8| Step { to, deg, dz: 0.0, flow: 1.0, scarf: false };
+        let plain = |to: DVec2, hang: u8| Step { to, hang, dz: 0.0, flow: 1.0, scarf: false };
         let mut steps: Vec<Step> =
-            (1..n).filter_map(|k| path.points.get(k).map(|&p| plain(p, path.overhang_at(k - 1)))).collect();
+            (1..n).filter_map(|k| path.points.get(k).map(|&p| plain(p, path.hang_at(k - 1)))).collect();
         let Some(start) = path.start() else { return steps };
         if !path.closed {
             return steps;
         }
-        steps.push(plain(start, path.overhang_at(n - 1)));
+        steps.push(plain(start, path.hang_at(n - 1)));
         // Spiral vase: the wall climbs from the last layer's height to this one's as it goes
         // round, with no seam (and on the first spiral layer, the flow grows from nothing).
         if let Some(first_turn) = self.spiral.filter(|_| path.role == Role::OuterWall) {
@@ -726,9 +726,9 @@ impl<'a> Writer<'a> {
         let mut i = 0;
         while i < steps.len() {
             let Some(first) = steps.get(i) else { break };
-            let key = (first.deg, first.scarf);
+            let key = (first.hang, first.scarf);
             let j = (i..steps.len())
-                .find(|&j| steps.get(j).is_some_and(|st| (st.deg, st.scarf) != key))
+                .find(|&j| steps.get(j).is_some_and(|st| (st.hang, st.scarf) != key))
                 .unwrap_or(steps.len());
             if let Some(run) = steps.get(i..j) {
                 all.extend(run.iter().map(|st| st.to));
@@ -768,14 +768,16 @@ impl<'a> Writer<'a> {
         self.mv(target.extend(z), 0.0, speed, MoveKind::Travel);
     }
 
-    /// Prints a run of `path`'s steps that share an overhang degree (and scarf or not).
+    /// Prints a run of `path`'s steps that hang alike (and scarf or not).
     fn run(&mut self, path: &Path, run: &[Step], z: f64) {
         let Some(fil) = self.filament() else { return };
         let Some(first) = run.first() else { return };
         let s = self.s();
-        let deg = if path.role.is_wall() { first.deg } else { 0 };
-        // Half or more of the line over air: an overhang wall in the Preview and G-code.
-        let role = if deg >= 3 { Role::OverhangWall } else { path.role };
+        let hang = if path.role.is_wall() { first.hang } else { 0 };
+        let deg = crate::toolpath::degree_of(hang);
+        // OrcaSlicer's overhang wall: the line's centre over half a nozzle past the layer below.
+        let over_air = f64::from(hang) / 100.0 > 0.5 + s.nozzle / (2.0 * path.width.max(1e-6));
+        let role = if over_air { Role::OverhangWall } else { path.role };
         if self.role != Some(role) {
             self.role = Some(role);
             self.line(format!(";TYPE:{}", role.name()));
@@ -791,14 +793,10 @@ impl<'a> Writer<'a> {
             base = v;
         }
         let mut flow = path.flow;
-        if deg > 0 && s.walls.overhang_speed {
-            base = match s.walls.overhang_speeds.get(usize::from(deg) - 1) {
-                Some(sp) => sp.of(base),
-                // Hanging (almost) entirely: bridge speed.
-                None => s.speeds.bridge,
-            };
+        if deg > 0 && s.walls.overhang_speed && self.layer > 0 {
+            base = overhang_speed(f64::from(hang) / 100.0, base, &s.walls.overhang_speeds, s.speeds.bridge);
         }
-        if deg == 5 {
+        if over_air {
             flow *= s.walls.overhang_flow;
         }
         if first.scarf {
@@ -1336,10 +1334,37 @@ impl<'a> Writer<'a> {
 #[derive(Clone, Copy, Debug)]
 struct Step {
     to: DVec2,
-    deg: u8,
+    /// How much of the line hangs past the layer below, percent.
+    hang: u8,
     dz: f64,
     flow: f64,
     scarf: bool,
+}
+
+/// A wall's speed where `share` of its line hangs past the layer below (OrcaSlicer's dynamic
+/// overhang speed): the wall speed up to 10 %, then on to each overhang speed at 25, 50, 75 and
+/// 87 % (0 keeps the wall speed) and the bridge speed when all of it hangs, in straight lines
+/// between; never faster than `original`.
+fn overhang_speed(share: f64, original: f64, speeds: &[crate::settings::RelSpeed; 4], bridge: f64) -> f64 {
+    const AT: [f64; 6] = [0.10, 0.25, 0.50, 0.75, 0.87, 1.0];
+    let level = |k: usize| -> f64 {
+        match k {
+            0 => original,
+            5 => bridge,
+            _ => speeds.get(k - 1).map_or(original, |sp| sp.of(original)),
+        }
+    };
+    let v = if share <= AT[0] {
+        original
+    } else if share >= AT[5] {
+        level(5)
+    } else {
+        let k = AT.windows(2).position(|w| share <= w[1]).unwrap_or(4);
+        let (a, b) = (AT.get(k).copied().unwrap_or(0.1), AT.get(k + 1).copied().unwrap_or(1.0));
+        let t = ((share - a) / (b - a)).clamp(0.0, 1.0);
+        (1.0 - t) * level(k) + t * level(k + 1)
+    };
+    v.round().min(original).max(1.0)
 }
 
 /// Splits steps starting at `from` where they pass the distances `cuts` (ascending), giving
@@ -1451,7 +1476,7 @@ fn stagger(path: &mut Path, back: f64) {
             // A new point on segment `prev`, which keeps its overhang mark.
             path.points.insert(prev + 1, cut);
             if path.overhang.len() == n {
-                let d = path.overhang_at(prev);
+                let d = path.hang_at(prev);
                 path.overhang.insert(prev + 1, d);
             }
             path.rotate(prev + 1);
@@ -2272,12 +2297,30 @@ mod tests {
     }
 
     #[test]
+    fn overhang_speeds_run_smoothly_between_degrees() {
+        use crate::settings::RelSpeed;
+        // X1C's: 200 mm/s walls, overhangs off / 50 / 30 / 10, bridges 50.
+        let speeds = [RelSpeed::Off, RelSpeed::Mm(50.0), RelSpeed::Mm(30.0), RelSpeed::Mm(10.0)];
+        let v = |share: f64| overhang_speed(share, 200.0, &speeds, 50.0);
+        assert_eq!(v(0.05), 200.0);
+        assert_eq!(v(0.25), 200.0);
+        // Halfway from 25 % (wall speed) to 50 % (50 mm/s).
+        assert_eq!(v(0.375), 125.0);
+        assert_eq!(v(0.5), 50.0);
+        assert_eq!(v(0.87), 10.0);
+        // Then up to the bridge speed when all of it hangs.
+        assert_eq!(v(1.2), 50.0);
+        // Never faster than the line's own speed.
+        assert_eq!(overhang_speed(0.3, 40.0, &speeds, 50.0), 40.0);
+    }
+
+    #[test]
     fn seams_hide_in_concave_corners_but_not_on_overhangs() {
         let mut p = l_shape();
         // Near the top-right of the L, the concave corner wins over the convex ones nearby.
         assert_eq!(best_seam(&p, DVec2::new(8.0, 8.0)), 3);
         // Overhanging there: the seam goes elsewhere.
-        p.overhang = vec![0, 0, 3, 3, 0, 0];
+        p.overhang = vec![0, 0, 60, 60, 0, 0];
         assert_ne!(best_seam(&p, DVec2::new(8.0, 8.0)), 3);
         assert!((corner_angle(&p.points, 3) - 90.0).abs() < 1e-9);
     }
@@ -2285,7 +2328,7 @@ mod tests {
     #[test]
     fn loops_stop_short_by_the_seam_gap() {
         let p = l_shape();
-        let plain = |to: DVec2| Step { to, deg: 0, dz: 0.0, flow: 1.0, scarf: false };
+        let plain = |to: DVec2| Step { to, hang: 0, dz: 0.0, flow: 1.0, scarf: false };
         let mut steps: Vec<Step> = p.points.iter().skip(1).chain(p.points.first()).map(|q| plain(*q)).collect();
         trim_end(DVec2::ZERO, &mut steps, 0.04);
         assert_eq!(steps.len(), 6);
@@ -2298,7 +2341,7 @@ mod tests {
 
     #[test]
     fn steps_split_at_distances() {
-        let plain = |to: DVec2| Step { to, deg: 0, dz: 0.0, flow: 1.0, scarf: false };
+        let plain = |to: DVec2| Step { to, hang: 0, dz: 0.0, flow: 1.0, scarf: false };
         let steps = vec![plain(DVec2::new(10.0, 0.0)), plain(DVec2::new(10.0, 10.0))];
         let split = split_steps(DVec2::ZERO, &steps, &[2.5, 5.0, 10.0, 12.0]);
         let ds: Vec<f64> = split.iter().map(|(_, d)| *d).collect();

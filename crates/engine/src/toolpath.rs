@@ -103,12 +103,18 @@ pub struct Path {
     pub speed: f64,
     /// Extrusion multiplier on top of the filament's flow ratio (bridges).
     pub flow: f64,
-    /// Walls: how far each segment (from point `i` to the next) overhangs the layer below,
-    /// 0 (not) to 5 (95 % or more of the line width). Empty when none does.
+    /// Walls: how much of each segment's line (from point `i` to the next) hangs past the
+    /// layer below, in percent of its width (0 to 255). Empty when none does.
     pub overhang: Vec<u8>,
     /// Paths sharing a non-zero group print one after another in the order given (monotonic
     /// infill, overhang perimeters), not nearest first.
     pub group: u32,
+}
+
+/// The overhang degree (OrcaSlicer's: 10, 25, 50, 75 and 95 % of the line hanging start
+/// degrees 1 to 5) of a share in percent.
+pub fn degree_of(percent: u8) -> u8 {
+    [10, 25, 50, 75, 95].iter().filter(|t| percent >= **t).count() as u8
 }
 
 impl Path {
@@ -131,8 +137,13 @@ impl Path {
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed).max(1)
     }
 
-    /// The overhang degree of segment `i`.
+    /// The overhang degree of segment `i`: 0 (not) to 5 (95 % or more of the line).
     pub fn overhang_at(&self, i: usize) -> u8 {
+        degree_of(self.hang_at(i))
+    }
+
+    /// How much of segment `i`'s line hangs, in percent of its width.
+    pub fn hang_at(&self, i: usize) -> u8 {
         self.overhang.get(i).copied().unwrap_or(0)
     }
 
@@ -187,7 +198,7 @@ mod tests {
     fn reversing_keeps_overhang_marks_on_their_segments() {
         let mut p = Path::new(Role::OuterWall, vec![DVec2::ZERO, DVec2::X, DVec2::ONE, DVec2::Y], true, 0.4, 1.0, 1.0);
         // Only the segment from X to ONE overhangs.
-        p.overhang = vec![0, 3, 0, 0];
+        p.overhang = vec![0, 60, 0, 0];
         p.reverse();
         let i = p.points.iter().position(|q| *q == DVec2::ONE).unwrap_or(9);
         assert_eq!(p.points.get(i + 1), Some(&DVec2::X));

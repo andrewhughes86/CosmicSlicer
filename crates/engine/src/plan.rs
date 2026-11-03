@@ -1020,8 +1020,12 @@ mod tests {
         slices.extend(vec![vec![geom::rectangle(glam::DVec2::ZERO, glam::DVec2::new(20.0, 10.0))]; 5]);
         let layers = slicing::layer_heights(3.0, 0.2, 0.2);
         let plan = object(&slices, &layers, &s, &[], &never);
-        let marked =
-            |i: usize| plan[i].iter().flat_map(|isl| isl.walls.iter().flatten()).any(|p| p.overhang.contains(&5));
+        let marked = |i: usize| {
+            plan[i]
+                .iter()
+                .flat_map(|isl| isl.walls.iter().flatten())
+                .any(|p| p.overhang.iter().any(|h| crate::toolpath::degree_of(*h) == 5))
+        };
         assert!(marked(10) && !marked(9) && !marked(11));
         assert!(plan[10][0].fills.iter().any(|p| p.role == Role::Bridge));
     }

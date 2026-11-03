@@ -7,50 +7,94 @@ use glam::DVec2;
 use crate::geom::{self, Join, Op, Shape};
 use crate::toolpath::Path;
 
-/// Fractions of the line width hanging past the layer below that start degrees 1 to 5.
-const THRESHOLDS: [f64; 5] = [0.10, 0.25, 0.50, 0.75, 0.95];
-
-/// The layer below, grown or shrunk to each degree's threshold for one line width.
+/// The layer below, near where this layer's walls may hang past it.
 pub struct Below {
     /// Where a line centre hangs at least 10 % (empty: nothing on this layer overhangs).
     zone: Vec<Shape>,
     bounds: Option<(DVec2, DVec2)>,
-    /// The layer below offset to the thresholds of degrees 1 to 5.
-    grown: Vec<Vec<Shape>>,
+    below: Vec<Shape>,
+    /// The layer below's edges near the zone, bucketed by `cell`.
+    edges: std::collections::HashMap<(i64, i64), Vec<(DVec2, DVec2)>>,
+    cell: f64,
     width: f64,
 }
+
+/// Hanging shares (percent of the line) are kept in 5 % steps.
+const STEP: f64 = 5.0;
 
 impl Below {
     /// For lines `width` wide on `layer`, over `below`.
     pub fn new(layer: &[Shape], below: &[Shape], width: f64) -> Below {
         // A line centred `x` outside the layer below hangs (x / w + ½) of its width.
-        let at = |t: f64| geom::offset(below, width * (t - 0.5), Join::Miter);
-        let first = at(THRESHOLDS[0]);
+        let first = geom::offset(below, width * (0.10 - 0.5), Join::Miter);
         // Wall centres sit half a width inside the layer; where those can hang 10 %.
         let centres = geom::offset(layer, -0.45 * width, Join::Miter);
         let zone = geom::without_slivers(geom::boolean(&centres, &first, Op::Difference), width * width * 0.01);
-        let bounds = geom::bounds(&zone).map(|(lo, hi)| (lo - DVec2::splat(width), hi + DVec2::splat(width)));
-        let grown = if zone.is_empty() {
-            Vec::new()
-        } else {
-            std::iter::once(first).chain(THRESHOLDS[1..].iter().map(|t| at(*t))).collect()
-        };
-        Below { zone, bounds, grown, width }
+        let bounds =
+            geom::bounds(&zone).map(|(lo, hi)| (lo - DVec2::splat(width * 2.0), hi + DVec2::splat(width * 2.0)));
+        let cell = width.max(0.05);
+        let mut edges: std::collections::HashMap<(i64, i64), Vec<(DVec2, DVec2)>> = std::collections::HashMap::new();
+        if let Some((lo, hi)) = bounds {
+            for c in below.iter().flatten() {
+                let n = c.len();
+                for i in 0..n {
+                    let (Some(&a), Some(&b)) = (c.get(i), c.get((i + 1) % n)) else { continue };
+                    if a.max(b).cmplt(lo).any() || a.min(b).cmpgt(hi).any() {
+                        continue;
+                    }
+                    let steps = ((a.distance(b) / (cell / 2.0)).ceil() as usize).clamp(1, 100_000);
+                    let mut last = None;
+                    for k in 0..=steps {
+                        let q = a.lerp(b, k as f64 / steps as f64);
+                        let key = ((q.x / cell).floor() as i64, (q.y / cell).floor() as i64);
+                        if last != Some(key) {
+                            edges.entry(key).or_default().push((a, b));
+                            last = Some(key);
+                        }
+                    }
+                }
+            }
+        }
+        let below = if zone.is_empty() { Vec::new() } else { below.to_vec() };
+        Below { zone, bounds, below, edges, cell, width }
     }
 
     fn near(&self, p: DVec2) -> bool {
         self.bounds.is_some_and(|(lo, hi)| p.x >= lo.x && p.y >= lo.y && p.x <= hi.x && p.y <= hi.y)
     }
 
-    /// The degree, 0 to 5, of a line centred at `p`.
-    pub fn degree(&self, p: DVec2) -> u8 {
-        if !self.near(p) {
+    /// How much of a line centred at `p` hangs past the layer below, in percent of its width
+    /// (0 to 255), in 5 % steps.
+    pub fn hang(&self, p: DVec2) -> u8 {
+        if self.zone.is_empty() || !self.near(p) {
             return 0;
         }
-        self.grown.iter().filter(|g| !geom::contains(g, p)).count() as u8
+        let inside = geom::contains(&self.below, p);
+        // The nearest edge within two widths; past that the line is all in or all out.
+        let (cx, cy) = ((p.x / self.cell).floor() as i64, (p.y / self.cell).floor() as i64);
+        let reach = ((self.width * 2.0 / self.cell).ceil() as i64).clamp(1, 8);
+        let mut best = f64::INFINITY;
+        for x in cx - reach..=cx + reach {
+            for y in cy - reach..=cy + reach {
+                for (a, b) in self.edges.get(&(x, y)).into_iter().flatten() {
+                    best = best.min(geom::point_segment_distance(p, *a, *b));
+                }
+            }
+        }
+        let signed = if inside { -best } else { best };
+        let share = (signed / self.width + 0.5) * 100.0;
+        if !share.is_finite() {
+            return if inside { 0 } else { 255 };
+        }
+        ((share / STEP).round() * STEP).clamp(0.0, 255.0) as u8
     }
 
-    /// Marks each segment of `path` with its overhang degree, splitting long segments near
+    /// The degree, 0 to 5, of a line centred at `p`.
+    pub fn degree(&self, p: DVec2) -> u8 {
+        crate::toolpath::degree_of(self.hang(p))
+    }
+
+    /// Marks each segment of `path` with how far it hangs, splitting long segments near
     /// overhangs so the marks follow the overhang's edge.
     pub fn mark(&self, path: &mut Path) {
         if self.zone.is_empty() || path.points.len() < 2 {
@@ -76,19 +120,19 @@ impl Below {
             points.push((last, false));
         }
         let m = points.len();
-        let degrees: Vec<u8> = (0..m)
+        let hangs: Vec<u8> = (0..m)
             .map(|i| match (points.get(i), points.get((i + 1) % m)) {
-                (Some(&(a, _)), Some(&(b, _))) if path.closed || i + 1 < m => self.degree((a + b) / 2.0),
+                (Some(&(a, _)), Some(&(b, _))) if path.closed || i + 1 < m => self.hang((a + b) / 2.0),
                 _ => 0,
             })
             .collect();
-        if !degrees.iter().any(|d| *d > 0) {
+        if !hangs.iter().any(|d| crate::toolpath::degree_of(*d) > 0) {
             return;
         }
-        // Added points stay only where the degree changes.
+        // Added points stay only where the share changes.
         let (mut kept, mut marks) = (Vec::with_capacity(n), Vec::with_capacity(n));
-        for (i, (&(p, added), &d)) in points.iter().zip(&degrees).enumerate() {
-            let before = if i == 0 { None } else { degrees.get(i - 1).copied() };
+        for (i, (&(p, added), &d)) in points.iter().zip(&hangs).enumerate() {
+            let before = if i == 0 { None } else { hangs.get(i - 1).copied() };
             if !added || before != Some(d) {
                 kept.push(p);
                 marks.push(d);
