@@ -518,7 +518,24 @@ Done so far (2026-11-02):
 - Still open: offsets cost ~1 ms each in i_overlay (the speed test structure's walls);
   self-intersections within a shell; booleans run on the UI thread (Benchy 0.2 s).
 
-## 19 · Parity with OrcaSlicer
+## 19 · Parity with OrcaSlicer — in progress
+Progress (2026-11-02):
+- `tools/parity.sh` slices a reference set (eight generated shapes and Orca's own Benchy, Voron
+  cube, KSR test, Orca cube, calicat and Stanford bunny) with OrcaSlicer 2.4.2's command line on
+  the X1C, MK4 and Voron 2.4 presets, and with ours on the settings Orca wrote into its G-code;
+  `parity_tests` compares time, filament, features, retractions and toolpath maps, and draws
+  layers. Every difference so far was fixed from Orca's own source.
+- Fixed: estimates (custom G-code and waits timed; "model printing time" as Orca's), layer
+  cooling (Orca's cooling buffer and fan rules), auto brim, retraction and wipe, vertical shells
+  and internal bridges (which areas, which direction, spacing), infill alignment, spacing and
+  joining, Orca's crosshatch, narrow solid infill, monotonic lines, narrow outer loops (pin tips),
+  and a slicing bug that lost whole layers when a vertex lay on the cutting plane.
+- Now: time within about -6 % to +8 % of Orca's estimate across 42 cases, filament within about
+  2 %, toolpaths covering the same ground 60–94 %.
+- Still open: "slowdown for curled perimeters" (Orca's curl estimate; the MK4 overhang test runs
+  9 % faster than Orca's); the MK4 (Arachne) infill area is a little wider than Orca's;
+  the start sequence's heating and loading time Orca adds to its total.
+
 - A reference set (calibration cube, Benchy, thin walls, overhang test, multi-part, multi-colour,
   large and small parts) sliced by both with the same profiles.
 - Compare time, filament, layer count, per-feature totals and toolpath maps; explain or fix every
