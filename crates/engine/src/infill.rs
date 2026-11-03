@@ -133,6 +133,9 @@ pub struct Params {
     /// The layer height, when lines are spaced as beads side by side (OrcaSlicer's flow
     /// spacing: `width - height × (1 - π/4)` apart at full density); 0 spaces them a width apart.
     pub height: f64,
+    /// Solid line fills spread their lines evenly over the region (OrcaSlicer's solid spacing
+    /// adjustment; not for bridges, which keep their spacing).
+    pub fit_solid: bool,
     /// Where the patterns' grid is fixed: OrcaSlicer fills in the object's own coordinates,
     /// centred on it, so lines sit the same way wherever the object is on the plate.
     pub origin: DVec2,
@@ -153,6 +156,7 @@ impl Params {
             skin: Skin { depth: 2.0, density: 0.25, skeleton: 0.25 },
             origin: DVec2::ZERO,
             height: 0.0,
+            fit_solid: false,
         }
     }
 }
@@ -194,8 +198,13 @@ pub fn fill_with(area: &[Shape], kind: Kind, p: &Params) -> Vec<Line> {
     let s = bead / d;
     let turned = |a: f64| if p.turn_by_layer && p.layer % 2 == 1 { a + FRAC_PI_2 } else { a };
     let a = p.angle;
-    // Solid fills sit half a line off the grid (OrcaSlicer's), so a square's lines are centred.
-    let half = if d >= 0.9999 { s / 2.0 } else { 0.0 };
+    // Solid fills sit half a line off the grid (OrcaSlicer's), so a square's lines are centred;
+    // fitted ones are spread over the region instead, half a line in from its edge.
+    let line_kind = matches!(kind, Kind::Rectilinear { .. } | Kind::Monotonic | Kind::Line);
+    let (s, half) = match fitted(area, kind, turned, p, s) {
+        Some(fit) if d >= 0.9999 && line_kind => fit,
+        _ => (s, if d >= 0.9999 { s / 2.0 } else { 0.0 }),
+    };
     // OrcaSlicer links rectilinear lines along the edge: up to three lines' spacing for solid
     // fills, however far for sparse ones.
     let link = if d > 0.8 { 3.0 * bead } else { f64::INFINITY };
@@ -255,6 +264,30 @@ pub fn fill_with(area: &[Shape], kind: Kind, p: &Params) -> Vec<Line> {
     }
     lines.retain(|l| l.points.len() >= 2);
     lines
+}
+
+/// OrcaSlicer's solid spacing adjustment: the lines spread evenly over the region's width
+/// across them (at most 20 % further apart), the first half a line in. (spacing, phase).
+fn fitted(area: &[Shape], kind: Kind, turned: impl Fn(f64) -> f64, p: &Params, s: f64) -> Option<(f64, f64)> {
+    if !p.fit_solid {
+        return None;
+    }
+    let a = match kind {
+        Kind::Rectilinear { alternate: false } => p.angle,
+        _ => turned(p.angle),
+    };
+    let normal = DVec2::new(a.cos(), a.sin()).perp();
+    let (lo, hi) = area.iter().flatten().flatten().fold((f64::MAX, f64::MIN), |(lo, hi), q| {
+        let d = q.dot(normal);
+        (lo.min(d), hi.max(d))
+    });
+    let width = hi - lo;
+    if !(width > 0.0 && width.is_finite()) {
+        return None;
+    }
+    let n = ((width - 1e-9) / s).floor();
+    let fit = if n < 1.0 { s } else { (width / n).min(s * 1.2) };
+    Some((fit, (lo + fit / 2.0).rem_euclid(fit)))
 }
 
 /// Turns `p` by `angle`.

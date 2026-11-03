@@ -719,7 +719,11 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
         p.turn_by_layer = !templated;
         p
     };
-    let solid_params = |w: f64, density: f64| params(w, density, solid_angle, !inf.solid_template.is_empty());
+    let solid_params = |w: f64, density: f64| {
+        let mut p = params(w, density, solid_angle, !inf.solid_template.is_empty());
+        p.fit_solid = true;
+        p
+    };
     let (infill_speed, solid_speed, top_speed) = if first {
         (s.speeds.first_layer_infill, s.speeds.first_layer_infill, s.speeds.first_layer_infill)
     } else {
