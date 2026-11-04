@@ -288,7 +288,10 @@ fn config_block(schema: &Schema, table: &Config) -> String {
         "printhost_password",
         "printhost_port",
     ];
-    let mut keys: Vec<&str> = schema.options.keys().map(String::as_str).collect();
+    // What the presets hold and what the settings tabs show; the schema also lists options
+    // that belong to neither a print nor a printer.
+    let mut keys: Vec<&str> =
+        schema.options.keys().map(String::as_str).filter(|k| schema.tab_of(k).is_some()).collect();
     keys.extend(table.values.keys().map(String::as_str));
     keys.sort_unstable();
     keys.dedup();

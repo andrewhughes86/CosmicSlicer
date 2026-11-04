@@ -70,7 +70,10 @@ OrcaSlicer's crashes are the reason this exists.
   OrcaSlicer's command line (presets flattened by `tools/parity_flatten.py`, since Orca's CLI
   ignores `inherits`) and with ours using the settings Orca wrote into its G-code, then
   `parity_tests` compares them (time, filament, features, retractions, toolpath maps and
-  layer pictures in `<dir>/<model>@<set>/`). Orca's behaviour is the reference: when they
+  layer pictures in `<dir>/<model>@<set>/`). `tools/parity_diff.py <case> [--layer N] [--feature F]`
+  compares the two files line by line; `PARITY.md` lists every known difference and why. `seam`,
+  `connect` and `arcs` are ports of Orca's SeamPlacer, connect_infill and ArcFitter down to libstdc++'s
+  random numbers and sort, so keep them so. Orca's behaviour is the reference: when they
   differ, read Orca's source for the rule rather than guessing.
 - `crates/ui-egui` — the UI. `project.rs` maps the session to and from 3MF projects (presets by name, edits kept);
   `slicer.rs` runs the engine on a thread (results checked against a
