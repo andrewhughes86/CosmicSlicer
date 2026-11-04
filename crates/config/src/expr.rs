@@ -65,8 +65,17 @@ fn format_number(n: f64) -> String {
     if (n - n.round()).abs() < 1e-9 && n.abs() < 1e15 {
         return format!("{}", n.round() as i64);
     }
-    let s = format!("{n:.6}");
-    s.trim_end_matches('0').trim_end_matches('.').to_owned()
+    // As a C++ stream prints a double, which is what OrcaSlicer's templates give: six
+    // significant digits.
+    let science = format!("{n:.5e}");
+    let (mantissa, exp) = science.split_once('e').unwrap_or((&science, "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let trimmed = |t: &str| t.trim_end_matches('0').trim_end_matches('.').to_owned();
+    if (-4..6).contains(&exp) {
+        trimmed(&format!("{n:.*}", (5 - exp) as usize))
+    } else {
+        format!("{}e{}{:02}", trimmed(mantissa), if exp < 0 { '-' } else { '+' }, exp.abs())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

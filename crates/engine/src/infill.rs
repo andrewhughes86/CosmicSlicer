@@ -128,6 +128,8 @@ pub struct Params {
     pub turn_by_layer: bool,
     /// Open line ends follow the edge this far (OrcaSlicer's infill anchors), mm.
     pub anchor: f64,
+    /// Lines join along the edge when their ends are closer than this; under 0.05 they stay apart.
+    pub anchor_max: f64,
     /// Lateral lattice angles from vertical, radians.
     pub lattice: [f64; 2],
     /// Cross zag's shift per layer, mm.
@@ -159,6 +161,7 @@ impl Params {
             z,
             turn_by_layer: true,
             anchor: 0.0,
+            anchor_max: 0.0,
             lattice: [-std::f64::consts::FRAC_PI_4, std::f64::consts::FRAC_PI_4],
             shift_step: 0.4,
             skin: Skin { depth: 2.0, density: 0.25, skeleton: 0.25 },
@@ -279,7 +282,7 @@ pub fn fill_with(area: &[Shape], kind: Kind, p: &Params) -> Vec<Line> {
     if p.anchor <= 0.0 && p.inset && matches!(kind, Kind::Rectilinear { .. } | Kind::Monotonic | Kind::MonotonicLine) {
         extend_ends(&mut lines, &geom::offset(source, -0.05 * bead / d.max(1e-6), Join::Miter), bead * 20.0);
     }
-    if p.anchor > 0.0 {
+    if p.anchor > 0.0 && !(p.anchor_max >= 0.05 && matches!(kind, Kind::CrossHatch)) {
         // Never so long that neighbouring anchors meet.
         anchor_ends(&mut lines, area, p.anchor.min(s * 0.45), w * 0.25);
     }
@@ -941,6 +944,30 @@ fn cross_hatch(area: &[Shape], p: &Params, s: f64) -> Vec<Line> {
     });
     // Bits shorter than most of a line go (OrcaSlicer's).
     let lines: Vec<Polyline> = lines.into_iter().filter(|l| geom::length(l) >= 0.8 * s * density).collect();
+    if p.anchor_max >= 0.05 {
+        let boundary: Vec<Contour> = area.iter().flatten().cloned().collect();
+        // Equal arcs between line ends fall to the order lines arrive in, which in OrcaSlicer is
+        // what Clipper returns. This order, top row first in the pattern's frame, matches it
+        // best on symmetric parts; other parts have no such ties.
+        let (sin, cos) = p.angle.sin_cos();
+        let in_frame = |q: Option<&DVec2>| q.map_or(DVec2::ZERO, |q| turn(*q, (-sin, cos)));
+        let mut lines = lines;
+        for l in &mut lines {
+            let (a, b) = (in_frame(l.first()), in_frame(l.last()));
+            if (a.x, a.y) < (b.x, b.y) {
+                l.reverse();
+            }
+        }
+        let middle = |l: &Polyline| (in_frame(l.first()) + in_frame(l.last())) / 2.0;
+        lines.sort_by(|a, b| {
+            let (x, y) = (middle(a), middle(b));
+            y.y.total_cmp(&x.y).then(x.x.total_cmp(&y.x))
+        });
+        return crate::connect::connect_infill(lines, &boundary, s * density, p.anchor, p.anchor_max)
+            .into_iter()
+            .map(Line::open)
+            .collect();
+    }
     let row_angle = if rows_along > 0 { p.angle } else { p.angle + FRAC_PI_2 };
     join_rows(lines, row_angle, ls, 0.0, area, ls * 1.9, 0.0)
 }

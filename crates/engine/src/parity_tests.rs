@@ -264,6 +264,12 @@ fn job_for(models: &[std::path::PathBuf], cfg: &Config, orca: &Preview) -> Optio
         let file = CosmicSlicer_model::load(model).ok()?;
         let mesh = file.objects.into_iter().next()?.mesh.centred();
         let centre = object_centre(orca, several.then_some(k)).unwrap_or([110.0, 110.0]);
+        // Orca's arrange centres a lone object on a round number; the walls only say roughly.
+        let snap = |v: f64| {
+            let r = (v * 2.0).round() / 2.0;
+            if !several && (v - r).abs() < 0.1 { r } else { v }
+        };
+        let centre = centre.map(snap);
         objects.push(JobObject {
             name: model.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
             mesh: Arc::new(mesh),
@@ -447,8 +453,7 @@ fn picture(orca: &Preview, ours: &Preview, z: f64) -> Option<Vec<u8>> {
 /// "; model printing time: 1h 2m 3s; …" (the start and end G-code aside; or "estimated printing
 /// time (normal mode) = …").
 fn header_time(g: &str) -> Option<f64> {
-    let line =
-        g.lines().take(400).find(|l| l.contains("model printing time") || l.contains("estimated printing time"))?;
+    let line = g.lines().find(|l| l.contains("model printing time") || l.contains("estimated printing time"))?;
     let t = line.split(';').find(|p| p.contains("model printing time")).unwrap_or(line).rsplit([':', '=']).next()?;
     let mut secs = 0.0;
     for part in t.split_whitespace() {

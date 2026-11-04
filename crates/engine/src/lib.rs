@@ -13,6 +13,7 @@
 
 pub mod arcs;
 pub mod calib;
+pub mod connect;
 pub mod fuzzy;
 pub mod gcode;
 pub mod gcodeview;
@@ -272,6 +273,34 @@ fn macro_table(schema: &Schema, base: &Config, filaments: &[Config]) -> Config {
         table.set(k.clone(), v.join(","));
     }
     table
+}
+
+/// `; key = value` for every setting, sorted, as OrcaSlicer's `append_full_config`.
+fn config_block(schema: &Schema, table: &Config) -> String {
+    const LEFT_OUT: [&str; 9] = [
+        "compatible_printers",
+        "compatible_prints",
+        "print_host",
+        "print_host_webui",
+        "printhost_apikey",
+        "printhost_cafile",
+        "printhost_user",
+        "printhost_password",
+        "printhost_port",
+    ];
+    let mut keys: Vec<&str> = schema.options.keys().map(String::as_str).collect();
+    keys.extend(table.values.keys().map(String::as_str));
+    keys.sort_unstable();
+    keys.dedup();
+    let mut out = String::new();
+    for key in keys.into_iter().filter(|k| !LEFT_OUT.contains(k)) {
+        out.push_str("; ");
+        out.push_str(key);
+        out.push_str(" = ");
+        out.push_str(&table.get(schema, key).replace('\\', "\\\\").replace('\n', "\\n"));
+        out.push('\n');
+    }
+    out
 }
 
 /// Each object's seams, sharing the raycast visibility between instances of one mesh.
@@ -775,6 +804,8 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
         events: &job.events,
         calib: job.calib.as_ref(),
         seams: &seams,
+        config_block: config_block(schema, &table),
+        bed_shape: table.get(schema, "printable_area").to_owned(),
     };
     let out = gcode::emit(&plans, &cx);
     if let Some(e) = out.error {

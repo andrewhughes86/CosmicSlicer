@@ -101,6 +101,10 @@ pub struct Context<'a> {
     pub events: &'a [(f64, LayerEvent)],
     /// A calibration print's per-layer changes.
     pub calib: Option<&'a crate::calib::Calib>,
+    /// The settings as OrcaSlicer's config block lists them.
+    pub config_block: String,
+    /// `printable_area`, for that block.
+    pub bed_shape: String,
     /// Where each object's loops start.
     pub seams: &'a [Option<crate::seam::ObjectSeams>],
 }
@@ -1747,7 +1751,7 @@ fn label_mask(o: usize) -> String {
 
 fn fan_command(percent: f64) -> String {
     let s = (percent.clamp(0.0, 100.0) * 2.55).round() as i64;
-    if s == 0 { "M107".into() } else { format!("M106 S{s}") }
+    format!("M106 S{s}")
 }
 
 fn has_command(gcode: &str, words: &[&str]) -> bool {
@@ -1777,68 +1781,55 @@ fn label(name: &str, i: usize) -> String {
 }
 
 /// The machine limits, as the firmware expects them at the start.
+/// The machine limits, as OrcaSlicer's `print_machine_envelope` writes them.
 fn limits_gcode(s: &Settings) -> Vec<String> {
     let m = &s.motion;
     let l = &m.limits;
-    match m.flavor {
-        Flavor::Klipper => vec![format!(
-            "SET_VELOCITY_LIMIT VELOCITY={} ACCEL={} SQUARE_CORNER_VELOCITY={}",
-            f3(l.max_speed[0].min(l.max_speed[1])),
-            f3(l.accel_extruding),
-            f3(l.jerk[0].min(l.jerk[1])),
-        )],
-        Flavor::RepRap => vec![
-            format!(
-                "M201 X{} Y{} Z{} E{}",
-                f3(l.max_accel[0]),
-                f3(l.max_accel[1]),
-                f3(l.max_accel[2]),
-                f3(l.max_accel[3])
-            ),
-            // RepRapFirmware takes speeds and jerk in mm/min.
-            format!(
-                "M203 X{} Y{} Z{} E{}",
-                f3(l.max_speed[0] * 60.0),
-                f3(l.max_speed[1] * 60.0),
-                f3(l.max_speed[2] * 60.0),
-                f3(l.max_speed[3] * 60.0)
-            ),
-            format!("M204 P{} T{}", f3(l.accel_extruding), f3(l.accel_travel)),
-            format!(
-                "M566 X{} Y{} Z{} E{}",
-                f3(l.jerk[0] * 60.0),
-                f3(l.jerk[1] * 60.0),
-                f3(l.jerk[2] * 60.0),
-                f3(l.jerk[3] * 60.0)
-            ),
-        ],
-        Flavor::Repetier => Vec::new(),
-        Flavor::Marlin | Flavor::Marlin2 => {
-            let mut v = vec![
-                format!(
-                    "M201 X{} Y{} Z{} E{}",
-                    f3(l.max_accel[0]),
-                    f3(l.max_accel[1]),
-                    f3(l.max_accel[2]),
-                    f3(l.max_accel[3])
-                ),
-                format!(
-                    "M203 X{} Y{} Z{} E{}",
-                    f3(l.max_speed[0]),
-                    f3(l.max_speed[1]),
-                    f3(l.max_speed[2]),
-                    f3(l.max_speed[3])
-                ),
-                format!("M204 P{} R{} T{}", f3(l.accel_extruding), f3(l.accel_retracting), f3(l.accel_travel)),
-            ];
-            if m.flavor == Flavor::Marlin2 && l.junction_deviation > 0.0 {
-                v.push(format!("M205 J{}", f3(l.junction_deviation)));
-            } else {
-                v.push(format!("M205 X{} Y{} Z{} E{}", f3(l.jerk[0]), f3(l.jerk[1]), f3(l.jerk[2]), f3(l.jerk[3])));
-            }
-            v
-        }
+    let int = |v: f64| (v + 0.5).trunc() as i64;
+    let factor = if m.flavor == Flavor::RepRap { 60.0 } else { 1.0 };
+    if !matches!(m.flavor, Flavor::RepRap | Flavor::Marlin | Flavor::Marlin2) {
+        return Vec::new();
     }
+    let extruding = int(l.accel_extruding);
+    let mut v = vec![
+        format!(
+            "M201 X{} Y{} Z{} E{}",
+            int(l.max_accel[0]),
+            int(l.max_accel[1]),
+            int(l.max_accel[2]),
+            int(l.max_accel[3])
+        ),
+        format!(
+            "M203 X{} Y{} Z{} E{}",
+            int(l.max_speed[0] * factor),
+            int(l.max_speed[1] * factor),
+            int(l.max_speed[2] * factor),
+            int(l.max_speed[3] * factor)
+        ),
+        match m.flavor {
+            Flavor::RepRap => {
+                format!("M204 P{} T{} ; sets acceleration (P, T), mm/sec^2", extruding, int(l.accel_travel))
+            }
+            Flavor::Marlin2 => format!(
+                "M204 P{} R{} T{} ; sets acceleration (P, T) and retract acceleration (R), mm/sec^2",
+                extruding,
+                int(l.accel_retracting),
+                int(l.accel_travel)
+            ),
+            // Legacy Marlin has one acceleration for printing and travel.
+            _ => format!("M204 P{} R{} T{}", extruding, int(l.accel_retracting), extruding),
+        },
+    ];
+    let jerk = |i: usize| format!("{:.2}", l.jerk[i] * factor);
+    v.push(if m.flavor == Flavor::RepRap {
+        format!("M566 X{} Y{} Z{} E{} ; sets the jerk limits, mm/min", jerk(0), jerk(1), jerk(2), jerk(3))
+    } else {
+        format!("M205 X{} Y{} Z{} E{} ; sets the jerk limits, mm/sec", jerk(0), jerk(1), jerk(2), jerk(3))
+    });
+    if m.flavor == Flavor::Marlin2 && l.junction_deviation > 0.0 {
+        v.push(format!("M205 J{:.3}", l.junction_deviation));
+    }
+    v
 }
 
 fn accel_gcode(flavor: Flavor, a: f64, to_decel: Option<f64>) -> String {
@@ -1935,6 +1926,7 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         }
     };
     let start = render("Machine start G-code", &s.gcode.start, &[]);
+    w.line("; EXECUTABLE_BLOCK_START");
     // Object labels go before the start G-code, so the firmware knows them from the start.
     let labels = m.label_objects || m.exclude_object;
     if labels && m.flavor == Flavor::Klipper && m.exclude_object {
@@ -1950,42 +1942,65 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
                 poly.join(",")
             ));
         }
-    } else if labels && matches!(m.flavor, Flavor::Marlin | Flavor::Marlin2) {
-        w.line(format!("M486 T{}", cx.object_names.len()));
+    } else if labels && !s.bbl && matches!(m.flavor, Flavor::Marlin | Flavor::Marlin2) {
+        for (i, name) in cx.object_names.iter().enumerate() {
+            w.line(format!("M486 S{i}"));
+            w.line(format!("M486 A{}", label(name, i)));
+            w.line("M486 S-1");
+        }
     }
+    // The first progress line.
+    w.ops.push(Op::Layer(usize::MAX));
     if m.emit_limits {
         for l in limits_gcode(s) {
             w.line(l);
         }
     }
-    if !has_command(&start, &["M140", "M190"]) {
-        w.line(format!("M140 S{}", bed_first.round() as i64));
+    if s.gcode.auxiliary_fan && first_fil.as_ref().is_some_and(|f| f.fan_off_layers > 0) {
+        w.line("M106 S0");
+        w.line("M106 P2 S0");
     }
-    if !has_command(&start, &["M104", "M109"]) {
+    let klipper = m.flavor == Flavor::Klipper;
+    let sets_bed = has_command(&start, &["M140", "M190"]);
+    let sets_nozzle = has_command(&start, &["M104", "M109"]);
+    if !klipper && !sets_bed {
+        w.line(format!("M190 S{}", bed_first.round() as i64));
+    }
+    if !klipper && !sets_nozzle {
         w.line(format!("M104 S{}", nozzle_first.round() as i64));
     }
-    if !has_command(&start, &["M140", "M190"]) {
-        w.line(format!("M190 S{} ; wait for bed", bed_first.round() as i64));
-    }
-    if !has_command(&start, &["M104", "M109"]) {
-        w.line(format!("M109 S{} ; wait for nozzle", nozzle_first.round() as i64));
-    }
-    w.line("; machine start G-code");
+    w.line(if s.bbl { "; FEATURE: Custom" } else { ";TYPE:Custom" });
     w.line(start.trim_end().to_owned());
-    w.line("; end of machine start G-code");
-    w.line("G90 ; absolute coordinates");
-    w.line("G21 ; millimetres");
+    let filament_vars = [("filament_extruder_id", Value::Num(w.extruder as f64)), ("layer_num", Value::Num(0.0))];
+    let first_start =
+        first_fil.as_ref().map_or(String::new(), |f| render("Filament start G-code", &f.start_gcode, &filament_vars));
+    if s.bbl {
+        w.line(first_start.trim_end().to_owned());
+        w.line(format!(";VT{}", w.extruder));
+        w.pressure_advance();
+    }
+    // Start G-code that does not heat the nozzle: nothing else will wait for it.
+    if !sets_nozzle {
+        w.line(format!("M109 S{}", nozzle_first.round() as i64));
+    }
+    w.line("G90");
+    w.line("G21");
     if s.gcode.relative_e {
-        w.line("M83 ; relative extrusion");
+        w.line("M83 ; use relative distances for extrusion");
     } else {
-        w.line("M82 ; absolute extrusion");
+        w.line("M82 ; use absolute distances for extrusion");
         w.line("G92 E0");
     }
     if n_ext > 1 {
         let e = w.extruder;
         w.line(format!("T{e}"));
     }
-    w.pressure_advance();
+    if !s.bbl {
+        w.line(first_start.trim_end().to_owned());
+        w.pressure_advance();
+    } else {
+        w.line("M981 S1 P20000 ;open spaghetti detector");
+    }
 
     // The prime tower: as deep as the layer with the most purging needs, up to the last change.
     if s.multi.tower && n_ext > 1 {
@@ -2238,8 +2253,22 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
     w.retract();
     w.flush_labels();
     w.set_fan(0.0);
+    if s.gcode.auxiliary_fan {
+        w.line("M106 P2 S0");
+    }
+    if s.bbl {
+        w.line("M981 S0 P20000 ; close spaghetti detector");
+    }
+    w.line(if s.bbl { "; FEATURE: Custom" } else { ";TYPE:Custom" });
+    let last_layer = plans.len().saturating_sub(1) as f64;
+    for (i, f) in cx.filaments.iter().enumerate() {
+        let vars = [("filament_extruder_id", Value::Num(i as f64)), ("layer_num", Value::Num(last_layer))];
+        let text = render("Filament end G-code", &f.end_gcode, &vars);
+        if !text.trim().is_empty() {
+            w.line(text.trim_end().to_owned());
+        }
+    }
     let end = render("Machine end G-code", &s.gcode.end, &[]);
-    w.line("; machine end G-code");
     w.line(end.trim_end().to_owned());
 
     // ---- time, then text ----
@@ -2283,34 +2312,78 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
             *slot = g / 1000.0 * f.cost;
         }
     }
+    let first_layer_time = layer_times.first().copied().unwrap_or(0.0) + stats.prepare_time;
     let mut header = String::new();
     let _ = writeln!(header, "; HEADER_BLOCK_START");
     let _ = writeln!(header, "; generated by CosmicSlicer {}", env!("CARGO_PKG_VERSION"));
-    let _ = writeln!(header, "; plate: {}", cx.plate_name);
-    let _ = writeln!(
-        header,
-        "; model printing time: {}; total estimated time: {}",
-        hms(stats.total_time - stats.prepare_time),
-        hms(stats.total_time)
-    );
-    let _ = writeln!(header, "; estimated printing time (normal mode) = {}", hms(stats.total_time));
+    if s.bbl {
+        let _ = writeln!(
+            header,
+            "; model printing time: {}; total estimated time: {}",
+            hms(stats.total_time - stats.prepare_time),
+            hms(stats.total_time)
+        );
+        let _ = writeln!(header, "; estimated first layer printing time (normal mode) = {}", hms(first_layer_time));
+    }
     let _ = writeln!(header, "; total layer number: {}", plans.len());
-    let _ = writeln!(header, "; filament used [mm] = {}", join(&stats.filament_mm, 2));
+    if s.bbl {
+        let ids: Vec<String> = (0..cx.object_names.len()).map(|i| i.to_string()).collect();
+        let _ = writeln!(header, "; model label id: {}", ids.join(","));
+    }
+    let list = |f: &dyn Fn(&Filament) -> f64| {
+        cx.filaments.iter().map(|x| format!("{:.2}", f(x))).collect::<Vec<_>>().join(",")
+    };
+    let _ = writeln!(header, "; filament_density: {}", plain_list(cx.filaments.iter().map(|f| f.density)));
+    let _ = writeln!(header, "; filament_diameter: {}", list(&|f| f.diameter));
+    let _ = writeln!(header, "; max_z_height: {:.2}", plans.last().map_or(0.0, |p| p.print_z));
     let _ = writeln!(
         header,
+        "; filament: {}",
+        (1..=cx.filaments.len()).map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+    );
+    let _ = writeln!(header, "; HEADER_BLOCK_END");
+    header.push('\n');
+    if s.bbl {
+        header.push_str(&config_block(cx, s));
+    }
+    let mut gcode = header;
+    gcode.push_str(&cx.thumbnails);
+    if !s.bbl {
+        let widths = &s.widths;
+        let _ = writeln!(gcode, "; external perimeters extrusion width = {:.2}mm", widths.outer);
+        let _ = writeln!(gcode, "; perimeters extrusion width = {:.2}mm", widths.inner);
+        let _ = writeln!(gcode, "; infill extrusion width = {:.2}mm", widths.sparse);
+        let _ = writeln!(gcode, "; solid infill extrusion width = {:.2}mm", widths.solid);
+        let _ = writeln!(gcode, "; top infill extrusion width = {:.2}mm", widths.top);
+        if plans.iter().any(|p| !p.support.is_empty()) {
+            let _ = writeln!(gcode, "; support material extrusion width = {:.2}mm", widths.support);
+        }
+        let _ = writeln!(gcode, "; first layer extrusion width = {:.2}mm", widths.first_layer);
+        gcode.push('\n');
+    }
+    render_ops(&mut gcode, &w.ops, &times, stats.total_time, s);
+    gcode.push_str("; EXECUTABLE_BLOCK_END\n\n");
+    let _ = writeln!(gcode, "; filament used [mm] = {}", join(&stats.filament_mm, 2));
+    let _ = writeln!(
+        gcode,
         "; filament used [cm3] = {}",
         join(&stats.volume_mm3.iter().map(|v| v / 1000.0).collect::<Vec<_>>(), 2)
     );
-    let _ = writeln!(header, "; filament used [g] = {}", join(&stats.weight_g, 2));
-    let _ = writeln!(header, "; filament cost = {}", join(&stats.cost, 2));
-    let _ = writeln!(header, "; layer_height = {}", f3(s.layer_height));
-    let _ = writeln!(header, "; initial_layer_print_height = {}", f3(s.first_layer_height));
-    let _ = writeln!(header, "; nozzle_diameter = {}", f3(s.nozzle));
-    let _ = writeln!(header, "; HEADER_BLOCK_END");
-    header.push('\n');
-    let mut gcode = header;
-    gcode.push_str(&cx.thumbnails);
-    render_ops(&mut gcode, &w.ops, &times, stats.total_time, s);
+    let _ = writeln!(gcode, "; filament used [g] = {}", join(&stats.weight_g, 2));
+    let _ = writeln!(gcode, "; filament cost = {}", join(&stats.cost, 2));
+    if !s.bbl {
+        let _ = writeln!(gcode, "; total filament used [g] = {:.2}", stats.weight_g.iter().sum::<f64>());
+        let _ = writeln!(gcode, "; total filament cost = {:.2}", stats.cost.iter().sum::<f64>());
+        if toolchanges > 0 {
+            let _ = writeln!(gcode, "; total filament change = {toolchanges}");
+        }
+        let _ = writeln!(gcode, "; total layers count = {}", plans.len());
+        let _ = writeln!(gcode, "; estimated printing time (normal mode) = {}", hms(stats.total_time));
+        let _ = writeln!(gcode, "; estimated first layer printing time (normal mode) = {}", hms(first_layer_time));
+        gcode.push('\n');
+        gcode.push_str(&config_block(cx, s));
+    }
+    gcode.push('\n');
     Output { error, gcode, preview: w.preview, stats, warnings: w.warnings }
 }
 
@@ -2408,6 +2481,28 @@ fn time_ops(ops: &[Op], s: &Settings) -> Vec<f64> {
     out
 }
 
+/// A list of numbers as a C++ stream prints them, comma-separated.
+fn plain_list(values: impl Iterator<Item = f64>) -> String {
+    values.map(|v| plain(v, 6)).collect::<Vec<_>>().join(",")
+}
+
+/// `; CONFIG_BLOCK_START` to its end: every setting, then what older readers look for.
+fn config_block(cx: &Context<'_>, s: &Settings) -> String {
+    let mut out = String::from("; CONFIG_BLOCK_START\n");
+    out.push_str(&cx.config_block);
+    let first = cx.filaments.first();
+    let _ = writeln!(out, "; first_layer_bed_temperature = {}", first.map_or(0, |f| f.bed_temp_first.round() as i64));
+    if !s.bbl {
+        let _ = writeln!(out, "; bed_shape = {}", cx.bed_shape);
+    }
+    let _ = writeln!(out, "; first_layer_temperature = {}", first.map_or(0, |f| f.nozzle_temp_first.round() as i64));
+    if !s.bbl {
+        let _ = writeln!(out, "; first_layer_height = {:.3}", s.first_layer_height);
+    }
+    out.push_str("; CONFIG_BLOCK_END\n\n");
+    out
+}
+
 /// The program as G-code text, with M73 progress at each layer.
 fn render_ops(out: &mut String, ops: &[Op], times: &[f64], total: f64, s: &Settings) {
     let flavor = s.motion.flavor;
@@ -2421,7 +2516,6 @@ fn render_ops(out: &mut String, ops: &[Op], times: &[f64], total: f64, s: &Setti
         out.push_str(s);
         out.push('\n');
     };
-    line(out, &format!("M73 P0 R{}", (total / 60.0).round() as i64));
     for (op, t) in ops.iter().zip(times) {
         match op {
             Op::Text(text) => {

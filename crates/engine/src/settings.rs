@@ -192,6 +192,8 @@ pub enum VerticalShell {
 pub struct InfillOpts {
     /// mm; 0 for no anchors.
     pub anchor: f64,
+    /// mm: line ends closer than this along the edge join up.
+    pub anchor_max: f64,
     /// Lateral lattice angles from vertical, radians.
     pub lattice: [f64; 2],
     pub shift_step: f64,
@@ -583,6 +585,8 @@ pub struct GcodeSettings {
     pub before_layer: String,
     pub timelapse: String,
     pub layer_change: String,
+    /// Bambu Lab's auxiliary part fan (M106 P2).
+    pub auxiliary_fan: bool,
     pub relative_e: bool,
     pub printer_model: String,
     /// Run at each filament change (OrcaSlicer's `change_filament_gcode`).
@@ -623,6 +627,9 @@ pub struct MultiMaterial {
 /// One filament's properties.
 #[derive(Clone, Debug)]
 pub struct Filament {
+    /// Custom G-code for when this filament starts and finishes.
+    pub start_gcode: String,
+    pub end_gcode: String,
     pub diameter: f64,
     /// g/cm³.
     pub density: f64,
@@ -786,13 +793,18 @@ impl Settings {
         let default_accel = accel("default_acceleration", 500.0);
         let support_type = r.text("support_type");
         let sparse_w = widths.sparse;
-        let anchor = match (r.mm_or_percent("infill_anchor", sparse_w), r.mm_or_percent("infill_anchor_max", sparse_w))
-        {
-            (Some(a), Some(m)) => a.min(m).min(1000.0),
-            _ => 0.0,
+        // Percentages are of the infill's line spacing.
+        let sparse_spacing = Settings::spacing(sparse_w, r.range("layer_height", 0.2, 0.01, 10.0));
+        let (anchor, anchor_max) = match (
+            r.mm_or_percent("infill_anchor", sparse_spacing),
+            r.mm_or_percent("infill_anchor_max", sparse_spacing),
+        ) {
+            (Some(a), Some(m)) => (a.min(m).min(1000.0), m.min(1000.0)),
+            _ => (0.0, 0.0),
         };
         let infill = InfillOpts {
             anchor,
+            anchor_max,
             lattice: [
                 r.range("lateral_lattice_angle_1", -45.0, -80.0, 80.0).to_radians(),
                 r.range("lateral_lattice_angle_2", 45.0, -80.0, 80.0).to_radians(),
@@ -1155,6 +1167,7 @@ impl Settings {
                 flavor: r.text("gcode_flavor"),
                 start: r.text("machine_start_gcode"),
                 end: r.text("machine_end_gcode"),
+                auxiliary_fan: r.flag("auxiliary_fan"),
                 before_layer: r.text("before_layer_change_gcode"),
                 timelapse: r.text("time_lapse_gcode"),
                 layer_change: r.text("layer_change_gcode"),
@@ -1230,6 +1243,8 @@ impl Filament {
         let nozzle_temp = r.range("nozzle_temperature", 210.0, 0.0, 500.0);
         let bed_temp = r.range(bed_key, 60.0, 0.0, 200.0);
         Filament {
+            start_gcode: r.text("filament_start_gcode"),
+            end_gcode: r.text("filament_end_gcode"),
             diameter: r.range("filament_diameter", 1.75, 0.5, 5.0),
             density: r.range("filament_density", 1.24, 0.0, 30.0),
             cost: r.range("filament_cost", 0.0, 0.0, 1.0e6),

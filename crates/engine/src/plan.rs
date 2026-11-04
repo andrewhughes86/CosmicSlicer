@@ -1014,6 +1014,7 @@ fn sparse_fill(out: &mut Vec<Path>, r: &Regions, s: &Settings, at: &Around<'_>, 
     p.height = at.layer.height;
     p.turn_by_layer = inf.sparse_template.is_empty();
     p.anchor = inf.anchor;
+    p.anchor_max = inf.anchor_max;
     p.lattice = inf.lattice;
     p.shift_step = inf.shift_step;
     p.skin = inf.skin;
