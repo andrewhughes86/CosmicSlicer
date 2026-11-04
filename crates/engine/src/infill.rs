@@ -660,11 +660,12 @@ fn filter_vibrating_lines(sections: &[Vec<Section>]) -> Vec<Vec<Section>> {
                     }
                     while let Some(check) = queue.pop_front() {
                         let alive = node(&nodes, check).is_some_and(|n| !n.removed);
-                        if alive && removable(&nodes, check) {
-                            if let Some(n) = nodes.get_mut(check.0).and_then(|l| l.get_mut(check.1)) {
-                                n.removed = true;
-                                queue.extend(n.previous.iter().copied());
-                            }
+                        if alive
+                            && removable(&nodes, check)
+                            && let Some(n) = nodes.get_mut(check.0).and_then(|l| l.get_mut(check.1))
+                        {
+                            n.removed = true;
+                            queue.extend(n.previous.iter().copied());
                         }
                     }
                 }

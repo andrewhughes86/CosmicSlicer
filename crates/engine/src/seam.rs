@@ -27,6 +27,9 @@ const SHARP_ANGLE: f32 = 55.0 * std::f32::consts::PI / 180.0;
 const ANGLE_ALIGNED: f32 = 0.6;
 const ANGLE_NEAREST: f32 = 1.0;
 const ENFORCER_STEP: f32 = 0.2;
+/// Orca's rounded figure, kept: the depth of inner seams depends on it.
+#[allow(clippy::approx_constant)]
+const ORCA_SQRT_2: f32 = 1.4142;
 const SCORE_TOLERANCE: f32 = 0.3;
 const TOLERABLE_DIST_FACTOR: f32 = 4.0;
 const MIN_STRING: usize = 6;
@@ -1757,11 +1760,11 @@ impl ObjectSeams {
                 let to_middle = (normalized(candidate.position - neighbour(previous)).truncate()
                     + normalized(candidate.position - neighbour(next)).truncate())
                     * 0.5;
-                depth = 1.4142 * depth / beta;
+                depth = ORCA_SQRT_2 * depth / beta;
                 let final_position = candidate.position.truncate() + to_middle * depth;
                 (segment, projected) = closest_on_loop(&path.points, to_world(final_position.extend(0.0)));
             } else {
-                depth = depth * beta / 1.4142;
+                depth = depth * beta / ORCA_SQRT_2;
             }
             seam_point = projected;
             if staggered && path.length() > 0.0 {
@@ -2032,7 +2035,7 @@ mod tests {
     fn the_fit_goes_through_a_straight_line() {
         let at: Vec<f32> = (0..50).map(|i| i as f32 * 0.2).collect();
         let points: Vec<Vec2> = at.iter().map(|z| Vec2::new(1.0 + z * 0.5, 2.0 - z)).collect();
-        let s = Spline::fit(&points, &at, &vec![1.0; 50], 3);
+        let s = Spline::fit(&points, &at, &[1.0; 50], 3);
         assert!(s.is_some());
         let Some(s) = s else { return };
         // With no spare parameters at the ends the curve only settles inside them, as in Orca.

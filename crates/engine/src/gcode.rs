@@ -1027,7 +1027,11 @@ impl<'a> Writer<'a> {
         pts.extend(run.iter().map(|st| st.to));
         // Each step's own height and flow (a scarf's), else straight or fitted arcs.
         let pieces: Vec<(Piece, f64, f64)> = if fit {
-            arcs::fit(&pts, 0.02).into_iter().map(|p| (p, 0.0, 1.0)).collect()
+            let tolerance = if path.role == Role::SparseInfill { 0.04 } else { s.resolution };
+            arcs::fit(&pts, tolerance).into_iter().map(|p| (p, 0.0, 1.0)).collect()
+        } else if run.iter().all(|st| st.dz == 0.0 && st.flow == 1.0) && self.spiral.is_none() {
+            // Without arcs, OrcaSlicer still simplifies each path.
+            geom::simplify(&pts, s.resolution).into_iter().skip(1).map(|p| (Piece::Line(p), 0.0, 1.0)).collect()
         } else {
             run.iter().map(|st| (Piece::Line(st.to), st.dz, st.flow)).collect()
         };

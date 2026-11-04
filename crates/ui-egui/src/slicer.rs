@@ -407,7 +407,7 @@ mod library_printers {
             assert!(out.is_ok(), "{printer}: {:?}", out.as_ref().err());
             let Ok(out) = out else { continue };
             let start: String =
-                out.gcode.lines().take_while(|l| !l.starts_with(";LAYER_CHANGE")).collect::<Vec<_>>().join("\n");
+                out.gcode.lines().take_while(|l| !l.ends_with("LAYER_CHANGE")).collect::<Vec<_>>().join("\n");
             assert!(
                 start.contains(expect),
                 "{printer}: start G-code lacks {expect}:\n{}",
@@ -416,7 +416,8 @@ mod library_printers {
             let leftover =
                 out.gcode.lines().map(|l| l.split(';').next().unwrap_or("")).find(|c| c.contains(['{', '}']));
             assert!(leftover.is_none(), "{printer}: template text in G-code: {leftover:?}");
-            assert!(out.gcode.contains(";TYPE:Outer wall"), "{printer}");
+            // Bambu Lab's files name features Orca's other way.
+            assert!(out.gcode.contains("TYPE:Outer wall") || out.gcode.contains("FEATURE: Outer wall"), "{printer}");
         }
     }
 }

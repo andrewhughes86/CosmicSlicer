@@ -552,8 +552,11 @@ impl Graph {
     }
 }
 
+/// A point on a line: its segment, how far along that, and where.
+type LinePoint = (usize, f64, DVec2);
+
 /// The start and end of `line` once `clip` is cut off both ends: the segment and point of each.
-fn clipped(line: &[DVec2], clip: f64) -> Option<((usize, f64, DVec2), (usize, f64, DVec2))> {
+fn clipped(line: &[DVec2], clip: f64) -> Option<(LinePoint, LinePoint)> {
     let mut left = clip;
     let mut start = None;
     for (i, w) in line.windows(2).enumerate() {

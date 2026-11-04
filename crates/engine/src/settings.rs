@@ -51,6 +51,8 @@ pub struct Settings {
     pub seam: String,
     pub outer_first: bool,
     pub spiral: bool,
+    /// How far simplified paths may stray, mm.
+    pub resolution: f64,
     pub bridge_flow: f64,
     pub only_one_wall_top: bool,
     pub walls: Walls,
@@ -1205,6 +1207,7 @@ impl Settings {
             seam: r.text("seam_position"),
             outer_first: r.text("wall_sequence").starts_with("outer"),
             spiral: r.flag("spiral_mode"),
+            resolution: r.range("resolution", 0.012, 0.0, 1.0),
             bridge_flow: r.range("bridge_flow", 1.0, 0.1, 2.0),
             only_one_wall_top: r.flag("only_one_wall_top"),
             walls,
