@@ -208,7 +208,10 @@ pub fn walls(island: &Shape, s: &Settings, h: f64, first_layer: bool, loops: usi
             share * (s_last + Settings::spacing(s.widths.solid, h)) / 2.0
         };
         // Strips inside the last wall too narrow for infill are gap filled instead.
-        let narrow = narrow_parts(&edge, wi, min_feature);
+        // (OrcaSlicer's classic walls look one loop further: what is under two spacings
+        // across there is gap fill, not infill.)
+        let gap_width = if s.walls.arachne { wi } else { 2.0 * si };
+        let narrow = narrow_parts(&edge, gap_width, min_feature);
         let mut area = geom::offset(source, -(inner_edge_at - overlap), Join::Miter);
         if !narrow.is_empty() {
             let (role, speed, flow) = if s.walls.arachne {

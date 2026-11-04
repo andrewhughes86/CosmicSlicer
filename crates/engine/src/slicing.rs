@@ -227,7 +227,9 @@ fn clear_of_vertices(mesh: &Placed, tris: &[u32], z: f64) -> f64 {
     if !hits(z) {
         return z;
     }
-    [1.0e-5, -1.0e-5, 3.0e-5, -3.0e-5, 1.0e-4, -1.0e-4, MAX_NUDGE, -MAX_NUDGE]
+    // Down first: a top face lying on the plane still counts for the layer (as OrcaSlicer
+    // slices it).
+    [-1.0e-5, 1.0e-5, -3.0e-5, 3.0e-5, -1.0e-4, 1.0e-4, -MAX_NUDGE, MAX_NUDGE]
         .into_iter()
         .map(|d| z + d)
         .find(|zz| !hits(*zz))
