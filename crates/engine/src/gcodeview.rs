@@ -280,6 +280,9 @@ pub fn read(text: &str, s: &Settings, fil: &[Filament]) -> Viewed {
                     if let Some(v) = stats.volume_mm3.get_mut(tool) {
                         *v += volume;
                     }
+                    if let Some(v) = stats.volume_by_role.get_mut(role.index()) {
+                        *v += volume;
+                    }
                     let area = bead_area(w, h);
                     let mut at = pos;
                     for p in &pts {

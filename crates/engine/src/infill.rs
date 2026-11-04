@@ -133,6 +133,9 @@ pub struct Params {
     /// The layer height, when lines are spaced as beads side by side (OrcaSlicer's flow
     /// spacing: `width - height × (1 - π/4)` apart at full density); 0 spaces them a width apart.
     pub height: f64,
+    /// Lines end half a line inside the region, as OrcaSlicer's object fills do (the walls
+    /// leave the region reaching that far past where lines should end).
+    pub inset: bool,
     /// Solid line fills spread their lines evenly over the region (OrcaSlicer's solid spacing
     /// adjustment; not for bridges, which keep their spacing).
     pub fit_solid: bool,
@@ -157,6 +160,7 @@ impl Params {
             origin: DVec2::ZERO,
             height: 0.0,
             fit_solid: false,
+            inset: false,
         }
     }
 }
@@ -196,6 +200,14 @@ pub fn fill_with(area: &[Shape], kind: Kind, p: &Params) -> Vec<Line> {
     }
     let bead = if p.height > 0.0 && p.height.is_finite() { crate::settings::Settings::spacing(w, p.height) } else { w };
     let s = bead / d;
+    // Loops already start half a line in.
+    let shrunk;
+    let area = if !p.inset || matches!(kind, Kind::Concentric | Kind::SpiralInset) {
+        area
+    } else {
+        shrunk = geom::offset(area, -bead / 2.0, Join::Miter);
+        shrunk.as_slice()
+    };
     let turned = |a: f64| if p.turn_by_layer && p.layer % 2 == 1 { a + FRAC_PI_2 } else { a };
     let a = p.angle;
     // Solid fills sit half a line off the grid (OrcaSlicer's), so a square's lines are centred;

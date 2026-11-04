@@ -134,7 +134,8 @@ fn compare(case: &Path) -> Report {
     );
 
     let _ = writeln!(text, "by feature: volume (mm³) and time (s):");
-    let (ov, uv) = (volumes(&orca.preview), volumes(&back.preview));
+    // Filament each feature takes (from E, not the drawn widths).
+    let (ov, uv) = (orca.stats.volume_by_role.to_vec(), back.stats.volume_by_role.to_vec());
     for role in Role::ALL {
         let i = role.index();
         let (o, u) = (ov.get(i).copied().unwrap_or(0.0), uv.get(i).copied().unwrap_or(0.0));
@@ -291,7 +292,9 @@ fn is_object(r: Role) -> bool {
 fn object_centre(p: &Preview) -> Option<[f64; 2]> {
     let mut lo = [f64::MAX; 2];
     let mut hi = [f64::MIN; 2];
-    for s in p.segments.iter().filter(|s| is_object(s.role)) {
+    // The outer walls' extent: symmetric about the part, unlike seams and wipes.
+    let outer = p.segments.iter().any(|s| s.role == Role::OuterWall);
+    for s in p.segments.iter().filter(|s| if outer { s.role == Role::OuterWall } else { is_object(s.role) }) {
         for q in [s.a, s.b] {
             for k in 0..2 {
                 let v = f64::from(q.get(k).copied().unwrap_or(0.0));
@@ -301,20 +304,6 @@ fn object_centre(p: &Preview) -> Option<[f64; 2]> {
         }
     }
     (lo[0] <= hi[0]).then(|| [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0])
-}
-
-/// Extruded volume per feature: flow × length / speed for each segment.
-fn volumes(p: &Preview) -> Vec<f64> {
-    let mut v = vec![0.0; Role::COUNT];
-    for s in &p.segments {
-        let len = f64::from(Vec3::from(s.a).distance(Vec3::from(s.b)));
-        if s.speed > 0.0
-            && let Some(slot) = v.get_mut(s.role.index())
-        {
-            *slot += f64::from(s.flow) * len / f64::from(s.speed);
-        }
-    }
-    v
 }
 
 /// Cells each layer's object toolpaths pass over, keyed by height (0.01 mm).

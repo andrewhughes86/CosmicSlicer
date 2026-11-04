@@ -58,6 +58,13 @@ pub struct Settings {
     pub seams: Seams,
     /// Overhangs steeper than this (degrees from vertical) are filled out into cones.
     pub printable_overhang: Option<f64>,
+    /// Outlines and holes grown (positive) or shrunk on every layer, mm.
+    pub xy_contour: f64,
+    pub xy_hole: f64,
+    /// Elephant foot compensation: the first layer shrunk by this much, less on each layer
+    /// up to `elephant_layers`.
+    pub elephant_foot: f64,
+    pub elephant_layers: usize,
     pub infill: InfillOpts,
     pub ironing: Ironing,
     pub fuzzy: Fuzzy,
@@ -1172,6 +1179,10 @@ impl Settings {
             walls,
             bridges,
             seams,
+            xy_contour: r.range("xy_contour_compensation", 0.0, -10.0, 10.0),
+            xy_hole: r.range("xy_hole_compensation", 0.0, -10.0, 10.0),
+            elephant_foot: r.range("elefant_foot_compensation", 0.0, 0.0, 5.0),
+            elephant_layers: r.count("elefant_foot_compensation_layers", 1, 1000),
             printable_overhang: r
                 .flag("make_overhang_printable")
                 .then(|| r.range("make_overhang_printable_angle", 55.0, 0.0, 90.0))

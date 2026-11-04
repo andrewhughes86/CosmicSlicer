@@ -48,7 +48,7 @@ pub use gcode::{LayerEvent, Preview, PreviewLayer, Segment, Stats, auto_flush};
 pub use settings::{Filament, Settings};
 pub use toolpath::Role;
 
-use geom::{Op, Shape};
+use geom::{Join, Op, Shape};
 use slicing::{LayerZ, Placed};
 use toolpath::{LayerPlan, Path};
 
@@ -273,6 +273,60 @@ fn macro_table(schema: &Schema, base: &Config, filaments: &[Config]) -> Config {
     table
 }
 
+/// OrcaSlicer's size compensation: outlines and holes grown or shrunk on every layer, and the
+/// first layers drawn in against elephant's foot (on the plate only, not on a raft), the most
+/// at the bottom, less on each layer above. Parts too thin to lose that much keep their size.
+fn compensate(slices: &mut [Vec<Shape>], s: &Settings) {
+    if s.xy_contour != 0.0 || s.xy_hole != 0.0 {
+        for layer in slices.iter_mut() {
+            let mut out: Vec<Shape> = Vec::new();
+            for sh in layer.iter() {
+                let Some(outer) = sh.first() else { continue };
+                let grown = geom::offset(&[vec![outer.clone()]], s.xy_contour, Join::Miter);
+                let holes: Vec<Shape> = sh
+                    .iter()
+                    .skip(1)
+                    .map(|h| {
+                        let mut h = h.clone();
+                        if geom::signed_area2(&h) < 0.0 {
+                            h.reverse();
+                        }
+                        vec![h]
+                    })
+                    .collect();
+                let holes = geom::offset(&holes, s.xy_hole, Join::Miter);
+                out.extend(geom::boolean(&grown, &holes, Op::Difference));
+            }
+            *layer = geom::union(&out);
+        }
+    }
+    if s.elephant_foot > 0.0 && s.raft.layers == 0 {
+        let n = s.elephant_layers.max(1);
+        let w = s.widths.outer;
+        for (k, layer) in slices.iter_mut().enumerate().take(n) {
+            let c = s.elephant_foot * (1.0 - k as f64 / n as f64);
+            if c <= 0.0 || layer.is_empty() {
+                continue;
+            }
+            let shrunk = geom::offset(layer, -c, Join::Miter);
+            // Features narrower than a wall and the compensation stay (scraps along curves, a
+            // hair wide, are not features), grown back onto the shrunk part they belong to.
+            let r = w / 2.0 + c;
+            let opened = geom::offset(&geom::offset(layer, -r, Join::Miter), r, Join::Miter);
+            let thin: Vec<Shape> = geom::boolean(layer, &opened, Op::Difference)
+                .into_iter()
+                .filter(|p| !geom::offset(std::slice::from_ref(p), -0.05, Join::Miter).is_empty())
+                .collect();
+            *layer = if thin.is_empty() {
+                shrunk
+            } else {
+                let kept = geom::boolean(&geom::offset(&thin, c, Join::Miter), layer, Op::Intersect);
+                geom::boolean(&shrunk, &kept, Op::Union)
+            };
+        }
+    }
+}
+
 fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
     let schema = Schema::get();
     let cancelled = || progress.is_cancelled();
@@ -386,6 +440,7 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
             let heights: Vec<f64> = layers.iter().map(|l| l.height).collect();
             overhang::make_printable(&mut slices, &heights, angle);
         }
+        compensate(&mut slices, &os);
         let mut islands = if o.color_paint.is_empty() {
             plan::object(&slices, &layers, &os, &regions, &cancelled)
         } else {
@@ -1099,6 +1154,31 @@ mod tests {
     }
 
     /// Slices, checks the G-code reads back with the same time, and returns it.
+    #[test]
+    fn elephant_foot_and_xy_compensation_resize_the_layers() {
+        let mut c = Config::default();
+        c.set("elefant_foot_compensation", "0.2");
+        c.set("elefant_foot_compensation_layers", "2");
+        c.set("xy_hole_compensation", "0.1");
+        let s = Settings::read(Schema::get(), &c);
+        // A 10 mm square with a 4 mm hole, and a 0.3 mm fin beside it.
+        let mut sq = geom::rectangle(glam::DVec2::ZERO, glam::DVec2::splat(10.0));
+        let mut hole = geom::rectangle(glam::DVec2::splat(3.0), glam::DVec2::splat(7.0)).remove(0);
+        hole.reverse();
+        sq.push(hole);
+        let fin = geom::rectangle(glam::DVec2::new(12.0, 0.0), glam::DVec2::new(12.3, 10.0));
+        let layer = vec![sq, fin];
+        let mut slices = vec![layer.clone(), layer.clone(), layer.clone()];
+        compensate(&mut slices, &s);
+        let area = |l: &[Shape]| geom::area(l);
+        // The hole grows by 0.1 all round on every layer: 4.2² instead of 4².
+        let plain = 100.0 - 4.2 * 4.2 + 3.0;
+        assert!((area(&slices[2]) - plain).abs() < 0.05, "{}", area(&slices[2]));
+        // The first layer is 0.2 smaller all round (the fin stays), the second 0.1.
+        assert!(area(&slices[0]) < area(&slices[1]) && area(&slices[1]) < area(&slices[2]));
+        assert!((area(&slices[0]) - (9.6 * 9.6 - 4.6 * 4.6 + 3.0)).abs() < 0.1, "{}", area(&slices[0]));
+    }
+
     #[test]
     fn calibration_towers_step_their_values_up_the_layers() {
         use calib::{Calib, Mode};

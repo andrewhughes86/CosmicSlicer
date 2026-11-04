@@ -120,8 +120,13 @@ pub fn walls(island: &Shape, s: &Settings, h: f64, first_layer: bool, loops: usi
     for k in 0..loops {
         if k == 1 {
             // "Precise outer wall": the first inner wall sits a full width in, so the outer
-            // wall is not squashed outwards and the part keeps its size.
-            centre = if s.walls.precise_outer { wo / 2.0 + (wo + wi) / 2.0 } else { wo / 2.0 + (so + si) / 2.0 };
+            // wall is not squashed outwards and the part keeps its size (OrcaSlicer's Arachne
+            // lays its beads at their spacing, classic at their width).
+            let outer = if s.walls.precise_outer { wo } else { (wo + so) / 2.0 };
+            centre = match (s.walls.precise_outer, s.walls.arachne) {
+                (true, false) => wo + wi / 2.0,
+                _ => outer + si / 2.0,
+            };
         } else if k > 1 {
             centre += si;
         }
@@ -172,7 +177,9 @@ pub fn walls(island: &Shape, s: &Settings, h: f64, first_layer: bool, loops: usi
             .filter(|c| c.len() >= 3)
             .map(|points| Path::new(role, points, true, width, speed, 1.0))
             .collect();
-        inner_edge_at = centre + width / 2.0;
+        // Infill starts half the wall's spacing in from its centre (OrcaSlicer's).
+        let spacing = if k == 0 { so } else { si };
+        inner_edge_at = centre + spacing / 2.0;
         // Thin walls found at this depth went in first; the loops join them.
         if let Some(level) = walls.get_mut(k) {
             level.splice(0..0, paths);
@@ -191,10 +198,15 @@ pub fn walls(island: &Shape, s: &Settings, h: f64, first_layer: bool, loops: usi
     } else {
         let s_last = if walls.len() == 1 { so } else { si };
         let edge = geom::offset(source, -inner_edge_at, Join::Miter);
-        // OrcaSlicer's overlap: the share of half the last wall's spacing and half a solid
-        // line's (top and bottom surfaces' share on the first layer).
+        // OrcaSlicer's overlap: classic walls the share of half the last wall's spacing and
+        // half a solid line's (top and bottom surfaces' share on the first layer), Arachne the
+        // share of the last wall's spacing.
         let share = if first_layer { s.solid_wall_overlap } else { s.infill_wall_overlap };
-        let overlap = share * (s_last + Settings::spacing(s.widths.solid, h)) / 2.0;
+        let overlap = if s.walls.arachne {
+            share * s_last
+        } else {
+            share * (s_last + Settings::spacing(s.widths.solid, h)) / 2.0
+        };
         // Strips inside the last wall too narrow for infill are gap filled instead.
         let narrow = narrow_parts(&edge, wi, min_feature);
         let mut area = geom::offset(source, -(inner_edge_at - overlap), Join::Miter);

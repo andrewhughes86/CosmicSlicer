@@ -82,6 +82,33 @@ fn classify(area: &[Shape], slices: &[Vec<Shape>], i: usize, s: &Settings, w: f6
     }
     let solid = geom::boolean(&geom::boolean(&solid_all, &top, Op::Difference), &bottom, Op::Difference);
     let solid = geom::without_slivers(solid, sliver);
+    if s.wall_loops == 0 {
+        return Regions { top, bottom, solid, sparse };
+    }
+    // OrcaSlicer's external surface expansion: top and bottom surfaces reach out under the
+    // walls' thickness (×√2) into the solid infill round them, and a wall's spacing into
+    // sparse infill, so they are anchored.
+    let h = s.layer_height;
+    let (so, si) = (Settings::spacing(s.widths.outer, h), Settings::spacing(s.widths.inner, h));
+    let shell = 0.5 * s.widths.outer + so + si * (s.wall_loops - 1) as f64;
+    let (into_solid, into_sparse) = (shell * std::f64::consts::SQRT_2, si);
+    let mut solid = solid;
+    let mut grow = |surface: Vec<Shape>| -> Vec<Shape> {
+        if surface.is_empty() {
+            return surface;
+        }
+        let from_solid = geom::boolean(&geom::offset(&surface, into_solid, Join::Miter), &solid, Op::Intersect);
+        let from_sparse = geom::boolean(&geom::offset(&surface, into_sparse, Join::Miter), &sparse, Op::Intersect);
+        let mut all = surface;
+        all.extend(from_solid);
+        all.extend(from_sparse);
+        let grown = geom::union(&all);
+        solid = geom::without_slivers(geom::boolean(&solid, &grown, Op::Difference), sliver);
+        sparse = geom::without_slivers(geom::boolean(&sparse, &grown, Op::Difference), sliver);
+        grown
+    };
+    let bottom = grow(bottom);
+    let top = grow(geom::boolean(&top, &bottom, Op::Difference));
     Regions { top, bottom, solid, sparse }
 }
 
@@ -258,6 +285,55 @@ fn bridge_bead(s: &Settings, thick: bool, w: f64, h: f64, flow: f64) -> (f64, f6
 /// flat ones as solid infill does.
 fn bridge_spacing(thick: bool, w: f64, solid_w: f64, h: f64) -> f64 {
     if thick { w + 0.05 } else { Settings::spacing(solid_w, h) }
+}
+
+/// An internal bridge grown as OrcaSlicer anchors it: each of its lines (along `angle`,
+/// `spacing` apart) runs on past the area to the first infill line below it, and a line's
+/// width beyond, within `limit`; then cleaned of slivers and small gaps.
+fn anchored(part: &[Shape], angle: f64, lines: &[Polyline], limit: &[Shape], spacing: f64, w: f64) -> Vec<Shape> {
+    let dir = glam::DVec2::new(angle.cos(), angle.sin());
+    let normal = dir.perp();
+    let segs: Vec<(glam::DVec2, glam::DVec2)> =
+        lines.iter().flat_map(|l| l.windows(2).filter_map(|p| Some((*p.first()?, *p.get(1)?)))).collect();
+    let rows = geom::clip_lines(&geom::hatch_lines(part, spacing, angle, spacing / 2.0, 100_000), part);
+    let mut strips: Vec<Shape> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (Some(&a), Some(&b)) = (row.first(), row.last()) else { continue };
+        let (a, b) = if (b - a).dot(dir) >= 0.0 { (a, b) } else { (b, a) };
+        // Where the row's line crosses the lines below, as distances along it from `a`.
+        let len = a.distance(b);
+        let (mut back, mut on) = (None::<f64>, None::<f64>);
+        for (p, q) in &segs {
+            let e = *q - *p;
+            let denom = dir.perp_dot(e);
+            if denom.abs() < 1e-12 {
+                continue;
+            }
+            let t = (*p - a).perp_dot(e) / denom;
+            let u = (*p - a).perp_dot(dir) / denom;
+            if !(0.0..=1.0).contains(&u) {
+                continue;
+            }
+            if t < 0.0 {
+                back = Some(back.map_or(t, |x: f64| x.max(t)));
+            } else if t > len {
+                on = Some(on.map_or(t, |x: f64| x.min(t)));
+            }
+        }
+        let from = a + dir * back.map_or(0.0, |t| t - w);
+        let to = a + dir * on.map_or(len, |t| t + w);
+        let h = normal * (spacing / 2.0);
+        strips.push(vec![vec![from - h, to - h, to + h, from + h]]);
+    }
+    if strips.is_empty() {
+        return part.to_vec();
+    }
+    let grown = geom::union(&strips);
+    let opened = geom::offset(&geom::offset(&grown, -spacing * 0.375, Join::Miter), spacing * 0.375, Join::Miter);
+    let closed = geom::offset(&geom::offset(&opened, spacing / 2.0, Join::Miter), -spacing / 2.0, Join::Miter);
+    let mut out = geom::boolean(&closed, limit, Op::Intersect);
+    out.extend(part.iter().cloned());
+    geom::union(&out)
 }
 
 /// The sparse infill angle on layer `i` before turning by layer.
@@ -715,6 +791,7 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
     let params = |w: f64, density: f64, angle: f64, templated: bool| {
         let mut p = Params::new(w, density, angle, i, z);
         p.origin = at.origin;
+        p.inset = true;
         p.height = h;
         p.turn_by_layer = !templated;
         p
@@ -788,6 +865,7 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
             let angle = b.angle.map_or_else(|| bridge_angle(part, anchors, w), f64::to_radians);
             let mut p = Params::new(bridge_spacing(b.thick, w, solid_w, h), b.density, angle, i, z);
             p.origin = at.origin;
+            p.inset = true;
             p.turn_by_layer = false;
             out.extend(paths_of(
                 infill::fill_with(part, Kind::Rectilinear { alternate: false }, &p),
@@ -799,10 +877,12 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
         }
     }
     // Solid infill over sparse infill bridges it: an internal bridge.
-    let (internal, solid) = match at.sparse_below {
+    let (internal, mut solid) = match at.sparse_below {
         Some(sb) if !sb.is_empty() && !r.solid.is_empty() => internal_bridges(&r.solid, sb, s, h),
         _ => (Vec::new(), r.solid.clone()),
     };
+    // Sparse infill left once bridges have reached out over it.
+    let mut sparse_left: Option<Vec<Shape>> = None;
     if !internal.is_empty() {
         let b = &s.bridges;
         let (w, flow) = bridge_bead(s, b.thick_internal, solid_w, h, b.internal_flow);
@@ -814,24 +894,39 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
         // The sparse infill below, which the bridge crosses (OrcaSlicer runs it square to
         // those lines).
         let below_lines: Vec<Polyline> = match at.sparse_below {
-            Some(sb) if b.internal_angle.is_none() && i > 0 => {
-                let near = geom::boolean(sb, &geom::offset(&internal, 3.0, Join::Miter), Op::Intersect);
+            Some(sb) if i > 0 => {
+                let near = geom::boolean(sb, &geom::offset(&internal, 8.0, Join::Miter), Op::Intersect);
                 let mut p = Params::new(s.widths.sparse, s.density, sparse_angle_at(s, i - 1), i - 1, z - h);
                 p.origin = at.origin;
+                p.inset = true;
                 p.height = h;
                 p.turn_by_layer = inf.sparse_template.is_empty();
                 infill::fill_with(&near, infill::kind_of(&s.sparse_pattern), &p).into_iter().map(|l| l.points).collect()
             }
             _ => Vec::new(),
         };
+        // Bridges reach along their lines to the infill below (OrcaSlicer's anchoring), over
+        // the solid and sparse infill round them.
+        let reach_into = geom::union(&[r.solid.clone(), r.sparse.clone()].concat());
+        let spacing = bridge_spacing(b.thick_internal, w, solid_w, h);
+        let mut bridged: Vec<(Vec<Shape>, f64)> = Vec::new();
         for part in &internal {
             let part = std::slice::from_ref(part);
             let angle = match b.internal_angle {
                 Some(a) => a.to_radians(),
                 None => across_lines(part, &below_lines).unwrap_or_else(|| bridge_angle(part, &anchors, w)),
             };
-            let mut p = Params::new(bridge_spacing(b.thick_internal, w, solid_w, h), b.internal_density, angle, i, z);
+            bridged.push((anchored(part, angle, &below_lines, &reach_into, spacing, w), angle));
+        }
+        let all: Vec<Shape> = bridged.iter().flat_map(|(a, _)| a.iter().cloned()).collect();
+        let all = geom::union(&all);
+        solid = geom::without_slivers(geom::boolean(&solid, &all, Op::Difference), solid_w * solid_w);
+        sparse_left = Some(geom::without_slivers(geom::boolean(&r.sparse, &all, Op::Difference), solid_w * solid_w));
+        for (part, angle) in &bridged {
+            let (part, angle) = (part.as_slice(), *angle);
+            let mut p = Params::new(spacing, b.internal_density, angle, i, z);
             p.origin = at.origin;
+            p.inset = true;
             p.turn_by_layer = false;
             out.extend(paths_of(
                 infill::fill_with(part, Kind::Rectilinear { alternate: false }, &p),
@@ -867,7 +962,13 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
         inf.solid_flow,
     ));
     out.extend(gaps);
-    sparse_fill(out, r, s, at, sparse_angle, infill_speed);
+    match sparse_left {
+        Some(sparse) => {
+            let left = Regions { top: Vec::new(), bottom: Vec::new(), solid: Vec::new(), sparse };
+            sparse_fill(out, &left, s, at, sparse_angle, infill_speed);
+        }
+        None => sparse_fill(out, r, s, at, sparse_angle, infill_speed),
+    }
 }
 
 /// Sparse infill: lightning trees, or the pattern, less what combined infill prints later and
@@ -892,6 +993,7 @@ fn sparse_fill(out: &mut Vec<Path>, r: &Regions, s: &Settings, at: &Around<'_>, 
     let inf = &s.infill;
     let mut p = Params::new(w, s.density, angle, at.i, at.layer.print_z);
     p.origin = at.origin;
+    p.inset = true;
     p.height = at.layer.height;
     p.turn_by_layer = inf.sparse_template.is_empty();
     p.anchor = inf.anchor;

@@ -67,6 +67,8 @@ pub struct Stats {
     /// Seconds.
     pub total_time: f64,
     pub time_by_role: [f64; Role::COUNT],
+    /// Filament each feature takes, mm³.
+    pub volume_by_role: [f64; Role::COUNT],
     pub travel_time: f64,
     /// Seconds before the first layer (the start G-code): OrcaSlicer's "prepare" time, which
     /// its "model printing time" leaves out.
@@ -884,6 +886,9 @@ impl<'a> Writer<'a> {
             *mm += length * e_per_mm;
         }
         if let Some(v) = self.stats.volume_mm3.get_mut(self.extruder) {
+            *v += volume;
+        }
+        if let Some(v) = self.stats.volume_by_role.get_mut(role.index()) {
             *v += volume;
         }
         // The Preview draws a simplified copy, so huge prints stay within memory.
