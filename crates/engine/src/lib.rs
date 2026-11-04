@@ -24,6 +24,7 @@ pub mod medial;
 pub mod motion;
 pub mod overhang;
 pub mod plan;
+pub mod seam;
 pub mod segment;
 pub mod settings;
 pub mod skirt;
@@ -271,6 +272,45 @@ fn macro_table(schema: &Schema, base: &Config, filaments: &[Config]) -> Config {
         table.set(k.clone(), v.join(","));
     }
     table
+}
+
+/// Each object's seams, sharing the raycast visibility between instances of one mesh.
+fn object_seams(
+    job: &Job,
+    placed: &[Placed],
+    settings: &[Settings],
+    plans: &[LayerPlan],
+) -> Vec<Option<seam::ObjectSeams>> {
+    type Key = (usize, [u32; 9], String);
+    let mut shared: std::collections::HashMap<Key, Option<std::sync::Arc<seam::Visibility>>> = Default::default();
+    placed
+        .iter()
+        .zip(&job.objects)
+        .zip(settings)
+        .enumerate()
+        .map(|(i, ((p, o), s))| {
+            if s.spiral {
+                return None;
+            }
+            let more: Vec<Placed> = o
+                .volumes
+                .iter()
+                .filter(|v| v.kind == VolumeKind::Part)
+                .map(|v| Placed::new(&v.mesh, &v.matrix))
+                .collect();
+            let parts: Vec<&Placed> = std::iter::once(p).chain(&more).collect();
+            let m = o.matrix.to_cols_array();
+            let turn = [m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]].map(f32::to_bits);
+            // The mesh's address and its turn and scale make a model the same.
+            let key = (Arc::as_ptr(&o.mesh) as usize, turn, s.seam.clone());
+            let visible = if more.is_empty() {
+                shared.entry(key).or_insert_with(|| seam::visibility(&parts, &s.seam).map(Arc::new)).clone()
+            } else {
+                seam::visibility(&parts, &s.seam).map(Arc::new)
+            };
+            Some(seam::build(plans, i, &parts, visible.as_deref(), &s.seam, s.nozzle))
+        })
+        .collect()
 }
 
 /// OrcaSlicer's size compensation: outlines and holes grown or shrunk on every layer, and the
@@ -720,6 +760,9 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
             _ => calib::pa_pattern(c, &s, at, glam::DVec2::new(room.x.max(60.0), room.y)),
         };
     }
+    // Seams: chosen for the whole of each object before anything is written.
+    progress.set(0.85, "Placing seams");
+    let seams = object_seams(job, &placed, &object_settings, &plans);
     let cx = gcode::Context {
         settings: &s,
         filaments: &filaments,
@@ -731,6 +774,7 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
         thumbnails,
         events: &job.events,
         calib: job.calib.as_ref(),
+        seams: &seams,
     };
     let out = gcode::emit(&plans, &cx);
     if let Some(e) = out.error {

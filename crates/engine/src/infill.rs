@@ -12,7 +12,7 @@ use std::f64::consts::{FRAC_PI_2, FRAC_PI_3, PI, TAU};
 
 use glam::DVec2;
 
-use crate::geom::{self, Join, Polyline, Shape};
+use crate::geom::{self, Contour, Join, Polyline, Shape};
 
 /// A fill line: open, or a loop for concentric patterns.
 #[derive(Clone, Debug, PartialEq)]
@@ -40,6 +40,8 @@ pub enum Kind {
     /// OrcaSlicer's "monotonic line" is the same without infill anchors (which ordered lines
     /// never get here).
     Monotonic,
+    /// Monotonic, each line on its own, with no links between them.
+    MonotonicLine,
     /// Parallel lines, each on its own.
     Line,
     ZigZag,
@@ -72,7 +74,8 @@ pub enum Kind {
 pub fn kind_of(pattern: &str) -> Kind {
     match pattern {
         "alignedrectilinear" => Kind::Rectilinear { alternate: false },
-        "monotonic" | "monotonicline" => Kind::Monotonic,
+        "monotonic" => Kind::Monotonic,
+        "monotonicline" => Kind::MonotonicLine,
         "line" => Kind::Line,
         "zigzag" => Kind::ZigZag,
         "crosszag" => Kind::CrossZag,
@@ -139,6 +142,8 @@ pub struct Params {
     /// Solid line fills spread their lines evenly over the region (OrcaSlicer's solid spacing
     /// adjustment; not for bridges, which keep their spacing).
     pub fit_solid: bool,
+    /// A bridge: its lines link along the edge however far apart they end.
+    pub bridge: bool,
     /// Where the patterns' grid is fixed: OrcaSlicer fills in the object's own coordinates,
     /// centred on it, so lines sit the same way wherever the object is on the plate.
     pub origin: DVec2,
@@ -160,6 +165,7 @@ impl Params {
             origin: DVec2::ZERO,
             height: 0.0,
             fit_solid: false,
+            bridge: false,
             inset: false,
         }
     }
@@ -200,6 +206,7 @@ pub fn fill_with(area: &[Shape], kind: Kind, p: &Params) -> Vec<Line> {
     }
     let bead = if p.height > 0.0 && p.height.is_finite() { crate::settings::Settings::spacing(w, p.height) } else { w };
     let s = bead / d;
+    let source = area;
     // Loops already start half a line in.
     let shrunk;
     let area = if !p.inset || matches!(kind, Kind::Concentric | Kind::SpiralInset) {
@@ -212,17 +219,14 @@ pub fn fill_with(area: &[Shape], kind: Kind, p: &Params) -> Vec<Line> {
     let a = p.angle;
     // Solid fills sit half a line off the grid (OrcaSlicer's), so a square's lines are centred;
     // fitted ones are spread over the region instead, half a line in from its edge.
-    let line_kind = matches!(kind, Kind::Rectilinear { .. } | Kind::Monotonic | Kind::Line);
-    let (s, half) = match fitted(area, kind, turned, p, s) {
-        Some(fit) if d >= 0.9999 && line_kind => fit,
-        _ => (s, if d >= 0.9999 { s / 2.0 } else { 0.0 }),
-    };
+    let (s, half) = fitted(source, kind, turned, p, s).unwrap_or((s, if d >= 0.9999 { s / 2.0 } else { 0.0 }));
     // OrcaSlicer links rectilinear lines along the edge: up to three lines' spacing for solid
     // fills, however far for sparse ones.
-    let link = if d > 0.8 { 3.0 * bead } else { f64::INFINITY };
+    let link = if d > 0.8 && !p.bridge { 3.0 * bead } else { f64::INFINITY };
     let mut lines = match kind {
         Kind::Rectilinear { alternate } => parallel(area, s, if alternate { turned(a) } else { a }, half, w, link),
         Kind::Monotonic => monotonic(area, s, turned(a), half, w, link),
+        Kind::MonotonicLine => monotonic_lines(area, s, turned(a), half, w),
         Kind::Line => rows(area, s, turned(a), half, w).into_iter().map(Line::open).collect(),
         Kind::Grid => directions(area, w, s * 2.0, &[(a, 0.0), (a + FRAC_PI_2, 0.0)]),
         Kind::Triangles | Kind::Lightning => {
@@ -270,6 +274,11 @@ pub fn fill_with(area: &[Shape], kind: Kind, p: &Params) -> Vec<Line> {
         Kind::Archimedean => archimedean(area, s),
         Kind::Octagram => octagram(area, s),
     };
+    // Lines that end free run on to the outer contour: OrcaSlicer's lines stop nearly at the
+    // region's edge (a twentieth of a spacing in), its links half a spacing in.
+    if p.anchor <= 0.0 && p.inset && matches!(kind, Kind::Rectilinear { .. } | Kind::Monotonic | Kind::MonotonicLine) {
+        extend_ends(&mut lines, &geom::offset(source, -0.05 * bead / d.max(1e-6), Join::Miter), bead * 20.0);
+    }
     if p.anchor > 0.0 {
         // Never so long that neighbouring anchors meet.
         anchor_ends(&mut lines, area, p.anchor.min(s * 0.45), w * 0.25);
@@ -278,10 +287,19 @@ pub fn fill_with(area: &[Shape], kind: Kind, p: &Params) -> Vec<Line> {
     lines
 }
 
+/// The patterns made of straight lines across the region.
+pub fn is_line_pattern(kind: Kind) -> bool {
+    matches!(kind, Kind::Rectilinear { .. } | Kind::Monotonic | Kind::MonotonicLine | Kind::Line)
+}
+
 /// OrcaSlicer's solid spacing adjustment: the lines spread evenly over the region's width
 /// across them (at most 20 % further apart), the first half a line in. (spacing, phase).
+///
+/// `area` is the region before lines are kept half a line in from it, and the numbers are the
+/// nanometre integers Orca computes in.
 fn fitted(area: &[Shape], kind: Kind, turned: impl Fn(f64) -> f64, p: &Params, s: f64) -> Option<(f64, f64)> {
-    if !p.fit_solid {
+    const NM: f64 = 1e6;
+    if !p.fit_solid || p.density < 0.9999 || !is_line_pattern(kind) {
         return None;
     }
     let a = match kind {
@@ -290,16 +308,38 @@ fn fitted(area: &[Shape], kind: Kind, turned: impl Fn(f64) -> f64, p: &Params, s
     };
     let normal = DVec2::new(a.cos(), a.sin()).perp();
     let (lo, hi) = area.iter().flatten().flatten().fold((f64::MAX, f64::MIN), |(lo, hi), q| {
-        let d = q.dot(normal);
+        let d = (q.dot(normal) * NM).round();
         (lo.min(d), hi.max(d))
     });
     let width = hi - lo;
-    if !(width > 0.0 && width.is_finite()) {
+    let spacing = (s * NM).trunc();
+    if !(width > 0.0 && width.is_finite() && spacing > 0.0) {
         return None;
     }
-    let n = ((width - 1e-9) / s).floor();
-    let fit = if n < 1.0 { s } else { (width / n).min(s * 1.2) };
-    Some((fit, (lo + fit / 2.0).rem_euclid(fit)))
+    let intervals = ((width - 1e-4) / spacing).trunc();
+    let mut fit = if intervals < 1.0 { spacing } else { ((width - 1e-4) / intervals).trunc() };
+    if fit / spacing > 1.2 {
+        fit = (spacing * 1.2 + 0.5).floor();
+    }
+    let first = lo + ((fit + 100.0) / 2.0).trunc();
+    Some((fit / NM, (first / NM).rem_euclid(fit / NM)))
+}
+
+/// The line width a solid fill of `area` prints at: OrcaSlicer widens the lines by what
+/// [`fitted`] spread them apart, so the fill stays solid. `area` is one region.
+pub fn solid_width(area: &[Shape], kind: Kind, p: &Params) -> f64 {
+    if !p.width.is_finite() || p.width <= 0.0 {
+        return p.width;
+    }
+    let bead = if p.height > 0.0 && p.height.is_finite() {
+        crate::settings::Settings::spacing(p.width, p.height)
+    } else {
+        p.width
+    };
+    let turned = |a: f64| if p.turn_by_layer && p.layer % 2 == 1 { a + FRAC_PI_2 } else { a };
+    let moved: Vec<Shape> =
+        area.iter().map(|sh| sh.iter().map(|c| c.iter().map(|q| *q - p.origin).collect()).collect()).collect();
+    fitted(&moved, kind, turned, p, bead).map_or(p.width, |(fit, _)| p.width + fit - bead)
 }
 
 /// Turns `p` by `angle`.
@@ -399,64 +439,301 @@ fn regions(pieces: Vec<Polyline>, a: f64, spacing: f64, phase: f64) -> Vec<Vec<P
 
 /// Splits solid infill into what fills well with lines and the narrow rest, which fills better
 /// concentrically (OrcaSlicer's "detect narrow internal solid infill", after PrusaSlicer's
-/// anti-vibration filter): strips under about four lines across are narrow, and so are runs of
-/// five or more neighbouring lines at `angle` shorter than 4 mm. Returns (lines, narrow).
-pub fn split_narrow_solid(area: &[Shape], spacing: f64, angle: f64) -> (Vec<Shape>, Vec<Shape>) {
-    const SHORT: f64 = 4.0;
-    const RUN: usize = 5;
+/// anti-vibration filter): what stays after opening by two and three spacings, with runs of
+/// short lines at `angle` filtered out, fills with lines. `line_pattern` says the solid pattern
+/// is one of lines; others only lose what an opening removes. Returns (lines, narrow).
+pub fn split_narrow_solid(area: &[Shape], spacing: f64, angle: f64, line_pattern: bool) -> (Vec<Shape>, Vec<Shape>) {
     if area.is_empty() || !(spacing > 0.0 && spacing.is_finite()) {
         return (area.to_vec(), Vec::new());
     }
-    let core = geom::offset(&geom::offset(area, -2.0 * spacing, Join::Miter), 3.0 * spacing, Join::Miter);
-    let core = geom::offset(&geom::boolean(area, &core, geom::Op::Intersect), -spacing * 0.5, Join::Miter);
-    if core.is_empty() {
-        return (Vec::new(), area.to_vec());
+    if !line_pattern {
+        // Other patterns: only the parts an opening removes are thin.
+        let core = geom::offset(&geom::offset(area, -spacing, Join::Miter), spacing, Join::Miter);
+        let core = geom::boolean(area, &core, geom::Op::Intersect);
+        let narrow = geom::boolean(area, &core, geom::Op::Difference);
+        return if narrow.is_empty() { (area.to_vec(), Vec::new()) } else { (core, narrow) };
     }
-    let pieces: Vec<Polyline> =
-        rows(&core, spacing, angle, 0.0, spacing).into_iter().filter(|l| geom::length(l) > spacing).collect();
-    let normal = DVec2::new(angle.cos(), angle.sin()).perp() * (spacing / 2.0);
-    let mut strips: Vec<Shape> = Vec::new();
-    for region in regions(pieces, angle, spacing, 0.0) {
-        let short: Vec<bool> = region.iter().map(|l| geom::length(l) < SHORT).collect();
-        let mut k = 0;
-        while k < region.len() {
-            let run = short.iter().skip(k).take_while(|s| **s).count();
-            let skip = run >= RUN;
-            for l in region.iter().skip(k).take(run.max(1)) {
-                if (skip && run > 0) || l.len() < 2 {
-                    continue;
+    // Frame turned so the lines stand upright.
+    let (sin, cos) = (FRAC_PI_2 - angle).sin_cos();
+    let back = (-sin, cos);
+    let to = (sin, cos);
+    let turned_shape =
+        |sh: &Shape, by: (f64, f64)| -> Shape { sh.iter().map(|c| c.iter().map(|q| turn(*q, by)).collect()).collect() };
+    let mut normal_areas: Vec<Shape> = Vec::new();
+    for shape in area {
+        let filled = vec![turned_shape(shape, to)];
+        let Some((lo, hi)) = geom::bounds(&filled) else { continue };
+        let opened = geom::offset(&geom::offset(&filled, -2.0 * spacing, Join::Miter), 3.0 * spacing, Join::Miter);
+        let inner = geom::boolean(&filled, &opened, geom::Op::Intersect);
+        let inner = geom::offset(&inner, -spacing * 0.5, Join::Miter);
+        let walls: Vec<[DVec2; 2]> = inner
+            .iter()
+            .flatten()
+            .flat_map(|c| (0..c.len()).filter_map(|i| Some([*c.get(i)?, *c.get((i + 1) % c.len())?])))
+            .collect();
+        let rows = (((hi.x - lo.x) + spacing - 1e-6) / spacing).floor().clamp(0.0, 100_000.0) as usize;
+        let mut sections: Vec<Vec<Section>> = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let x = lo.x + row as f64 * spacing;
+            let mut ys: Vec<f64> = walls
+                .iter()
+                .filter(|[a, b]| (a.x <= x) != (b.x <= x))
+                .map(|[a, b]| a.y + (x - a.x) / (b.x - a.x) * (b.y - a.y))
+                .collect();
+            ys.sort_by(f64::total_cmp);
+            let mut section = Vec::new();
+            for pair in ys.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                if b - a > spacing && geom::contains(&inner, DVec2::new(x, (a + b) / 2.0)) {
+                    section.push(Section { x, low: a, high: b });
                 }
-                let (Some(&a), Some(&b)) = (l.first(), l.last()) else { continue };
-                strips.push(vec![vec![a - normal, b - normal, b + normal, a + normal]]);
             }
-            k += run.max(1);
+            sections.push(section);
         }
+        let kept = filter_vibrating_lines(&sections);
+        normal_areas.extend(trace_sections(&kept, spacing).into_iter().map(|c| turned_shape(&vec![c], back)));
     }
-    if strips.is_empty() {
-        return (Vec::new(), area.to_vec());
-    }
-    let lines_area = geom::union(&strips);
-    let mut narrow = geom::boolean(area, &lines_area, geom::Op::Difference);
-    // Scraps too small to fill that touch the line area join it.
-    let (scraps, rest): (Vec<Shape>, Vec<Shape>) = narrow.into_iter().partition(|p| {
-        geom::offset(std::slice::from_ref(p), -spacing * 0.5, Join::Miter).is_empty()
-            && !geom::boolean(
-                &geom::offset(std::slice::from_ref(p), spacing * 0.3, Join::Miter),
-                &lines_area,
-                geom::Op::Intersect,
-            )
-            .is_empty()
+    let normal = geom::offset(&geom::union(&normal_areas), 1e-5, Join::Miter);
+    let mut normal = geom::offset(&normal, -1e-5, Join::Miter);
+    let mut narrow = geom::boolean(area, &normal, geom::Op::Difference);
+    // Areas under a line wide that touch the normal infill join it.
+    let mut joined = Vec::new();
+    narrow.retain(|piece| {
+        let one = std::slice::from_ref(piece);
+        let tiny = geom::offset(one, -spacing * 0.5, Join::Miter).is_empty();
+        let touches = tiny
+            && !geom::boolean(&geom::offset(one, spacing * 0.3, Join::Miter), &normal, geom::Op::Intersect).is_empty();
+        if touches {
+            joined.push(piece.clone());
+        }
+        !touches
     });
-    narrow = rest;
+    normal.extend(joined);
     if narrow.is_empty() {
         return (area.to_vec(), Vec::new());
     }
-    let mut grown = lines_area;
-    grown.extend(scraps);
-    let lines =
-        geom::boolean(&geom::offset(&geom::union(&grown), spacing * 0.5, Join::Miter), area, geom::Op::Intersect);
-    let narrow = geom::boolean(area, &lines, geom::Op::Difference);
-    (lines, narrow)
+    let normal = geom::boolean(&geom::offset(&normal, spacing * 0.5, Join::Miter), area, geom::Op::Intersect);
+    (normal, narrow)
+}
+
+/// One line of a solid fill in the upright frame: at `x`, from `low` to `high`.
+#[derive(Clone, Copy, Debug)]
+struct Section {
+    x: f64,
+    low: f64,
+    high: f64,
+}
+
+#[derive(Clone, Default)]
+struct LineState {
+    min_skips_taken: i32,
+    total_short_lines: i32,
+    initial_touches_long: bool,
+    initialized: bool,
+}
+
+struct LineNode {
+    section: Section,
+    previous: Vec<(usize, usize)>,
+    next: Vec<(usize, usize)>,
+    removed: bool,
+    state: LineState,
+}
+
+const SHORT_LINE: f64 = 4.0;
+const MAX_SKIPS: i32 = 2;
+const MIN_DEPTH: i32 = 5;
+
+fn node(nodes: &[Vec<LineNode>], (s, i): (usize, usize)) -> Option<&LineNode> {
+    nodes.get(s).and_then(|l| l.get(i))
+}
+
+fn removable(nodes: &[Vec<LineNode>], at: (usize, usize)) -> bool {
+    let Some(n) = node(nodes, at) else { return false };
+    let initial_touching = n.previous.iter().any(|p| node(nodes, *p).is_some_and(|q| q.state.initial_touches_long));
+    let has_next = n.next.iter().any(|p| node(nodes, *p).is_some_and(|q| !q.removed));
+    n.section.high - n.section.low < SHORT_LINE
+        && (n.state.total_short_lines > MIN_DEPTH || (!initial_touching && !has_next))
+}
+
+/// Filters out runs of short lines, which shake the printer (from OrcaSlicer's
+/// `filter_vibrating_extrusions`, keeping its rules exactly).
+fn filter_vibrating_lines(sections: &[Vec<Section>]) -> Vec<Vec<Section>> {
+    let overlapping = |a: &Section, b: &Section| {
+        (b.low <= a.low && a.low <= b.high)
+            || (b.low <= a.high && a.high <= b.high)
+            || (a.low <= b.low && b.low <= a.high)
+            || (a.low <= b.high && b.high <= a.high)
+    };
+    let beside = |s: usize, line: &Section, other: usize| -> Vec<(usize, usize)> {
+        sections.get(other).map_or(Vec::new(), |list| {
+            list.iter()
+                .enumerate()
+                .filter(|(_, o)| s != other && overlapping(line, o))
+                .map(|(k, _)| (other, k))
+                .collect()
+        })
+    };
+    let mut nodes: Vec<Vec<LineNode>> = sections
+        .iter()
+        .enumerate()
+        .map(|(s, list)| {
+            list.iter()
+                .map(|line| LineNode {
+                    section: *line,
+                    previous: s.checked_sub(1).map_or(Vec::new(), |p| beside(s, line, p)),
+                    next: beside(s, line, s + 1),
+                    removed: false,
+                    state: LineState::default(),
+                })
+                .collect()
+        })
+        .collect();
+    let count = nodes.len();
+    for initial in 0..count {
+        for i in 0..nodes.get(initial).map_or(0, Vec::len) {
+            let Some(n) = node(&nodes, (initial, i)) else { continue };
+            if n.removed || n.section.high - n.section.low >= SHORT_LINE {
+                continue;
+            }
+            let touches = n
+                .previous
+                .iter()
+                .any(|p| node(&nodes, *p).is_some_and(|q| !q.removed && q.section.high - q.section.low >= SHORT_LINE));
+            if let Some(n) = nodes.get_mut(initial).and_then(|l| l.get_mut(i)) {
+                n.state = LineState {
+                    min_skips_taken: 0,
+                    total_short_lines: 1,
+                    initial_touches_long: touches,
+                    initialized: true,
+                };
+            }
+        }
+        for propagate in initial..count {
+            for n in nodes.get_mut(propagate + 1).into_iter().flatten() {
+                n.state = LineState::default();
+            }
+            for i in 0..nodes.get(propagate).map_or(0, Vec::len) {
+                let at = (propagate, i);
+                let Some(n) = node(&nodes, at) else { continue };
+                if n.removed || !n.state.initialized {
+                    continue;
+                }
+                let (state, next) = (n.state.clone(), n.next.clone());
+                for neighbour in next {
+                    let Some(m) = node(&nodes, neighbour) else { continue };
+                    if m.removed {
+                        continue;
+                    }
+                    let short = m.section.high - m.section.low < SHORT_LINE;
+                    let skip_allowed = state.min_skips_taken < MAX_SKIPS;
+                    if !short && !skip_allowed {
+                        continue;
+                    }
+                    let total = state.total_short_lines + i32::from(short);
+                    let skips = state.min_skips_taken + i32::from(!short);
+                    if let Some(m) = nodes.get_mut(neighbour.0).and_then(|l| l.get_mut(neighbour.1)) {
+                        if m.state.initialized {
+                            m.state.min_skips_taken = m.state.min_skips_taken.max(total).min(skips);
+                            if m.state.initial_touches_long {
+                                m.state.initial_touches_long = state.initial_touches_long;
+                            }
+                        } else {
+                            m.state = LineState {
+                                min_skips_taken: skips,
+                                total_short_lines: total,
+                                initial_touches_long: state.initial_touches_long,
+                                initialized: true,
+                            };
+                        }
+                    }
+                }
+                if removable(&nodes, at) {
+                    // Its removal may free the lines before it too.
+                    let mut queue: std::collections::VecDeque<(usize, usize)> = std::collections::VecDeque::new();
+                    if let Some(n) = nodes.get_mut(at.0).and_then(|l| l.get_mut(at.1)) {
+                        n.removed = true;
+                        queue.extend(n.previous.iter().copied());
+                    }
+                    while let Some(check) = queue.pop_front() {
+                        let alive = node(&nodes, check).is_some_and(|n| !n.removed);
+                        if alive && removable(&nodes, check) {
+                            if let Some(n) = nodes.get_mut(check.0).and_then(|l| l.get_mut(check.1)) {
+                                n.removed = true;
+                                queue.extend(n.previous.iter().copied());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    nodes.into_iter().map(|l| l.into_iter().filter(|n| !n.removed).map(|n| n.section).collect()).collect()
+}
+
+/// Polygons round runs of neighbouring lines (each widened half a line along its length).
+fn trace_sections(sections: &[Vec<Section>], spacing: f64) -> Vec<Contour> {
+    struct Traced {
+        lows: Vec<DVec2>,
+        highs: Vec<DVec2>,
+    }
+    let limit = 2.0 * spacing;
+    let half = DVec2::new(spacing / 2.0, 0.0);
+    let close = |t: Traced, out: &mut Vec<Contour>| {
+        let mut c = t.lows;
+        c.extend(t.highs.into_iter().rev());
+        out.push(c);
+    };
+    let mut out: Vec<Contour> = Vec::new();
+    let mut open: Vec<Traced> = Vec::new();
+    for section in sections {
+        let lines: Vec<(DVec2, DVec2)> = section
+            .iter()
+            .map(|l| (DVec2::new(l.x, l.low - spacing / 2.0), DVec2::new(l.x, l.high + spacing / 2.0)))
+            .collect();
+        let mut used = vec![false; lines.len()];
+        let mut still: Vec<Traced> = Vec::with_capacity(open.len());
+        for mut t in open.drain(..) {
+            let (Some(&low), Some(&high)) = (t.lows.last(), t.highs.last()) else { continue };
+            let first = lines.partition_point(|l| l.1.y <= low.y);
+            let end = lines.partition_point(|l| l.0.y <= high.y);
+            // As in Orca, a free line in reach continues the polygon with the first in reach.
+            let free = (first..end).any(|k| !used.get(k).copied().unwrap_or(true));
+            match lines.get(first).filter(|_| free) {
+                Some(&(a, b)) => {
+                    if low.distance(a) < limit {
+                        t.lows.push(a);
+                    } else {
+                        t.lows.extend([low + half, a - half, a]);
+                    }
+                    if high.distance(b) < limit {
+                        t.highs.push(b);
+                    } else {
+                        t.highs.extend([high + half, b - half, b]);
+                    }
+                    if let Some(u) = used.get_mut(first) {
+                        *u = true;
+                    }
+                    still.push(t);
+                }
+                None => {
+                    t.lows.push(low + half);
+                    t.highs.push(high + half);
+                    close(t, &mut out);
+                }
+            }
+        }
+        open = still;
+        for (line, was_used) in lines.iter().zip(&used) {
+            if !*was_used {
+                open.push(Traced { lows: vec![line.0 - half, line.0], highs: vec![line.1 - half, line.1] });
+            }
+        }
+    }
+    for t in open {
+        close(t, &mut out);
+    }
+    out
 }
 
 /// Pieces of lines along `a`, joined zig-zag within each region.
@@ -483,14 +760,85 @@ fn directions(area: &[Shape], width: f64, spacing: f64, dirs: &[(f64, f64)]) -> 
     dirs.iter().flat_map(|&(a, phase)| parallel(area, spacing, a, phase.rem_euclid(spacing), width, 0.0)).collect()
 }
 
-/// Monotonic: every line runs the same way, printed in order across the region.
+/// Monotonic: lines joined zig-zag, printed in order across the region, starting from the far
+/// end of the first (OrcaSlicer's regions start at the low end of its upright frame, which
+/// looks down the lines' direction).
 fn monotonic(area: &[Shape], spacing: f64, a: f64, phase: f64, width: f64, link: f64) -> Vec<Line> {
     let pieces = rows(area, spacing, a, phase, width);
-    let mut out = join_rows(pieces, a, spacing, phase, area, spacing * 1.9, link);
+    let around = Around::new(area, spacing * 1.9, link);
+    let mut out: Vec<Line> = regions(pieces, a, spacing, phase)
+        .into_iter()
+        .flat_map(|mut r| {
+            if let Some(first) = r.first_mut() {
+                first.reverse();
+            }
+            join_zigzag(r, &around, spacing * 1.9, link)
+        })
+        .collect();
     for l in &mut out {
         l.ordered = true;
     }
     out
+}
+
+/// Monotonic lines: in order across the region, turn about, unlinked.
+fn monotonic_lines(area: &[Shape], spacing: f64, a: f64, phase: f64, width: f64) -> Vec<Line> {
+    let pieces = rows(area, spacing, a, phase, width);
+    regions(pieces, a, spacing, phase)
+        .into_iter()
+        .flat_map(|r| {
+            r.into_iter().enumerate().map(|(i, mut l)| {
+                if i % 2 == 0 {
+                    l.reverse();
+                }
+                Line { points: l, closed: false, ordered: true }
+            })
+        })
+        .collect()
+}
+
+/// Runs each open line's two ends straight on until they meet `outer`, at most `reach`.
+fn extend_ends(lines: &mut [Line], outer: &[Shape], reach: f64) {
+    let edges: Vec<(DVec2, DVec2)> = outer
+        .iter()
+        .flatten()
+        .flat_map(|c| (0..c.len()).filter_map(|i| Some((*c.get(i)?, *c.get((i + 1) % c.len())?))))
+        .collect();
+    let extended = |end: DVec2, inner: DVec2| {
+        let dir = (end - inner).normalize_or_zero();
+        let mut best = reach;
+        for (a, b) in &edges {
+            let side = *b - *a;
+            let det = dir.perp_dot(side);
+            if det.abs() < 1e-12 {
+                continue;
+            }
+            let t = (*a - end).perp_dot(side) / det;
+            let u = (*a - end).perp_dot(dir) / det;
+            if t > 1e-9 && t < best && (0.0..=1.0).contains(&u) {
+                best = t;
+            }
+        }
+        if best < reach { end + dir * best } else { end }
+    };
+    for l in lines.iter_mut().filter(|l| !l.closed) {
+        let n = l.points.len();
+        if n < 2 {
+            continue;
+        }
+        if let (Some(&end), Some(&inner)) = (l.points.first(), l.points.get(1)) {
+            let to = extended(end, inner);
+            if let Some(p) = l.points.first_mut() {
+                *p = to;
+            }
+        }
+        if let (Some(&end), Some(&inner)) = (l.points.get(n - 1), l.points.get(n - 2)) {
+            let to = extended(end, inner);
+            if let Some(p) = l.points.last_mut() {
+                *p = to;
+            }
+        }
+    }
 }
 
 /// Cubic: `dirs` directions over 180°, each sliding with height so the lines build tilted
@@ -1471,11 +1819,12 @@ mod tests {
 
     #[test]
     fn monotonic_lines_sweep_across_in_order() {
-        // OrcaSlicer's monotonic lines: one zig-zag across the square, printed in order.
+        // OrcaSlicer's monotonic lines: each on its own, across the square in order, turn about.
         let lines = fill(&square(10.0), kind_of("monotonicline"), 0.42, 1.0, 0.0, 0, 0.0);
-        assert!(!lines.is_empty() && lines.len() <= 2 && lines.iter().all(|l| l.ordered), "{}", lines.len());
+        assert!(lines.len() > 20 && lines.iter().all(|l| l.ordered && l.points.len() == 2), "{}", lines.len());
         let ys: Vec<f64> = lines.iter().flat_map(|l| l.points.iter().map(|p| p.y)).collect();
         assert!(ys.windows(2).all(|w| w[1] >= w[0] - 1e-9));
+        assert!(lines.windows(2).all(|w| (w[0].points[0].x - w[1].points[0].x).abs() > 5.0));
     }
 
     #[test]

@@ -7,6 +7,8 @@
 
 use std::fmt::Write as _;
 
+use std::f64::consts::TAU;
+
 use glam::{DVec2, DVec3};
 
 use crate::arcs::{self, Piece};
@@ -99,6 +101,8 @@ pub struct Context<'a> {
     pub events: &'a [(f64, LayerEvent)],
     /// A calibration print's per-layer changes.
     pub calib: Option<&'a crate::calib::Calib>,
+    /// Where each object's loops start.
+    pub seams: &'a [Option<crate::seam::ObjectSeams>],
 }
 
 /// Something asked for at a layer from the layer slider.
@@ -907,6 +911,11 @@ impl<'a> Writer<'a> {
         if path.closed && path.role == Role::OuterWall {
             self.preview.seams.push([start.x as f32, start.y as f32, z as f32]);
         }
+        // `retract` wipes down this list from its end: an open path back the way it came, a
+        // loop on past its start, along its first edges.
+        if path.closed {
+            all.reverse();
+        }
         self.last_path = all;
         if path.closed && path.role == Role::OuterWall && self.s().motion.wipe_on_loops && self.spiral.is_none() {
             self.wipe_inwards(path);
@@ -995,7 +1004,8 @@ impl<'a> Writer<'a> {
         let mut speed = base;
         // The hot end can only melt so much per second.
         if area > 0.0 {
-            speed = speed.min(fil.max_volumetric / area);
+            // The filament's flow ratio counts: it is what the hot end really melts.
+            speed = speed.min(fil.max_volumetric / (area * fil.flow_ratio));
         }
         let speed = speed.max(1.0);
         let e_per_mm = area / fil.area() * fil.flow_ratio;
@@ -1082,6 +1092,12 @@ impl<'a> Writer<'a> {
             return;
         }
         let here = self.pos.truncate();
+        if self.spiral.is_none()
+            && let Some(table) = object.and_then(|o| self.cx.seams.get(o)).and_then(Option::as_ref)
+            && table.place(self.layer, path, here, self.s().seams.staggered_inner)
+        {
+            return;
+        }
         let seam = self.s().seam.clone();
         let hint = object.and_then(|o| self.seams.get(o).copied().flatten());
         // Painted seams win: the best point inside an enforcer, never one inside a blocker.
@@ -1399,7 +1415,21 @@ impl<'a> Writer<'a> {
         let mut pos = start;
         let mut total = 0.0;
         let mut moves: Vec<(f64, f64)> = Vec::new();
+        // As OrcaSlicer's cooling buffer: nothing before the layer's first extrusion counts. Its
+        // parser also carries the last E word over to lines without one, so each speed line
+        // (one starts every path and wipe) reads as an extruder move of that length: a few
+        // hundredths of a second per layer that decide the slowed-down speed.
+        let mut extruded = false;
+        let mut last_e = 0.0f64;
+        let mut before = None;
         for op in self.ops.get(from..).unwrap_or(&[]) {
+            if let Op::Spiral { z, i, j, feed } = op {
+                if extruded && *feed > 0.0 {
+                    total += (TAU * i.hypot(*j)).hypot(z - pos.z) / feed;
+                }
+                pos.z = *z;
+                before = None;
+            }
             if let Op::Move { to, e, feed, kind, arc, xy } = op {
                 let d = if *xy { *to - pos } else { DVec3::new(0.0, 0.0, to.z - pos.z) };
                 let xyz = match arc {
@@ -1408,14 +1438,29 @@ impl<'a> Writer<'a> {
                 };
                 let len = if xyz > 1e-9 { xyz } else { e.abs() };
                 pos = *to;
-                if *feed > 0.0 {
+                let starts = match kind {
+                    MoveKind::Extrude(_) | MoveKind::Wipe => before != Some((*kind, *feed)),
+                    _ => false,
+                };
+                extruded |= matches!(kind, MoveKind::Extrude(_));
+                if *feed > 0.0 && extruded {
                     total += len / feed;
+                    if starts {
+                        total += last_e.abs() / feed;
+                    }
                 }
                 if let MoveKind::Extrude(role) = kind
                     && adjustable(*role, *feed)
                 {
                     moves.push((len, *feed));
+                    if starts {
+                        moves.push((last_e.abs(), *feed));
+                    }
                 }
+                if *e != 0.0 {
+                    last_e = *e;
+                }
+                before = Some((*kind, *feed));
             }
         }
         let target = f.slow_down_layer_time * 1.001;

@@ -202,6 +202,17 @@ fn paths_of(lines: Vec<infill::Line>, role: Role, width: f64, speed: f64, flow: 
         .collect()
 }
 
+/// Fills each region of `area` on its own, as OrcaSlicer does: each gets its own line spacing
+/// and width.
+fn solid_paths(area: &[Shape], kind: Kind, p: &Params, role: Role, speed: f64, flow: f64) -> Vec<Path> {
+    area.iter()
+        .flat_map(|shape| {
+            let one = std::slice::from_ref(shape);
+            paths_of(infill::fill_with(one, kind, p), role, infill::solid_width(one, kind, p), speed, flow)
+        })
+        .collect()
+}
+
 /// One layer's settings where they differ from the object's.
 #[derive(Clone, Debug, Default)]
 pub struct LayerRegions {
@@ -606,7 +617,7 @@ pub fn object(
             slice
                 .iter()
                 .map(|island| {
-                    let walled = walls::walls(island, s, layer.height, first, loops, 1.0);
+                    let walled = walls::walls(island, s, layer.height, first, i + 1 == slices.len(), loops, 1.0);
                     let solid_w = if first { s.widths.first_layer } else { s.widths.solid };
                     let pieces = split_fill(&walled.infill_area, pieces, solid_w)
                         .into_iter()
@@ -810,10 +821,11 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
     let surfaces_gap = s.walls.gap_fill != GapFill::Nowhere;
     let top_w = if first { s.widths.first_layer } else { s.widths.top };
     let (top, gaps) = with_gap_fill(r.top.clone(), s, top_w, surfaces_gap, gap_speed);
-    out.extend(paths_of(
-        infill::fill_with(&top, infill::kind_of(&s.top_pattern), &solid_params(top_w, inf.top_density)),
+    out.extend(solid_paths(
+        &top,
+        infill::kind_of(&s.top_pattern),
+        &solid_params(top_w, inf.top_density),
         Role::TopSurface,
-        top_w,
         top_speed,
         inf.top_flow,
     ));
@@ -840,10 +852,11 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
     }
     if first {
         let (bottom, gaps) = with_gap_fill(r.bottom.clone(), s, solid_w, surfaces_gap, gap_speed);
-        out.extend(paths_of(
-            infill::fill_with(&bottom, infill::kind_of(&s.bottom_pattern), &solid_params(solid_w, inf.bottom_density)),
+        out.extend(solid_paths(
+            &bottom,
+            infill::kind_of(&s.bottom_pattern),
+            &solid_params(solid_w, inf.bottom_density),
             Role::BottomSurface,
-            solid_w,
             solid_speed,
             inf.bottom_flow,
         ));
@@ -866,6 +879,7 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
             let mut p = Params::new(bridge_spacing(b.thick, w, solid_w, h), b.density, angle, i, z);
             p.origin = at.origin;
             p.inset = true;
+            p.bridge = true;
             p.turn_by_layer = false;
             out.extend(paths_of(
                 infill::fill_with(part, Kind::Rectilinear { alternate: false }, &p),
@@ -927,6 +941,7 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
             let mut p = Params::new(spacing, b.internal_density, angle, i, z);
             p.origin = at.origin;
             p.inset = true;
+            p.bridge = true;
             p.turn_by_layer = false;
             out.extend(paths_of(
                 infill::fill_with(part, Kind::Rectilinear { alternate: false }, &p),
@@ -943,19 +958,21 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
         // The lines' direction on this layer, as the fill will lay them.
         let as_set = !inf.solid_template.is_empty() || i.is_multiple_of(2);
         let angle = solid_angle + if as_set { 0.0 } else { std::f64::consts::FRAC_PI_2 };
-        infill::split_narrow_solid(&solid, Settings::spacing(solid_w, h), angle)
+        let line_pattern = infill::is_line_pattern(infill::kind_of(&s.solid_pattern));
+        infill::split_narrow_solid(&solid, Settings::spacing(solid_w, h), angle, line_pattern)
     } else {
         (solid, Vec::new())
     };
-    out.extend(paths_of(
-        infill::fill_with(&narrow, Kind::Concentric, &solid_params(solid_w, 1.0)),
+    out.extend(solid_paths(
+        &solid,
+        infill::kind_of(&s.solid_pattern),
+        &solid_params(solid_w, 1.0),
         Role::SolidInfill,
-        solid_w,
         solid_speed,
         inf.solid_flow,
     ));
     out.extend(paths_of(
-        infill::fill_with(&solid, infill::kind_of(&s.solid_pattern), &solid_params(solid_w, 1.0)),
+        infill::fill_with(&narrow, Kind::Concentric, &solid_params(solid_w, 1.0)),
         Role::SolidInfill,
         solid_w,
         solid_speed,

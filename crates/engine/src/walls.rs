@@ -88,8 +88,17 @@ const NARROW_OVERLAP: f64 = 0.22;
 const NARROW_LOOP_LENGTH: f64 = 10.0;
 
 /// Walls for one island at layer height `h`. `loops` overrides the wall count (top layers
-/// with "only one wall on top", spiral vase).
-pub fn walls(island: &Shape, s: &Settings, h: f64, first_layer: bool, loops: usize, speed_scale: f64) -> Walled {
+/// with "only one wall on top", spiral vase). `last_layer` is the object's top layer, whose
+/// infill overlaps the walls as much as the first layer's.
+pub fn walls(
+    island: &Shape,
+    s: &Settings,
+    h: f64,
+    first_layer: bool,
+    last_layer: bool,
+    loops: usize,
+    speed_scale: f64,
+) -> Walled {
     let wo = if first_layer { s.widths.first_layer } else { s.widths.outer };
     let wi = if first_layer { s.widths.first_layer } else { s.widths.inner };
     let (so, si) = (Settings::spacing(wo, h), Settings::spacing(wi, h));
@@ -201,11 +210,12 @@ pub fn walls(island: &Shape, s: &Settings, h: f64, first_layer: bool, loops: usi
         // OrcaSlicer's overlap: classic walls the share of half the last wall's spacing and
         // half a solid line's (top and bottom surfaces' share on the first layer), Arachne the
         // share of the last wall's spacing.
-        let share = if first_layer { s.solid_wall_overlap } else { s.infill_wall_overlap };
+        let share = if first_layer || last_layer { s.solid_wall_overlap } else { s.infill_wall_overlap };
         let overlap = if s.walls.arachne {
             share * s_last
         } else {
-            share * (s_last + Settings::spacing(s.widths.solid, h)) / 2.0
+            let solid = if first_layer { s.widths.first_layer } else { s.widths.solid };
+            share * (s_last + Settings::spacing(solid, h)) / 2.0
         };
         // Strips inside the last wall too narrow for infill are gap filled instead.
         // (OrcaSlicer's classic walls look one loop further: what is under two spacings
@@ -246,12 +256,12 @@ mod tests {
         let mut s = settings("classic");
         s.walls.thin_walls = false;
         let tip = geom::rectangle(DVec2::ZERO, DVec2::splat(0.62));
-        let w = walls(&tip, &s, 0.2, false, 2, 1.0);
+        let w = walls(&tip, &s, 0.2, false, false, 2, 1.0);
         let loops: Vec<&Path> = w.walls.iter().flatten().collect();
         assert_eq!(loops.len(), 1);
         assert!(loops[0].width < s.widths.outer && loops[0].width > 0.3, "{}", loops[0].width);
         // A 2 mm square keeps the usual width.
-        let w = walls(&geom::rectangle(DVec2::ZERO, DVec2::splat(2.0)), &s, 0.2, false, 2, 1.0);
+        let w = walls(&geom::rectangle(DVec2::ZERO, DVec2::splat(2.0)), &s, 0.2, false, false, 2, 1.0);
         assert!(w.walls.iter().flatten().all(|p| p.width >= s.widths.outer.min(s.widths.inner) - 1e-9));
     }
 
@@ -259,7 +269,7 @@ mod tests {
     fn two_walls_round_a_square() {
         let s = settings("arachne");
         let sq = geom::rectangle(DVec2::ZERO, DVec2::splat(20.0));
-        let w = walls(&sq, &s, 0.2, false, 2, 1.0);
+        let w = walls(&sq, &s, 0.2, false, false, 2, 1.0);
         assert_eq!(w.walls.len(), 2);
         assert_eq!(w.walls[0][0].role, Role::OuterWall);
         // The outer wall's centre is half a line in: a 19.58 mm square.
@@ -282,7 +292,7 @@ mod tests {
             vec![DVec2::ZERO, DVec2::new(20.0, 0.0), DVec2::new(20.0, 20.0), DVec2::new(0.0, 20.0)],
             vec![DVec2::new(5.0, 5.0), DVec2::new(5.0, 15.0), DVec2::new(15.0, 15.0), DVec2::new(15.0, 5.0)],
         ];
-        let w = walls(&ring, &s, 0.2, false, 1, 1.0);
+        let w = walls(&ring, &s, 0.2, false, false, 1, 1.0);
         let areas: Vec<f64> = w.walls[0].iter().map(|p| geom::signed_area2(&p.points)).collect();
         // The outside clockwise, the hole counter-clockwise.
         assert!(areas.iter().any(|a| *a < 0.0 && a.abs() > 300.0), "{areas:?}");
@@ -294,14 +304,14 @@ mod tests {
         // A body with a 0.3 mm fin: too thin for a loop.
         let s = settings("arachne");
         let fin = geom::rectangle(DVec2::ZERO, DVec2::new(20.0, 0.3));
-        let w = walls(&fin, &s, 0.2, false, 2, 1.0);
+        let w = walls(&fin, &s, 0.2, false, false, 2, 1.0);
         let thin: Vec<&Path> = w.walls.iter().flatten().filter(|p| !p.closed).collect();
         assert!(!thin.is_empty());
         let len: f64 = thin.iter().map(|p| p.length()).sum();
         assert!(len > 18.0, "{len}");
         assert!(thin.iter().all(|p| p.role == Role::OuterWall && p.width < 0.42), "{:?}", thin[0].width);
         // Classic without thin-wall detection drops it, as OrcaSlicer does.
-        let none = walls(&fin, &settings("classic"), 0.2, false, 2, 1.0);
+        let none = walls(&fin, &settings("classic"), 0.2, false, false, 2, 1.0);
         assert!(none.walls.iter().flatten().next().is_none());
     }
 
@@ -310,7 +320,7 @@ mod tests {
         // 1.9 mm wide: two walls a side leave a strip in the middle no wall fits.
         let s = settings("classic");
         let bar = geom::rectangle(DVec2::ZERO, DVec2::new(30.0, 1.9));
-        let w = walls(&bar, &s, 0.2, false, 2, 1.0);
+        let w = walls(&bar, &s, 0.2, false, false, 2, 1.0);
         assert_eq!(w.walls.len(), 2);
         let gap: f64 = w.gaps.iter().filter(|p| p.role == Role::GapFill).map(Path::length).sum();
         assert!(gap > 20.0, "{gap}");
@@ -321,9 +331,9 @@ mod tests {
     fn a_thin_island_gets_what_fits() {
         let s = settings("classic");
         let sliver = geom::rectangle(DVec2::ZERO, DVec2::new(20.0, 0.6));
-        let w = walls(&sliver, &s, 0.2, false, 3, 1.0);
+        let w = walls(&sliver, &s, 0.2, false, false, 3, 1.0);
         assert!(w.walls.len() <= 1);
         let none = geom::rectangle(DVec2::ZERO, DVec2::new(20.0, 0.1));
-        assert!(walls(&none, &s, 0.2, false, 3, 1.0).walls.is_empty());
+        assert!(walls(&none, &s, 0.2, false, false, 3, 1.0).walls.is_empty());
     }
 }

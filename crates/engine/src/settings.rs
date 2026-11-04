@@ -1293,7 +1293,9 @@ pub fn bead_area(w: f64, h: f64) -> f64 {
         // A round bead: the line is narrower than it is tall.
         std::f64::consts::PI * (w / 2.0).powi(2)
     } else {
-        (w - h) * h + std::f64::consts::PI * (h / 2.0).powi(2)
+        // Single precision, as OrcaSlicer's `Flow` holds it: its last digit shows in E.
+        let (w, h) = (f64::from(w as f32), f64::from(h as f32));
+        f64::from((h * (w - h * (1.0 - 0.25 * std::f64::consts::PI))) as f32)
     }
 }
 
