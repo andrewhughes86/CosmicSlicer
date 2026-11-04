@@ -1778,6 +1778,7 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
 
     let mut highest: f64 = 0.0;
     let mut spiral_started = false;
+    let mut toolchanges = 0usize;
     for (li, plan) in plans.iter().enumerate() {
         w.layer = li;
         // The travel regions of the next layers' islands, made in parallel (one at a time,
@@ -1901,13 +1902,24 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         for (part, e) in steps {
             if e != w.extruder {
                 let from = w.extruder;
-                let vars = [
-                    ("layer_num", Value::Num(li as f64)),
-                    ("layer_z", Value::Num(plan.print_z)),
-                    ("previous_extruder", Value::Num(from as f64)),
-                    ("next_extruder", Value::Num(e as f64)),
-                    ("toolchange_z", Value::Num(plan.print_z)),
-                ];
+                toolchanges += 1;
+                let change = crate::macros::ToolChange {
+                    from,
+                    to: e,
+                    layer: li,
+                    z: plan.print_z,
+                    max_z: highest,
+                    // With a prime tower OrcaSlicer purges at least 100 mm³ in the change itself
+                    // (Bambu Lab's purge chute), in up to four parts.
+                    flush: if w.tower.is_some() {
+                        flush_volume(cx, from, e).max(100.0)
+                    } else {
+                        flush_volume(cx, from, e)
+                    },
+                    at: w.pos.to_array(),
+                    count: toolchanges,
+                };
+                let vars = change.vars(s, cx.filaments);
                 let custom = render("Change filament G-code", &s.gcode.change_filament, &vars);
                 w.tool_change(e, &custom);
                 if w.tower.is_some() {

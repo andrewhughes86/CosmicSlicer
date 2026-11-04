@@ -80,14 +80,18 @@ fn compare(case: &Path) -> Report {
     let mut text = String::new();
     presets(&cfg, &mut text);
 
-    let Some(model) = std::fs::read_dir(case)
-        .ok()
-        .and_then(|r| r.filter_map(Result::ok).map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "stl")))
-    else {
+    // The case's models in name order; with several, each prints with its own filament.
+    let mut models: Vec<std::path::PathBuf> = std::fs::read_dir(case)
+        .map(|r| {
+            r.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "stl")).collect()
+        })
+        .unwrap_or_default();
+    models.sort();
+    if models.is_empty() {
         return fail("no model .stl".into());
-    };
-    let orca = view_gcode(orca_text, &cfg, std::slice::from_ref(&cfg));
-    let Some(job) = job_for(&model, &cfg, &orca.preview) else { return fail("model unreadable".into()) };
+    }
+    let orca = view_gcode(orca_text, &cfg, &filaments_of(&cfg));
+    let Some(job) = job_for(&models, &cfg, &orca.preview) else { return fail("model unreadable".into()) };
     let started = std::time::Instant::now();
     let ours = match slice(&job, &Progress::default()) {
         Ok(s) => s,
@@ -96,7 +100,7 @@ fn compare(case: &Path) -> Report {
     let secs = started.elapsed().as_secs_f64();
     let _ = std::fs::write(case.join("ours.gcode"), &ours.gcode);
     // Both through the same reader, so the comparison is of the toolpaths, not the estimators.
-    let back = view_gcode(ours.gcode.clone(), &cfg, std::slice::from_ref(&cfg));
+    let back = view_gcode(ours.gcode.clone(), &cfg, &filaments_of(&cfg));
     let _ = writeln!(text, "sliced in {secs:.2} s");
 
     let mut flagged = Vec::new();
@@ -249,24 +253,22 @@ fn short(v: &str) -> String {
     if one.chars().count() > 60 { format!("{}…", one.chars().take(60).collect::<String>()) } else { one }
 }
 
-/// Our job for `model` with Orca's settings, placed where Orca printed it.
-fn job_for(model: &Path, cfg: &Config, orca: &Preview) -> Option<Job> {
-    let file = CosmicSlicer_model::load(model).ok()?;
-    let mesh = file.objects.into_iter().next()?.mesh.centred();
-    let centre = object_centre(orca).unwrap_or([110.0, 110.0]);
+/// Our job for `models` with Orca's settings, each placed where Orca printed it (model `k`
+/// with filament `k` when there are several).
+fn job_for(models: &[std::path::PathBuf], cfg: &Config, orca: &Preview) -> Option<Job> {
     let bed = cfg.values.get("curr_bed_type").map(String::as_str).unwrap_or("Textured PEI Plate");
     let bed_key = BEDS.iter().find(|b| b.0 == bed).map_or("textured_plate_temp", |b| b.1);
-    Some(Job {
-        printer: cfg.clone(),
-        process: cfg.clone(),
-        filaments: vec![cfg.clone()],
-        bed_key: bed_key.into(),
-        bed_type_name: bed.into(),
-        objects: vec![JobObject {
+    let several = models.len() > 1;
+    let mut objects = Vec::new();
+    for (k, model) in models.iter().enumerate() {
+        let file = CosmicSlicer_model::load(model).ok()?;
+        let mesh = file.objects.into_iter().next()?.mesh.centred();
+        let centre = object_centre(orca, several.then_some(k)).unwrap_or([110.0, 110.0]);
+        objects.push(JobObject {
             name: model.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
             mesh: Arc::new(mesh),
             matrix: Mat4::from_translation(Vec3::new(centre[0] as f32, centre[1] as f32, 0.0)),
-            extruder: 0,
+            extruder: if several { k } else { 0 },
             overrides: Vec::new(),
             support_volumes: Vec::new(),
             support_paint: Vec::new(),
@@ -277,24 +279,65 @@ fn job_for(model: &Path, cfg: &Config, orca: &Preview) -> Option<Job> {
             volumes: Vec::new(),
             ranges: Vec::new(),
             layer_profile: Vec::new(),
-        }],
+        });
+    }
+    let n = models.len();
+    Some(Job {
+        printer: cfg.clone(),
+        process: cfg.clone(),
+        filaments: (0..n).map(|k| filament(cfg, k, n)).collect(),
+        bed_key: bed_key.into(),
+        bed_type_name: bed.into(),
+        objects,
         plate_name: "Plate 1".into(),
         events: Vec::new(),
         calib: None,
     })
 }
 
+/// Each filament's settings from Orca's, as many as it names.
+fn filaments_of(cfg: &Config) -> Vec<Config> {
+    let n = cfg.values.get("filament_diameter").map_or(1, |v| v.split(',').count()).max(1);
+    (0..n).map(|k| filament(cfg, k, n)).collect()
+}
+
+/// Filament `k` of `n`'s settings: Orca writes every per-filament number as a list of `n`.
+fn filament(cfg: &Config, k: usize, n: usize) -> Config {
+    if n < 2 {
+        return cfg.clone();
+    }
+    let schema = Schema::get();
+    let mut out = cfg.clone();
+    for (key, v) in &cfg.values {
+        let Some(def) = schema.option(key) else { continue };
+        if !def.is_vector() || def.kind() == CosmicSlicer_config::OptionType::String {
+            continue;
+        }
+        let items: Vec<&str> = v.split(',').collect();
+        if items.len() == n
+            && let Some(item) = items.get(k)
+        {
+            out.set(key.clone(), (*item).to_owned());
+        }
+    }
+    out
+}
+
 fn is_object(r: Role) -> bool {
     !matches!(r, Role::Custom | Role::Skirt | Role::Brim | Role::PrimeTower)
 }
 
-/// The middle of what Orca printed of the object (start G-code, skirt and brim aside).
-fn object_centre(p: &Preview) -> Option<[f64; 2]> {
+/// The middle of what Orca printed of the object (start G-code, skirt and brim aside), or of
+/// what filament `tool` printed.
+fn object_centre(p: &Preview, tool: Option<usize>) -> Option<[f64; 2]> {
     let mut lo = [f64::MAX; 2];
     let mut hi = [f64::MIN; 2];
     // The outer walls' extent: symmetric about the part, unlike seams and wipes.
-    let outer = p.segments.iter().any(|s| s.role == Role::OuterWall);
-    for s in p.segments.iter().filter(|s| if outer { s.role == Role::OuterWall } else { is_object(s.role) }) {
+    let mine = |s: &&crate::gcode::Segment| tool.is_none_or(|t| usize::from(s.extruder) == t);
+    let outer = p.segments.iter().filter(mine).any(|s| s.role == Role::OuterWall);
+    for s in
+        p.segments.iter().filter(mine).filter(|s| if outer { s.role == Role::OuterWall } else { is_object(s.role) })
+    {
         for q in [s.a, s.b] {
             for k in 0..2 {
                 let v = f64::from(q.get(k).copied().unwrap_or(0.0));

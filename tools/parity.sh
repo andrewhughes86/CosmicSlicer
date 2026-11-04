@@ -65,6 +65,7 @@ for set in "${sets[@]}"; do
         python3 "$here/parity_flatten.py" "$share_host/profiles" "${!kind}" "$flat/$kind.json"
     done
     for m in $models; do
+        [ -f "$work/models/$m.stl" ] || continue
         case_dir="$work/$m@$set"
         mkdir -p "$case_dir"
         cp "$work/models/$m.stl" "$case_dir/"
@@ -81,6 +82,30 @@ for set in "${sets[@]}"; do
             echo "$m@$set: Orca failed (see $case_dir/orca.log)" >&2
         fi
     done
+    # Two colours (printers with a filament changer): the cube on filament 1, the cylinder on 2.
+    if [ "$set" = x1c ] && { [ -z "${MODELS:-}" ] || [[ " $MODELS " == *" duo "* ]]; }; then
+        case_dir="$work/duo@$set"
+        mkdir -p "$case_dir"
+        cp "$work/models/cube20.stl" "$case_dir/a_cube20.stl"
+        cp "$work/models/cylinder.stl" "$case_dir/b_cylinder.stl"
+        # A second filament under its own name and colour (Orca 2.4.2 crashes when the same
+        # preset is loaded twice).
+        python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); d["name"] += " B"; d["filament_colour"] = ["#2060E0"]; json.dump(d, open(sys.argv[2], "w"))' \
+            "$flat/filament.json" "$flat/filament2.json"
+        if [ "${SKIP_ORCA:-}" != 1 ] || [ ! -s "$case_dir/orca.gcode" ]; then
+            rm -f "$case_dir/orca.gcode" "$case_dir/plate_1.gcode"
+            if $orca --slice 0 --arrange 1 --outputdir "$case_dir" \
+                --load-settings "$flat/machine.json;$flat/process.json" \
+                --load-filaments "$flat/filament.json;$flat/filament2.json" --load-filament-ids "1,2" \
+                "$case_dir/a_cube20.stl" "$case_dir/b_cylinder.stl" >"$case_dir/orca.log" 2>&1 \
+                && [ -s "$case_dir/plate_1.gcode" ]; then
+                mv "$case_dir/plate_1.gcode" "$case_dir/orca.gcode"
+                echo "duo@$set: Orca sliced"
+            else
+                echo "duo@$set: Orca failed (see $case_dir/orca.log)" >&2
+            fi
+        fi
+    fi
 done
 
 cd "$here/.."

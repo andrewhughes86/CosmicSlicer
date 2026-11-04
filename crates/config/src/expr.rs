@@ -677,6 +677,7 @@ pub fn render(template: &str, vars: &dyn Vars, globals: &mut HashMap<String, Val
             Some(k) => (k, inner[k.len()..].trim()),
             None => inner.split_once(char::is_whitespace).map_or((inner, ""), |(w, t)| (w, t.trim())),
         };
+        let word = if has_then(inner) { "" } else { word };
         match word {
             "if" => {
                 let on = printing(&stack) && evaluate(tail, vars, &locals).map_err(|e| context(e, inner))?.truthy();
@@ -700,57 +701,9 @@ pub fn render(template: &str, vars: &dyn Vars, globals: &mut HashMap<String, Val
             }
             _ => {
                 if printing(&stack) {
-                    // Several statements may share braces, separated by `;`.
-                    for statement in split_statements(inner) {
-                        let (w, t) =
-                            statement.split_once(char::is_whitespace).map_or((statement, ""), |(w, t)| (w, t.trim()));
-                        if w == "local" || w == "global" {
-                            let Some((name, value)) = t.split_once('=') else {
-                                return Err(MacroError::Syntax(format!("{w} needs \"name = value\"")));
-                            };
-                            let name = name.trim().to_owned();
-                            let v = evaluate(value.trim(), vars, &locals).map_err(|e| context(e, statement))?;
-                            if w == "global" {
-                                globals.insert(name.clone(), v.clone());
-                            }
-                            locals.insert(name, v);
-                        } else if let Some((target, index_src, value)) = assignment(statement) {
-                            // `x = …` or `x[i] = …`: changes a variable (OrcaSlicer's writable
-                            // ones such as e_retracted, or an earlier local or global).
-                            let v = evaluate(value, vars, &locals).map_err(|e| context(e, statement))?;
-                            let new = match index_src {
-                                None => v,
-                                Some(i) => {
-                                    let i = evaluate(i, vars, &locals).map_err(|e| context(e, statement))?.num()?;
-                                    let current =
-                                        locals.get(target).cloned().or_else(|| vars.var(target)).unwrap_or(Value::Nil);
-                                    let mut items = match current {
-                                        Value::Vec(items) => items,
-                                        Value::Nil => Vec::new(),
-                                        other => vec![other],
-                                    };
-                                    let k = i.max(0.0) as usize;
-                                    if k > 1024 {
-                                        return Err(context(MacroError::Type("index out of range".into()), statement));
-                                    }
-                                    if items.len() <= k {
-                                        items.resize(k + 1, Value::Num(0.0));
-                                    }
-                                    if let Some(slot) = items.get_mut(k) {
-                                        *slot = v;
-                                    }
-                                    Value::Vec(items)
-                                }
-                            };
-                            if globals.contains_key(target) {
-                                globals.insert(target.to_owned(), new.clone());
-                            }
-                            locals.insert(target.to_owned(), new);
-                        } else if !statement.is_empty() {
-                            let v = evaluate(statement, vars, &locals).map_err(|e| context(e, statement))?;
-                            out.push_str(&v.text());
-                        }
-                    }
+                    // Several statements may share braces, separated by `;`, with their own
+                    // `if … then … endif` (PrusaSlicer's macro language).
+                    block(inner, vars, &mut locals, globals, &mut out)?;
                 }
             }
         }
@@ -765,6 +718,207 @@ pub fn render(template: &str, vars: &dyn Vars, globals: &mut HashMap<String, Val
 }
 
 /// Adds the expression to an error, so a failing template says where.
+/// One piece of a `{…}` block.
+enum Item<'a> {
+    Statement(&'a str),
+    If(&'a str),
+    Elsif(&'a str),
+    Else,
+    Endif,
+}
+
+fn is_ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Whether `s` has a `then` outside strings and brackets: an `if` statement, not an `{if}` tag.
+fn has_then(s: &str) -> bool {
+    items(s).is_ok_and(|v| v.iter().any(|i| matches!(i, Item::If(_) | Item::Elsif(_))))
+}
+
+/// Splits a block into statements and `if c then` / `elsif c then` / `else` / `endif`, at `;`
+/// and at those words outside strings and brackets.
+fn items(s: &str) -> Result<Vec<Item<'_>>, MacroError> {
+    let mut out = Vec::new();
+    let (mut depth, mut quote, mut start) = (0i32, false, 0usize);
+    let mut cond_from: Option<(usize, bool)> = None;
+    let bytes = s.as_bytes();
+    let word_at = |i: usize, w: &str| {
+        s.get(i..).is_some_and(|r| r.starts_with(w))
+            && s[..i].chars().next_back().is_none_or(|c| !is_ident(c))
+            && s.get(i + w.len()..).and_then(|r| r.chars().next()).is_none_or(|c| !is_ident(c))
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes.get(i).copied().unwrap_or(b' ');
+        if quote {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                quote = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => quote = true,
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b';' if depth == 0 && cond_from.is_none() => {
+                out.push(Item::Statement(s[start..i].trim()));
+                start = i + 1;
+            }
+            _ if depth == 0 => {
+                if let Some((from, elsif)) = cond_from {
+                    if word_at(i, "then") {
+                        let cond = s[from..i].trim();
+                        out.push(if elsif { Item::Elsif(cond) } else { Item::If(cond) });
+                        cond_from = None;
+                        i += 4;
+                        start = i;
+                        continue;
+                    }
+                } else {
+                    for (w, elsif) in [("if", false), ("elsif", true)] {
+                        if word_at(i, w) {
+                            out.push(Item::Statement(s[start..i].trim()));
+                            cond_from = Some((i + w.len(), elsif));
+                        }
+                    }
+                    if cond_from.is_some() {
+                        i += if word_at(i, "if") { 2 } else { 5 };
+                        continue;
+                    }
+                    let ending =
+                        [("else", Item::Else), ("endif", Item::Endif)].into_iter().find(|(w, _)| word_at(i, w));
+                    if let Some((w, item)) = ending {
+                        out.push(Item::Statement(s[start..i].trim()));
+                        out.push(item);
+                        i += w.len();
+                        start = i;
+                        continue;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if cond_from.is_some() {
+        return Err(MacroError::Syntax("an if has no then".into()));
+    }
+    out.push(Item::Statement(s[start..].trim()));
+    out.retain(|i| !matches!(i, Item::Statement("")));
+    Ok(out)
+}
+
+/// Runs a `{…}` block's statements, minding its `if` statements.
+fn block(
+    inner: &str,
+    vars: &dyn Vars,
+    locals: &mut HashMap<String, Value>,
+    globals: &mut HashMap<String, Value>,
+    out: &mut String,
+) -> Result<(), MacroError> {
+    // As in `render`: (this branch runs, a branch of this if has run).
+    let mut stack: Vec<(bool, bool)> = Vec::new();
+    let running = |stack: &Vec<(bool, bool)>| stack.iter().all(|(on, _)| *on);
+    for item in items(inner)? {
+        match item {
+            Item::If(cond) => {
+                let on = running(&stack) && evaluate(cond, vars, locals).map_err(|e| context(e, cond))?.truthy();
+                stack.push((on, on));
+            }
+            Item::Elsif(cond) => {
+                let parent = stack.len().saturating_sub(1);
+                let outer = stack.iter().take(parent).all(|(on, _)| *on);
+                let Some(&(_, done)) = stack.last() else { return Err(MacroError::Syntax("elsif without if".into())) };
+                let on = outer && !done && evaluate(cond, vars, locals).map_err(|e| context(e, cond))?.truthy();
+                if let Some(top) = stack.last_mut() {
+                    *top = (on, done || on);
+                }
+            }
+            Item::Else => {
+                let parent = stack.len().saturating_sub(1);
+                let outer = stack.iter().take(parent).all(|(on, _)| *on);
+                let Some(top) = stack.last_mut() else { return Err(MacroError::Syntax("else without if".into())) };
+                *top = (outer && !top.1, true);
+            }
+            Item::Endif => {
+                if stack.pop().is_none() {
+                    return Err(MacroError::Syntax("endif without if".into()));
+                }
+            }
+            Item::Statement(st) if running(&stack) => statement(st, vars, locals, globals, out)?,
+            Item::Statement(_) => {}
+        }
+    }
+    if !stack.is_empty() {
+        return Err(MacroError::Syntax("an if is never closed with endif".into()));
+    }
+    Ok(())
+}
+
+/// One statement: `local`/`global` definitions, assignments (`x = …`, `x[i] = …`), or an
+/// expression whose value is printed.
+fn statement(
+    statement: &str,
+    vars: &dyn Vars,
+    locals: &mut HashMap<String, Value>,
+    globals: &mut HashMap<String, Value>,
+    out: &mut String,
+) -> Result<(), MacroError> {
+    let (w, t) = statement.split_once(char::is_whitespace).map_or((statement, ""), |(w, t)| (w, t.trim()));
+    if w == "local" || w == "global" {
+        let Some((name, value)) = t.split_once('=') else {
+            return Err(MacroError::Syntax(format!("{w} needs \"name = value\"")));
+        };
+        let name = name.trim().to_owned();
+        let v = evaluate(value.trim(), vars, locals).map_err(|e| context(e, statement))?;
+        if w == "global" {
+            globals.insert(name.clone(), v.clone());
+        }
+        locals.insert(name, v);
+    } else if let Some((target, index_src, value)) = assignment(statement) {
+        // `x = …` or `x[i] = …`: changes a variable (OrcaSlicer's writable ones such as
+        // e_retracted, or an earlier local or global).
+        let v = evaluate(value, vars, locals).map_err(|e| context(e, statement))?;
+        let new = match index_src {
+            None => v,
+            Some(i) => {
+                let i = evaluate(i, vars, locals).map_err(|e| context(e, statement))?.num()?;
+                let current = locals.get(target).cloned().or_else(|| vars.var(target)).unwrap_or(Value::Nil);
+                let mut items = match current {
+                    Value::Vec(items) => items,
+                    Value::Nil => Vec::new(),
+                    other => vec![other],
+                };
+                let k = i.max(0.0) as usize;
+                if k > 1024 {
+                    return Err(context(MacroError::Type("index out of range".into()), statement));
+                }
+                if items.len() <= k {
+                    items.resize(k + 1, Value::Num(0.0));
+                }
+                if let Some(slot) = items.get_mut(k) {
+                    *slot = v;
+                }
+                Value::Vec(items)
+            }
+        };
+        if globals.contains_key(target) {
+            globals.insert(target.to_owned(), new.clone());
+        }
+        locals.insert(target.to_owned(), new);
+    } else if !statement.is_empty() {
+        let v = evaluate(statement, vars, locals).map_err(|e| context(e, statement))?;
+        out.push_str(&v.text());
+    }
+    Ok(())
+}
+
 fn context(e: MacroError, expression: &str) -> MacroError {
     let short: String = expression.chars().take(80).collect();
     match e {
@@ -804,25 +958,6 @@ fn assignment(s: &str) -> Option<(&str, Option<&str>, &str)> {
         }
     }
     None
-}
-
-/// Splits `a; b; c` at semicolons outside strings.
-fn split_statements(s: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut quote = false;
-    let mut start = 0;
-    for (i, c) in s.char_indices() {
-        match c {
-            '"' => quote = !quote,
-            ';' if !quote => {
-                out.push(s[start..i].trim());
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    out.push(s[start..].trim());
-    out
 }
 
 fn matching_brace(s: &str) -> Option<usize> {
@@ -909,6 +1044,51 @@ mod tests {
         assert_eq!(condition("printer_notes=~/.*PRINTER_MODEL_COREONE[^_a-zA-Z0-9].*/", &v), Ok(false));
         assert_eq!(condition("", &v), Ok(true));
         assert_eq!(condition("nozzle_diameter[0]!=0.4 or not spiral_mode", &v), Ok(true));
+    }
+
+    #[test]
+    fn if_statements_inside_blocks() {
+        // PrusaSlicer's style (the Prusa XL's tool change), and on one line with no `;`
+        // (the Anycubic Kobra X's).
+        let t = "{\nlocal fast = 350.0;\nlocal speed = fast;\nif travel < fast then\n  speed = travel;\nendif\n\"G1 F\" + (speed * 60) + \"\n\";\nif a == 3 then \"three\" elsif a == 2 then \"two\" else \"other\" endif\n}\
+                 {local t = 1}{ if (0 <= t && t < 3) then local from_=t else local from_=3 endif}; from {from_}";
+        let mut v = vars();
+        v.insert("travel".into(), Value::Num(200.0));
+        v.insert("a".into(), Value::Num(2.0));
+        let mut g = HashMap::new();
+        let out = render(t, &v, &mut g);
+        assert_eq!(out.as_deref().ok(), Some("G1 F12000\ntwo; from 1"), "{out:?}");
+        // An `{if}` tag still works.
+        assert_eq!(render("{if a == 2}x{endif}", &v, &mut g).ok().as_deref(), Some("x"));
+        // An if without then fails cleanly.
+        assert!(render("{local q = 1; if q }", &v, &mut g).is_err());
+    }
+
+    #[test]
+    fn random_blocks_always_finish() {
+        // Keywords, strings and brackets in random order: every template renders or fails,
+        // quickly (a splitter that stopped advancing once hung on `else`).
+        const PIECES: [&str; 22] = [
+            "if", "then", "elsif", "else", "endif", "local", "x", "=", "1", ";", "\"s\"", "(", ")", "[", "]", "{", "}",
+            " ", "\n", "a", "==", "+",
+        ];
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut v = vars();
+        v.insert("a".into(), Value::Num(1.0));
+        for _ in 0..5000 {
+            let n = (next() % 24) as usize;
+            let body: String =
+                (0..n).map(|_| PIECES[(next() % PIECES.len() as u64) as usize]).collect::<Vec<_>>().join(" ");
+            let started = std::time::Instant::now();
+            let _ = render(&format!("{{{body}}}"), &v, &mut HashMap::new());
+            assert!(started.elapsed().as_secs_f64() < 1.0, "slow: {body}");
+        }
     }
 
     #[test]

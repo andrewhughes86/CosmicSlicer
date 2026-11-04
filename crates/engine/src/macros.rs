@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use CosmicSlicer_config::expr::{self, ConfigVars, Value, Vars};
 use CosmicSlicer_config::{Config, Schema};
 
-use crate::settings::{Filament, Settings};
+use crate::settings::{Filament, Settings, bead_area};
 
 /// Everything a template can read, for one slice.
 pub struct Macros<'a> {
@@ -155,6 +155,20 @@ impl<'a> Macros<'a> {
         put("filament_max_volumetric_speed", nums(fil.iter().map(|f| f.max_volumetric)));
         put("flush_volumetric_speeds", nums(fil.iter().map(|f| f.max_volumetric)));
         put("flush_temperatures", nums(fil.iter().map(|f| f.nozzle_temp)));
+        // The strongest auxiliary fan any filament on the plate asks for (OrcaSlicer's).
+        let aux = table.get(schema, "additional_cooling_fan_speed");
+        let aux_max = aux
+            .split(',')
+            .enumerate()
+            .filter(|(i, _)| facts.used_extruders.is_empty() || facts.used_extruders.contains(i))
+            .filter_map(|(_, v)| v.trim().parse::<f64>().ok())
+            .fold(0.0, f64::max);
+        put("max_additional_fan", Value::Num(aux_max));
+        // Newer OrcaSlicer variables some recent profiles use: each nozzle's volume type, and
+        // the per-filament tool change retraction (the printer's here).
+        let nozzles = table.get(schema, "nozzle_diameter").split(',').count().max(1);
+        put("nozzle_volume_types", Value::Vec(vec![Value::Str("Standard".into()); nozzles]));
+        put("filament_retract_length_toolchange", nums(fil.iter().map(|_| s.retract.toolchange_length)));
         put("nozzle_diameter_at_nozzle_id", nums([s.nozzle]));
         put("relative_e_axis", Value::Bool(s.gcode.relative_e));
         put("input_filename", Value::Str(String::new()));
@@ -239,6 +253,83 @@ impl<'a> Macros<'a> {
     }
 }
 
+/// What changing from filament `from` to `to` sets for the change filament G-code, as
+/// OrcaSlicer sets it: the flush (in all and in up to four 135 mm³ parts, as filament
+/// length), the retractions, temperatures and feeds of both filaments, and where the head is.
+pub struct ToolChange {
+    pub from: usize,
+    pub to: usize,
+    pub layer: usize,
+    pub z: f64,
+    pub max_z: f64,
+    /// mm³ to purge.
+    pub flush: f64,
+    /// Where the head is before the change.
+    pub at: [f64; 3],
+    /// Changes so far, this one included.
+    pub count: usize,
+}
+
+impl ToolChange {
+    pub fn vars(&self, s: &Settings, fil: &[Filament]) -> Vec<(&'static str, Value)> {
+        let get = |i: usize| fil.get(i).or_else(|| fil.first());
+        let area = get(self.to).map_or(std::f64::consts::PI * 0.875 * 0.875, |f| f.area()).max(1e-6);
+        let length = self.flush.max(0.0) / area;
+        let parts = ((self.flush / 135.0).round() as usize).min(4);
+        let part = |k: usize| if k < parts && parts > 0 { length / parts as f64 } else { 0.0 };
+        let feed = |i: usize| get(i).map_or(0.0, |f| (60.0 * f.max_volumetric / f.area().max(1e-6)).floor());
+        let temp = |i: usize| get(i).map_or(0.0, |f| f.nozzle_temp);
+        let outer_area = bead_area(s.widths.outer, s.layer_height).max(1e-6);
+        let outer_volumetric = get(self.to).map_or(0.0, |f| (s.speeds.outer * outer_area).min(f.max_volumetric));
+        let num = |v: f64| Value::Num(v);
+        vec![
+            ("previous_extruder", num(self.from as f64)),
+            ("next_extruder", num(self.to as f64)),
+            ("current_hotend", num(0.0)),
+            ("next_hotend", num(0.0)),
+            ("layer_num", num(self.layer as f64)),
+            ("layer_z", num(self.z)),
+            ("toolchange_z", num(self.z)),
+            ("max_layer_z", num(self.max_z)),
+            ("relative_e_axis", Value::Bool(true)),
+            ("toolchange_count", num(self.count as f64)),
+            ("fan_speed", num(0.0)),
+            ("old_retract_length", num(s.retract.length)),
+            ("new_retract_length", num(s.retract.length)),
+            ("old_retract_length_toolchange", num(s.retract.toolchange_length)),
+            ("new_retract_length_toolchange", num(s.retract.toolchange_length)),
+            // How far the incoming extruder sits retracted (one nozzle: not at all).
+            ("new_extruder_retracted_length", num(0.0)),
+            ("old_filament_temp", num(temp(self.from))),
+            ("new_filament_temp", num(temp(self.to))),
+            ("x_after_toolchange", num(self.at[0])),
+            ("y_after_toolchange", num(self.at[1])),
+            ("z_after_toolchange", num(self.at[2])),
+            ("first_flush_volume", num(length / 2.0)),
+            ("second_flush_volume", num(length / 2.0)),
+            ("old_filament_e_feedrate", num(feed(self.from))),
+            ("new_filament_e_feedrate", num(feed(self.to))),
+            ("travel_point_1_x", num(0.0)),
+            ("travel_point_1_y", num(0.0)),
+            ("travel_point_2_x", num(0.0)),
+            ("travel_point_2_y", num(0.0)),
+            ("travel_point_3_x", num(0.0)),
+            ("travel_point_3_y", num(0.0)),
+            ("wipe_avoid_perimeter", Value::Bool(false)),
+            ("wipe_avoid_pos_x", num(0.0)),
+            ("is_prime_tower_interface", Value::Bool(false)),
+            ("filament_tower_interface_purge_volume", num(0.0)),
+            ("filament_tower_interface_print_temp", num(temp(self.to))),
+            ("outer_wall_volumetric_speed", num(outer_volumetric)),
+            ("flush_length", num(length)),
+            ("flush_length_1", num(part(0))),
+            ("flush_length_2", num(part(1))),
+            ("flush_length_3", num(part(2))),
+            ("flush_length_4", num(part(3))),
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,15 +396,32 @@ mod library_survey {
                 let s = Settings::read(schema, &table);
                 let fil = vec![Filament::read(schema, &pla, "textured_plate_temp")];
                 let m = Macros::new(schema, &table, &s, &fil, &tests_facts());
-                for key in
-                    ["machine_start_gcode", "machine_end_gcode", "layer_change_gcode", "before_layer_change_gcode"]
-                {
+                let change = ToolChange {
+                    from: 0,
+                    to: 0,
+                    layer: 5,
+                    z: 1.2,
+                    max_z: 1.2,
+                    flush: 300.0,
+                    at: [100.0, 100.0, 1.2],
+                    count: 1,
+                };
+                for key in [
+                    "machine_start_gcode",
+                    "machine_end_gcode",
+                    "layer_change_gcode",
+                    "before_layer_change_gcode",
+                    "change_filament_gcode",
+                ] {
                     let template = table.values.get(key).cloned().unwrap_or_default();
-                    let layer = [
+                    let mut layer = vec![
                         ("layer_num", Value::Num(5.0)),
                         ("layer_z", Value::Num(1.2)),
                         ("previous_layer_z", Value::Num(1.0)),
                     ];
+                    if key == "change_filament_gcode" {
+                        layer.extend(change.vars(&s, &fil));
+                    }
                     let rendered = m.render(key, &template, &layer);
                     if let Ok(text) = &rendered {
                         // No template syntax may survive into the G-code (comments aside).
