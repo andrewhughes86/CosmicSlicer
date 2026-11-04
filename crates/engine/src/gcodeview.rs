@@ -138,7 +138,7 @@ pub fn read(text: &str, s: &Settings, fil: &[Filament]) -> Viewed {
         if !comment.is_empty() {
             if let Some(t) = comment.strip_prefix("TYPE:").or_else(|| comment.strip_prefix("FEATURE:")) {
                 role = role_of(t);
-            } else if let Some(w) = comment.strip_prefix("WIDTH:") {
+            } else if let Some(w) = comment.strip_prefix("WIDTH:").or_else(|| comment.strip_prefix("LINE_WIDTH:")) {
                 width = w.trim().parse::<f64>().ok().filter(|v| *v > 0.0 && *v < 10.0);
             } else if comment == "LAYER_CHANGE" || comment == "CHANGE_LAYER" {
                 // PrusaSlicer's and OrcaSlicer's mark, and Bambu Studio's (also Orca's for
@@ -149,7 +149,7 @@ pub fn read(text: &str, s: &Settings, fil: &[Filament]) -> Viewed {
                 prepare_blocks.get_or_insert(blocks.len());
             } else if let Some(z) = comment.strip_prefix("Z:").or_else(|| comment.strip_prefix("Z_HEIGHT:")) {
                 marked_z = z.trim().parse::<f64>().ok().filter(|v| v.is_finite());
-            } else if let Some(h) = comment.strip_prefix("HEIGHT:") {
+            } else if let Some(h) = comment.strip_prefix("HEIGHT:").or_else(|| comment.strip_prefix("LAYER_HEIGHT:")) {
                 height = h.trim().parse::<f64>().ok().filter(|v| *v > 0.0 && *v < 10.0);
             }
         }

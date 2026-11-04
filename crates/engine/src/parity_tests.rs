@@ -265,7 +265,7 @@ fn job_for(models: &[std::path::PathBuf], cfg: &Config, orca: &Preview) -> Optio
         let mesh = file.objects.into_iter().next()?.mesh.centred();
         let centre = object_centre(orca, several.then_some(k)).unwrap_or([110.0, 110.0]);
         objects.push(JobObject {
-            name: model.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            name: model.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
             mesh: Arc::new(mesh),
             matrix: Mat4::from_translation(Vec3::new(centre[0] as f32, centre[1] as f32, 0.0)),
             extruder: if several { k } else { 0 },

@@ -412,6 +412,7 @@ mod library_survey {
                     "layer_change_gcode",
                     "before_layer_change_gcode",
                     "change_filament_gcode",
+                    "time_lapse_gcode",
                 ] {
                     let template = table.values.get(key).cloned().unwrap_or_default();
                     let mut layer = vec![
@@ -421,6 +422,16 @@ mod library_survey {
                     ];
                     if key == "change_filament_gcode" {
                         layer.extend(change.vars(&s, &fil));
+                    }
+                    if key == "time_lapse_gcode" {
+                        layer.extend([
+                            ("max_layer_z", Value::Num(1.2)),
+                            ("most_used_physical_extruder_id", Value::Num(0.0)),
+                            ("curr_physical_extruder_id", Value::Num(0.0)),
+                            ("timelapse_pos_x", Value::Num(0.0)),
+                            ("timelapse_pos_y", Value::Num(0.0)),
+                            ("has_timelapse_safe_pos", Value::Bool(false)),
+                        ]);
                     }
                     let rendered = m.render(key, &template, &layer);
                     if let Ok(text) = &rendered {

@@ -58,6 +58,12 @@ pub struct Settings {
     pub seams: Seams,
     /// Overhangs steeper than this (degrees from vertical) are filled out into cones.
     pub printable_overhang: Option<f64>,
+    /// A Bambu Lab printer: OrcaSlicer writes those files' comments its own way.
+    pub bbl: bool,
+    /// A bed-slinger (OrcaSlicer's "i3" structure): timelapse pictures differ.
+    pub i3: bool,
+    /// Object names and label comments in the G-code.
+    pub label_objects: bool,
     /// Outlines and holes grown (positive) or shrunk on every layer, mm.
     pub xy_contour: f64,
     pub xy_hole: f64,
@@ -409,6 +415,10 @@ pub enum ZHop {
     Normal,
     /// Rising along the start of the travel.
     Slope,
+    /// A helix on the spot.
+    Spiral,
+    /// OrcaSlicer's "Auto": a slope, a helix at layer changes.
+    Auto,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -571,6 +581,7 @@ pub struct GcodeSettings {
     pub start: String,
     pub end: String,
     pub before_layer: String,
+    pub timelapse: String,
     pub layer_change: String,
     pub relative_e: bool,
     pub printer_model: String,
@@ -765,7 +776,8 @@ impl Settings {
             support: r.speed("support_speed", 80.0),
             support_interface: r.speed("support_interface_speed", 80.0),
             skirt: r.speed("skirt_speed", first_layer_speed),
-            travel_z: r.speed("travel_speed_z", 10.0),
+            // 0: as fast as travel (OrcaSlicer's).
+            travel_z: r.range("travel_speed_z", 0.0, 0.0, 2000.0),
         };
         let accel = |key: &str, fallback: f64| {
             let v = r.num(key, fallback);
@@ -1000,7 +1012,12 @@ impl Settings {
                     jerk_first_layer: jerk("initial_layer_jerk"),
                     jerk_travel: jerk("travel_jerk"),
                     firmware_retraction: r.flag("use_firmware_retraction"),
-                    z_hop: if r.first("z_hop_types") == "Normal Lift" { ZHop::Normal } else { ZHop::Slope },
+                    z_hop: match r.first("z_hop_types").as_str() {
+                        "Normal Lift" => ZHop::Normal,
+                        "Slope Lift" => ZHop::Slope,
+                        "Spiral Lift" => ZHop::Spiral,
+                        _ => ZHop::Auto,
+                    },
                     lift_above: r.range("retract_lift_above", 0.0, 0.0, 10_000.0),
                     lift_below: r.range("retract_lift_below", 0.0, 0.0, 10_000.0),
                     travel_slope: r.range("travel_slope", 3.0, 0.5, 90.0),
@@ -1139,6 +1156,7 @@ impl Settings {
                 start: r.text("machine_start_gcode"),
                 end: r.text("machine_end_gcode"),
                 before_layer: r.text("before_layer_change_gcode"),
+                timelapse: r.text("time_lapse_gcode"),
                 layer_change: r.text("layer_change_gcode"),
                 relative_e: r.flag("use_relative_e_distances"),
                 printer_model: r.text("printer_model"),
@@ -1179,6 +1197,9 @@ impl Settings {
             walls,
             bridges,
             seams,
+            bbl: r.text("printer_model").starts_with("Bambu"),
+            i3: r.text("printer_structure") == "i3",
+            label_objects: r.flag("gcode_label_objects"),
             xy_contour: r.range("xy_contour_compensation", 0.0, -10.0, 10.0),
             xy_hole: r.range("xy_hole_compensation", 0.0, -10.0, 10.0),
             elephant_foot: r.range("elefant_foot_compensation", 0.0, 0.0, 5.0),

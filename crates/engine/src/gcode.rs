@@ -210,6 +210,8 @@ pub struct Output {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MoveKind {
     Travel,
+    /// A travel that names its Z even when unchanged (OrcaSlicer's moves while lifted).
+    Lifted,
     Extrude(Role),
     /// Extruder only: retract or unretract (or its firmware command).
     Retract,
@@ -240,6 +242,13 @@ enum Op {
     },
     Accel(f64),
     Jerk(f64),
+    /// A helix up on the spot: to `z`, about the centre (`i`, `j`) from the head.
+    Spiral {
+        z: f64,
+        i: f64,
+        j: f64,
+        feed: f64,
+    },
     /// The part fan, %. The layer's speed is settled once the layer is written (it follows the
     /// layer's time after cooling), so the fan commands say what they are for.
     Fan(f64, Fan),
@@ -256,6 +265,14 @@ enum Fan {
     Exact,
 }
 
+/// How a travel rises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lift {
+    Normal,
+    Slope,
+    Spiral,
+}
+
 struct Writer<'a> {
     cx: &'a Context<'a>,
     /// What a calibration print changes on the current layer.
@@ -270,6 +287,15 @@ struct Writer<'a> {
     role: Option<Role>,
     width: f64,
     extruder: usize,
+    /// A lift to make with the next travel (OrcaSlicer's lazy lift).
+    to_lift: Option<Lift>,
+    /// The layer's Z is still to be reached (the layer change moves no Z itself).
+    z_pending: bool,
+    /// Custom G-code ran: the next travel goes across first, then down.
+    pos_unclear: bool,
+    /// Object label to close, and to open, with the next travel.
+    label_end: Option<String>,
+    label_start: Option<String>,
     /// The fan as last commanded: (%, what for).
     out_fan: (f64, Fan),
     /// The fan ramp over the first layers (0 to 1; 0 while the fan is off).
@@ -312,28 +338,39 @@ struct Writer<'a> {
 /// Layers whose travel regions are made at once.
 const REGIONS_AHEAD: usize = 32;
 
+fn plain(v: f64, decimals: usize) -> String {
+    let t = format!("{v:.decimals$}");
+    let t = t.trim_end_matches('0').trim_end_matches('.');
+    if t.is_empty() || t == "-0" { "0".to_owned() } else { t.to_owned() }
+}
+
 fn f3(v: f64) -> String {
-    let mut s = String::new();
-    push_num(&mut s, v, 3);
-    s
+    plain(v, 3)
 }
 
 fn f5(v: f64) -> String {
-    let mut s = String::new();
-    push_num(&mut s, v, 5);
-    s
+    plain(v, 5)
 }
 
 /// `v` to `decimals` places without trailing zeros ("-0" as "0"), appended to `out` with no
 /// allocation of its own: the G-code text has millions of numbers.
 fn push_num(out: &mut String, v: f64, decimals: usize) {
-    let start = out.len();
-    let _ = write!(out, "{v:.decimals$}");
-    let kept = out.get(start..).map_or(0, |n| n.trim_end_matches('0').trim_end_matches('.').len());
-    out.truncate(start + kept);
-    if matches!(out.get(start..), Some("-0" | "")) {
-        out.truncate(start);
-        out.push('0');
+    // OrcaSlicer's numbers: rounded at `decimals`, no trailing zeros, no zero before the point.
+    let scale = 10i64.pow(decimals.min(9) as u32);
+    let n = (v * scale as f64).round() as i64;
+    if n < 0 {
+        out.push('-');
+    }
+    let abs = n.unsigned_abs();
+    let (whole, frac) = (abs / scale as u64, abs % scale as u64);
+    if whole > 0 || frac == 0 {
+        let _ = write!(out, "{whole}");
+    }
+    if frac > 0 {
+        let start = out.len();
+        let _ = write!(out, ".{frac:0decimals$}");
+        let kept = out.get(start..).map_or(0, |t| t.trim_end_matches('0').len());
+        out.truncate(start + kept);
     }
 }
 
@@ -417,6 +454,29 @@ impl<'a> Writer<'a> {
         }
     }
 
+    /// OrcaSlicer sets the travel's acceleration before anything else: for a short hop onto an
+    /// outer wall, already the wall's (or an overhang's, the bridges').
+    fn set_travel_dynamics(&mut self, next: Role, short: bool) {
+        let m = &self.s().motion;
+        let first = self.layer == 0;
+        let (accel, jerk) = match next {
+            Role::OverhangWall if short && !first => (self.dynamics(Some(Role::Bridge)).0, self.dynamics(Some(next)).1),
+            Role::OuterWall if short && !first => self.dynamics(Some(next)),
+            _ => self.dynamics(None),
+        };
+        // Only firmware with a travel acceleration of its own has a limit on it.
+        let separate = matches!(m.flavor, Flavor::Marlin2 | Flavor::RepRap | Flavor::Repetier);
+        let accel = if m.emit_limits && separate { accel.min(m.limits.accel_travel) } else { accel };
+        if m.accel_control && (accel - self.accel).abs() > 0.5 {
+            self.accel = accel;
+            self.ops.push(Op::Accel(accel));
+        }
+        if m.jerk_default > 0.0 && jerk > 0.0 && (jerk - self.jerk).abs() > 0.01 {
+            self.jerk = jerk;
+            self.ops.push(Op::Jerk(jerk));
+        }
+    }
+
     fn may_lift(&self) -> bool {
         let m = &self.s().motion;
         let z = self.print_z;
@@ -480,6 +540,7 @@ impl<'a> Writer<'a> {
                 }
                 let per_mm = during / travelled;
                 let mut from = self.pos.truncate();
+                self.line(if self.s().bbl { "; WIPE_START" } else { ";WIPE_START" });
                 for p in wipe {
                     let e = -per_mm * from.distance(p);
                     let z = self.pos.z;
@@ -487,6 +548,7 @@ impl<'a> Writer<'a> {
                     left += e;
                     from = p;
                 }
+                self.line(if self.s().bbl { "; WIPE_END" } else { ";WIPE_END" });
             } else if travelled > 0.0 {
                 for p in wipe {
                     let z = self.pos.z;
@@ -507,13 +569,116 @@ impl<'a> Writer<'a> {
         self.last_path.clear();
     }
 
+    /// Z moves' speed: `travel_speed_z`, or the travel speed when it is 0.
+    fn z_speed(&self) -> f64 {
+        let v = self.s().speeds.travel_z;
+        if v > 0.0 { v } else { self.travel_speed() }
+    }
+
+    /// The lift for travels between paths.
+    fn lift_kind(&self) -> Lift {
+        match self.s().motion.z_hop {
+            ZHop::Normal => Lift::Normal,
+            ZHop::Spiral => Lift::Spiral,
+            ZHop::Slope | ZHop::Auto => Lift::Slope,
+        }
+    }
+
+    /// Asks for a lift with the next travel, unless lifted or not allowed here.
+    fn want_lift(&mut self, kind: Lift) {
+        if self.hop == 0.0 && self.to_lift.is_none() && self.may_lift() {
+            self.to_lift = Some(kind);
+        }
+    }
+
+    /// Writes what the object labels owe: the last object's end, this one's start.
+    fn flush_labels(&mut self) {
+        if let Some(t) = self.label_end.take() {
+            self.line(t);
+        }
+        if let Some(t) = self.label_start.take() {
+            self.line(t);
+        }
+    }
+
+    /// A helix up by the hop at once (for custom G-code that runs lifted), OrcaSlicer's eager
+    /// lift: a turn of the travel slope's pitch, centred to the head's right.
+    fn eager_lift(&mut self) {
+        let hop = self.s().retract.z_hop;
+        self.to_lift = None;
+        if !self.may_lift() || hop <= 0.0 {
+            return;
+        }
+        let slope = self.s().motion.travel_slope.to_radians();
+        let radius = hop / (std::f64::consts::TAU * slope.atan());
+        let feed = self.z_speed();
+        let z = self.print_z + hop;
+        self.ops.push(Op::Spiral { z, i: radius, j: 0.0, feed });
+        self.pos.z = z;
+        self.hop = hop;
+    }
+
+    /// OrcaSlicer's `travel_to_xyz`: rises as asked on the way to `to`, ending there at the lift
+    /// height (or at the layer's height when `force_z`).
+    fn travel_xyz(&mut self, to: DVec2, force_z: bool) {
+        let speed = self.travel_speed();
+        let nominal = self.print_z;
+        if let Some(kind) = self.to_lift.take() {
+            let hop = self.s().retract.z_hop;
+            let target = nominal + hop;
+            let here = self.pos.truncate();
+            let run = here.distance(to);
+            self.hop = hop;
+            if run > 0.0 && self.xy_known && !self.pos_unclear {
+                let slope = self.s().motion.travel_slope.to_radians();
+                match kind {
+                    Lift::Spiral => {
+                        let dir = (to - here) / run;
+                        let radius = hop / (std::f64::consts::TAU * slope.atan());
+                        let feed = self.z_speed();
+                        self.ops.push(Op::Spiral { z: target, i: -dir.y * radius, j: dir.x * radius, feed });
+                        self.pos.z = target;
+                    }
+                    Lift::Slope if hop.atan2(run) < slope => {
+                        let top = here + (to - here) / run * (hop / slope.tan());
+                        self.mv(top.extend(target), 0.0, speed, MoveKind::Travel);
+                    }
+                    Lift::Normal => {
+                        let up = self.pos.truncate().extend(target);
+                        let z_speed = self.z_speed();
+                        self.mv(up, 0.0, z_speed, MoveKind::Travel);
+                    }
+                    Lift::Slope => {}
+                }
+            }
+            if self.pos_unclear {
+                self.mv(to.extend(self.pos.z), 0.0, speed, MoveKind::Travel);
+                let z_speed = self.z_speed();
+                self.mv(to.extend(target), 0.0, z_speed, MoveKind::Travel);
+            } else {
+                self.mv(to.extend(target), 0.0, speed, MoveKind::Lifted);
+            }
+        } else if !force_z {
+            self.mv(to.extend(self.pos.z), 0.0, speed, MoveKind::Travel);
+        } else if self.pos_unclear {
+            self.mv(to.extend(self.pos.z), 0.0, speed, MoveKind::Travel);
+            let z_speed = self.z_speed();
+            self.mv(to.extend(nominal), 0.0, z_speed, MoveKind::Travel);
+            self.hop = 0.0;
+        } else {
+            self.mv(to.extend(nominal), 0.0, speed, MoveKind::Lifted);
+            self.hop = 0.0;
+        }
+        self.pos_unclear = false;
+    }
+
     fn lift_now(&mut self) {
         if self.hop > 0.0 || !self.may_lift() {
             return;
         }
         let hop = self.s().retract.z_hop;
         let to = self.pos + DVec3::Z * hop;
-        self.mv(to, 0.0, self.s().speeds.travel_z.max(5.0), MoveKind::Travel);
+        self.mv(to, 0.0, self.z_speed(), MoveKind::Travel);
         self.hop = hop;
     }
 
@@ -521,7 +686,7 @@ impl<'a> Writer<'a> {
         let r = self.retraction();
         if self.hop > 0.0 {
             let to = DVec3::new(self.pos.x, self.pos.y, self.print_z);
-            self.mv(to, 0.0, self.s().speeds.travel_z.max(5.0), MoveKind::Travel);
+            self.mv(to, 0.0, self.z_speed(), MoveKind::Travel);
             self.hop = 0.0;
         }
         if self.retracted {
@@ -543,13 +708,14 @@ impl<'a> Writer<'a> {
     fn travel(&mut self, to: DVec2, next: Role) {
         let from = self.pos.truncate();
         let d = from.distance(to);
-        if d < 1.0e-4 && self.xy_known {
+        if d < 1.0e-4 && self.xy_known && !self.z_pending {
             return;
         }
         if !self.xy_known {
             // The first travel after the start G-code: straight there, lifted if lifting.
             self.retract();
             self.lift_now();
+            self.flush_labels();
             self.xy_known = true;
             let speed = self.travel_speed();
             let at = to.extend(self.print_z + self.hop);
@@ -573,35 +739,28 @@ impl<'a> Writer<'a> {
         let leaving_outer = matches!(self.role, Some(Role::OuterWall | Role::OverhangWall));
         let quiet = inside && m.reduce_infill_retraction && !next.is_wall() && self.s().density > 0.0;
         let retract = length > self.s().retract.min_travel && (leaving_outer || !quiet);
+        self.set_travel_dynamics(next, length < self.s().retract.min_travel);
         if retract {
             self.retract();
+            let kind = self.lift_kind();
+            self.want_lift(kind);
+        } else {
+            // Not wiping along an old path after a travel without retraction.
+            self.last_path.clear();
         }
-        self.set_dynamics(None);
+        self.flush_labels();
+        // The wipe may have moved the head.
+        if let Some(first) = route.first_mut() {
+            *first = self.pos.truncate();
+        }
+        let force = std::mem::take(&mut self.z_pending);
         let speed = self.travel_speed();
-        let lifting = retract && self.may_lift() && self.hop == 0.0;
-        let z = self.print_z;
-        let hop = self.s().retract.z_hop;
         for (i, p) in route.iter().enumerate().skip(1) {
-            let prev = route.get(i - 1).copied().unwrap_or(from);
-            if lifting && i == 1 && m.z_hop == ZHop::Slope {
-                // Rise along the start of the travel.
-                let rise_run = hop / m.travel_slope.to_radians().tan();
-                let seg = prev.distance(*p);
-                if seg > rise_run * 1.2 {
-                    let mid = prev + (*p - prev) * (rise_run / seg);
-                    self.mv(mid.extend(z + hop), 0.0, speed, MoveKind::Travel);
-                    self.hop = hop;
-                } else {
-                    self.lift_now();
-                }
-            } else if lifting && i == 1 {
-                self.lift_now();
+            if i == 1 {
+                self.travel_xyz(*p, force);
+            } else {
+                self.mv(p.extend(self.pos.z), 0.0, speed, MoveKind::Travel);
             }
-            let at = p.extend(z + self.hop);
-            self.mv(at, 0.0, speed, MoveKind::Travel);
-        }
-        if lifting && self.hop == 0.0 {
-            self.lift_now();
         }
         let pz = self.pos.z as f32;
         for w in route.windows(2) {
@@ -709,6 +868,7 @@ impl<'a> Writer<'a> {
         if let Some(r) = self.pending_region.take() {
             self.region = Some(r);
         }
+        self.flush_labels();
         self.unretract();
         if self.filament().is_none() {
             return;
@@ -719,7 +879,7 @@ impl<'a> Writer<'a> {
         // A scarf starts low: down to its first height before extruding.
         if let Some(first) = steps.first().filter(|st| st.dz < 0.0) {
             let to = start.extend(z + first.dz);
-            self.mv(to, 0.0, self.s().speeds.travel_z.max(5.0), MoveKind::Travel);
+            self.mv(to, 0.0, self.z_speed(), MoveKind::Travel);
         }
         self.set_dynamics(Some(path.role));
         let mut all: Vec<DVec2> = Vec::with_capacity(steps.len() + 1);
@@ -741,7 +901,7 @@ impl<'a> Writer<'a> {
         // Back to the layer's height and the layer's fan.
         if (self.pos.z - z).abs() > 1e-9 {
             let to = self.pos.truncate().extend(z);
-            self.mv(to, 0.0, self.s().speeds.travel_z.max(5.0), MoveKind::Travel);
+            self.mv(to, 0.0, self.z_speed(), MoveKind::Travel);
         }
         self.fan_for(0.0, Fan::Layer);
         if path.closed && path.role == Role::OuterWall {
@@ -782,11 +942,13 @@ impl<'a> Writer<'a> {
         let role = if over_air { Role::OverhangWall } else { path.role };
         if self.role != Some(role) {
             self.role = Some(role);
-            self.line(format!(";TYPE:{}", role.name()));
+            let tag = if s.bbl { "; FEATURE: " } else { ";TYPE:" };
+            self.line(format!("{tag}{}", role.name()));
         }
         if (self.width - path.width).abs() > 1.0e-4 {
             self.width = path.width;
-            self.line(format!(";WIDTH:{}", f3(path.width)));
+            let tag = if s.bbl { "; LINE_WIDTH: " } else { ";WIDTH:" };
+            self.line(format!("{tag}{}", f3(path.width)));
         }
         let mut base = path.speed;
         if path.role == Role::OuterWall
@@ -1051,11 +1213,18 @@ impl<'a> Writer<'a> {
                 continue;
             }
             let name = cx.object_names.get(*o).map_or_else(String::new, |n| n.replace(['\n', '\r'], " "));
-            self.line(format!("; printing object {name}"));
-            if labels && m.flavor == Flavor::Klipper && m.exclude_object {
-                self.line(format!("EXCLUDE_OBJECT_START NAME={}", label(&name, *o)));
+            let bbl = cx.settings.bbl;
+            if cx.settings.label_objects {
+                self.line(format!("; printing object {name} id:{o} copy 0"));
+            }
+            // OrcaSlicer opens and closes object labels with the travels round them.
+            if labels && bbl {
+                self.label_start =
+                    Some(format!("; start printing object, unique label id: {o}\nM624 {}", label_mask(*o)));
+            } else if labels && m.flavor == Flavor::Klipper && m.exclude_object {
+                self.label_start = Some(format!("EXCLUDE_OBJECT_START NAME={}", label(&name, *o)));
             } else if labels && matches!(m.flavor, Flavor::Marlin | Flavor::Marlin2) {
-                self.line(format!("M486 S{o}"));
+                self.label_start = Some(format!("M486 S{o}"));
             }
             while !remaining.is_empty() {
                 let here = self.pos.truncate();
@@ -1078,10 +1247,15 @@ impl<'a> Writer<'a> {
                 let island = remaining.swap_remove(next);
                 self.island(island, *o);
             }
-            if labels && m.flavor == Flavor::Klipper && m.exclude_object {
-                self.line(format!("EXCLUDE_OBJECT_END NAME={}", label(&name, *o)));
+            if cx.settings.label_objects {
+                self.line(format!("; stop printing object {name} id:{o} copy 0"));
+            }
+            if labels && bbl {
+                self.label_end = Some(format!("; stop printing object, unique label id: {o}\nM625"));
+            } else if labels && m.flavor == Flavor::Klipper && m.exclude_object {
+                self.label_end = Some(format!("EXCLUDE_OBJECT_END NAME={}", label(&name, *o)));
             } else if labels && matches!(m.flavor, Flavor::Marlin | Flavor::Marlin2) {
-                self.line("M486 S-1");
+                self.label_end = Some("M486 S-1".to_owned());
             }
         }
     }
@@ -1250,6 +1424,8 @@ impl<'a> Writer<'a> {
         if f.slow_down && total < target && !moves.is_empty() {
             cap = slow_down_cap(&moves, target - total, f.slow_down_min_speed).unwrap_or(f.slow_down_min_speed);
             time += moves.iter().map(|(len, v)| len / v.min(cap) - len / v).sum::<f64>();
+            // OrcaSlicer writes a slowed-down feed as whole mm/min.
+            cap = (cap * 60.0).round() / 60.0;
         }
         let fan = layer_fan(f, time, self.fan_ramp);
         for op in self.ops.get_mut(from..).into_iter().flatten() {
@@ -1505,6 +1681,25 @@ fn rear_index(points: &[DVec2]) -> usize {
         .map_or(0, |(i, _)| i)
 }
 
+/// Object `o`'s bit, as the 64-bit mask in base 64 that Bambu Lab's M624 takes.
+fn label_mask(o: usize) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mask = if o < 64 { 1u64 << o } else { 0 };
+    let bytes = mask.to_le_bytes();
+    let mut out = String::with_capacity(12);
+    for chunk in bytes.chunks(3) {
+        let b0 = u32::from(chunk.first().copied().unwrap_or(0));
+        let b1 = u32::from(chunk.get(1).copied().unwrap_or(0));
+        let b2 = u32::from(chunk.get(2).copied().unwrap_or(0));
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        for (i, shift) in [18u32, 12, 6, 0].into_iter().enumerate() {
+            let c = ALPHABET.get(((n >> shift) & 63) as usize).copied().unwrap_or(b'A');
+            out.push(if i > chunk.len() { '=' } else { char::from(c) });
+        }
+    }
+    out
+}
+
 fn fan_command(percent: f64) -> String {
     let s = (percent.clamp(0.0, 100.0) * 2.55).round() as i64;
     if s == 0 { "M107".into() } else { format!("M106 S{s}") }
@@ -1638,6 +1833,11 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         role: None,
         width: 0.0,
         extruder: cx.object_extruder.first().copied().unwrap_or(0).min(n_ext - 1),
+        to_lift: None,
+        z_pending: false,
+        pos_unclear: false,
+        label_end: None,
+        label_start: None,
         out_fan: (0.0, Fan::Exact),
         fan_ramp: 0.0,
         seg_fans: Vec::new(),
@@ -1819,7 +2019,7 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
             w.retract();
             let safe = (highest + 2.0).min(s.max_print_height.max(highest));
             let up = DVec3::new(w.pos.x, w.pos.y, safe);
-            w.mv(up, 0.0, s.speeds.travel_z.max(5.0), MoveKind::Travel);
+            w.mv(up, 0.0, w.z_speed(), MoveKind::Travel);
             let start = plan
                 .objects
                 .iter()
@@ -1831,23 +2031,32 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
             }
         }
         highest = highest.max(plan.print_z);
-        w.line(";LAYER_CHANGE");
-        w.line(format!(";Z:{}", f3(plan.print_z)));
-        w.line(format!(";HEIGHT:{}", f3(plan.height)));
+        w.line(if s.bbl { "; CHANGE_LAYER" } else { ";LAYER_CHANGE" });
+        w.line(format!("{}{}", if s.bbl { "; Z_HEIGHT: " } else { ";Z:" }, f3(plan.print_z)));
+        w.line(format!("{}{}", if s.bbl { "; LAYER_HEIGHT: " } else { ";HEIGHT:" }, f3(plan.height)));
         let before = render("Before layer change G-code", &s.gcode.before_layer, &layer_vars);
-        if !before.trim().is_empty() {
-            w.line(before.trim_end().to_owned());
+        if !before.is_empty() {
+            w.line(before);
         }
         w.ops.push(Op::Layer(li));
+        // No Z move here: as in OrcaSlicer the first travel of the layer takes it there.
         if s.retract.on_layer_change {
             w.retract();
+            let kind = if s.motion.z_hop == ZHop::Auto { Lift::Spiral } else { w.lift_kind() };
+            w.want_lift(kind);
         }
-        let to = DVec3::new(w.pos.x, w.pos.y, plan.print_z);
-        w.mv(to, 0.0, s.speeds.travel_z.max(5.0), MoveKind::Travel);
+        if let Some(t) = w.label_end.take() {
+            w.line(t);
+        }
+        w.z_pending = true;
         w.hop = 0.0;
+        if !s.bbl && !s.gcode.timelapse.is_empty() {
+            let t = render("Timelapse G-code", &s.gcode.timelapse, &layer_vars);
+            w.line(t);
+        }
         let after = render("Layer change G-code", &s.gcode.layer_change, &layer_vars);
-        if !after.trim().is_empty() {
-            w.line(after.trim_end().to_owned());
+        if !after.is_empty() {
+            w.line(after);
         }
         if let Some(c) = cx.calib {
             let jd = s.motion.limits.junction_deviation > 0.0;
@@ -1872,12 +2081,34 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
             }
         }
         // The layer's fan; its speed is settled with the layer's cooling, once it is written.
+        w.line(";_SET_FAN_SPEED_CHANGING_LAYER");
         let fil = w.filament().cloned();
         w.fan_ramp = fil.as_ref().map_or(0.0, |f| fan_ramp(f, li));
         let cool_from = (w.ops.len(), w.pos);
         w.seg_fans.clear();
         w.out_fan = (0.0, Fan::Exact);
         w.fan_for(0.0, Fan::Layer);
+        // Bambu Lab's core-XY printers take their timelapse picture here, lifted on a helix.
+        if s.bbl && !s.i3 && n_ext == 1 {
+            if s.retract.on_layer_change {
+                w.retract();
+                w.eager_lift();
+            }
+            if !s.gcode.timelapse.is_empty() {
+                let mut vars = layer_vars.to_vec();
+                vars.extend([
+                    ("max_layer_z", Value::Num(highest)),
+                    ("most_used_physical_extruder_id", Value::Num(0.0)),
+                    ("curr_physical_extruder_id", Value::Num(0.0)),
+                    ("timelapse_pos_x", Value::Num(0.0)),
+                    ("timelapse_pos_y", Value::Num(0.0)),
+                    ("has_timelapse_safe_pos", Value::Bool(false)),
+                ]);
+                let t = render("Timelapse G-code", &s.gcode.timelapse, &vars);
+                w.line(t);
+                w.pos_unclear = true;
+            }
+        }
 
         // Pauses, colour changes and custom G-code asked for at this layer.
         for (_, ev) in cx.events.iter().filter(|(z, _)| (z - plan.print_z).abs() < plan.height * 0.5) {
@@ -1960,6 +2191,7 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
 
     // ---- end ----
     w.retract();
+    w.flush_labels();
     w.set_fan(0.0);
     let end = render("Machine end G-code", &s.gcode.end, &[]);
     w.line("; machine end G-code");
@@ -1978,7 +2210,7 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
                     *slot += t;
                 }
             }
-            Op::Move { .. } | Op::FirmwareRetract { .. } => stats.travel_time += t,
+            Op::Move { .. } | Op::FirmwareRetract { .. } | Op::Spiral { .. } => stats.travel_time += t,
             // Custom G-code: the start and end sequences, layer change, filament change.
             Op::Text(_) => {
                 if let Some(slot) = stats.time_by_role.get_mut(Role::Custom.index()) {
@@ -2067,7 +2299,7 @@ fn time_ops(ops: &[Op], s: &Settings) -> Vec<f64> {
                 let bk = match kind {
                     MoveKind::Extrude(_) => BlockKind::Extrude,
                     MoveKind::Retract => BlockKind::Retract,
-                    MoveKind::Travel | MoveKind::Wipe => BlockKind::Travel,
+                    MoveKind::Travel | MoveKind::Lifted | MoveKind::Wipe => BlockKind::Travel,
                 };
                 st.pos = *to;
                 let b = Block {
@@ -2089,6 +2321,21 @@ fn time_ops(ops: &[Op], s: &Settings) -> Vec<f64> {
                     feed: *feed,
                     accel: st.accel,
                     kind: BlockKind::Retract,
+                    jerk: st.jerk,
+                    dwell: 0.0,
+                };
+                (Some(b), "")
+            }
+            Op::Spiral { z, i, j, feed } => {
+                let length = std::f64::consts::TAU * i.hypot(*j);
+                let dz = *z - st.pos.z;
+                st.pos.z = *z;
+                let b = Block {
+                    delta: [0.0, 0.0, dz, 0.0],
+                    length: Some(length.hypot(dz)),
+                    feed: *feed,
+                    accel: st.accel,
+                    kind: BlockKind::Travel,
                     jerk: st.jerk,
                     dwell: 0.0,
                 };
@@ -2135,7 +2382,23 @@ fn render_ops(out: &mut String, ops: &[Op], times: &[f64], total: f64, s: &Setti
             Op::Text(text) => {
                 line(out, text);
                 // Custom G-code may have set the fan itself.
-                last_fan = None;
+                if text.contains("M106") || text.contains("M107") {
+                    last_fan = None;
+                }
+            }
+            Op::Spiral { z, i, j, feed: f } => {
+                out.push_str("G17\nG3 Z");
+                push_num(out, *z + s.z_offset, 3);
+                out.push_str(" I");
+                push_num(out, *i, 3);
+                out.push_str(" J");
+                push_num(out, *j, 3);
+                out.push_str(" P1  F");
+                let fm = (f * 60.0).max(1.0);
+                push_num(out, fm, 3);
+                out.push('\n');
+                feed = fm;
+                pos.z = *z;
             }
             Op::Fan(f, _) => {
                 let command = fan_command(*f);
@@ -2156,22 +2419,31 @@ fn render_ops(out: &mut String, ops: &[Op], times: &[f64], total: f64, s: &Setti
             }
             Op::Move { to, e, feed: f, kind, arc, xy } => {
                 // Written straight into the text (millions of moves); dropped again if it
-                // says nothing.
+                // says nothing. As OrcaSlicer writes them: extrusions and wipes set their
+                // speed on a line of their own, and any move in the plane names X and Y.
+                let fm = (f * 60.0).max(1.0);
+                let changed = (fm - feed).abs() > 5e-4;
+                if changed && matches!(kind, MoveKind::Extrude(_) | MoveKind::Wipe) {
+                    out.push_str("G1 F");
+                    push_num(out, fm, 3);
+                    out.push('\n');
+                    feed = fm;
+                }
                 let start = out.len();
                 out.push_str(match arc {
                     Some((_, true)) => "G3",
                     Some((_, false)) => "G2",
                     None => "G1",
                 });
-                if *xy && ((to.x - pos.x).abs() > 5e-4 || pos.x.is_nan() || arc.is_some()) {
+                let planar = (to.x - pos.x).abs() > 5e-4 || (to.y - pos.y).abs() > 5e-4;
+                if *xy && (planar || pos.x.is_nan() || pos.y.is_nan() || arc.is_some()) {
                     out.push_str(" X");
                     push_num(out, to.x, 3);
-                }
-                if *xy && ((to.y - pos.y).abs() > 5e-4 || pos.y.is_nan() || arc.is_some()) {
                     out.push_str(" Y");
                     push_num(out, to.y, 3);
                 }
-                if (to.z - pos.z).abs() > 5e-4 || (pos.z.is_nan() && *kind != MoveKind::Retract) {
+                let named_z = *kind == MoveKind::Lifted;
+                if named_z || (to.z - pos.z).abs() > 5e-4 || (pos.z.is_nan() && *kind != MoveKind::Retract) {
                     out.push_str(" Z");
                     push_num(out, to.z + s.z_offset, 3);
                 }
@@ -2190,12 +2462,12 @@ fn render_ops(out: &mut String, ops: &[Op], times: &[f64], total: f64, s: &Setti
                         push_num(out, e_abs, 5);
                     }
                 }
-                let fm = (f * 60.0).round().max(1.0);
-                if (fm - feed).abs() > 0.5 {
-                    let _ = write!(out, " F{}", fm as i64);
-                    feed = fm;
-                }
                 if out.len() - start > 2 {
+                    if (fm - feed).abs() > 5e-4 {
+                        out.push_str(" F");
+                        push_num(out, fm, 3);
+                        feed = fm;
+                    }
                     out.push('\n');
                 } else {
                     out.truncate(start);

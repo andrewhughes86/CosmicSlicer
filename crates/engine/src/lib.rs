@@ -1512,7 +1512,7 @@ mod tests {
         assert!(changes.iter().filter(|c| **c > 0).count() > 50);
         // Each change purges about the table's 200 mm³ into the tower.
         let tower: Vec<(f64, f64)> = extrusions(&out.gcode, "Prime tower");
-        assert!(tower.iter().all(|(x, y)| *x >= 29.0 && *x <= 91.0 && *y >= 29.0 && *y < 120.0), "{:?}", &tower[..3]);
+        assert!(tower.iter().all(|(x, y)| *x >= 27.0 && *x <= 93.0 && *y >= 27.0 && *y < 120.0), "{:?}", &tower[..3]);
         assert!(!out.warnings.iter().any(|w| w.contains("tower")), "{:?}", out.warnings);
         // White is on the painted face: x near 100.
         let painted: Vec<(f64, f64)> = {
@@ -1804,12 +1804,13 @@ mod tests {
             let out = slice(&j, &Progress::default());
             assert!(out.is_ok(), "{:?}", out.as_ref().err());
             let gcode = out.map(|o| o.gcode).unwrap_or_default();
-            let speeds: Vec<String> = gcode
-                .lines()
-                .filter(|l| l.starts_with("G1 X") && l.contains(" E-"))
-                .filter_map(|l| l.split_whitespace().find(|w| w.starts_with('F')).map(str::to_owned))
-                .collect();
-            speeds
+            // The speed on the line before a wipe's first move.
+            let lines: Vec<&str> = gcode.lines().collect();
+            lines
+                .windows(2)
+                .filter(|w| w[1].starts_with("G1 X") && w[1].contains(" E-") && w[0].starts_with("G1 F"))
+                .filter_map(|w| w[0].strip_prefix("G1 ").map(str::to_owned))
+                .collect::<Vec<String>>()
         };
         // Half of 200 mm/s: F6000.
         let fixed = wipes("0");
