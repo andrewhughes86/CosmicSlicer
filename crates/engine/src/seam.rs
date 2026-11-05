@@ -72,7 +72,7 @@ impl Setup {
 // ---- std's random numbers, as libstdc++ draws them ---------------------------------------
 
 /// `std::mt19937_64`.
-struct Mt64 {
+pub(crate) struct Mt64 {
     state: Vec<u64>,
     at: usize,
 }
@@ -81,7 +81,7 @@ impl Mt64 {
     const N: usize = 312;
     const M: usize = 156;
 
-    fn new(seed: u64) -> Mt64 {
+    pub(crate) fn new(seed: u64) -> Mt64 {
         let mut state = Vec::with_capacity(Self::N);
         let mut last = seed;
         state.push(last);
@@ -92,7 +92,7 @@ impl Mt64 {
         Mt64 { state, at: Self::N }
     }
 
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         const UPPER: u64 = 0xFFFF_FFFF_8000_0000;
         const LOWER: u64 = 0x7FFF_FFFF;
         if self.at >= Self::N {
@@ -121,7 +121,7 @@ impl Mt64 {
     }
 
     /// `std::uniform_int_distribution<size_t>{0, range - 1}` (Lemire's method).
-    fn below(&mut self, range: u64) -> u64 {
+    pub(crate) fn below(&mut self, range: u64) -> u64 {
         let mut wide = u128::from(self.next()) * u128::from(range);
         if (wide as u64) < range {
             let threshold = range.wrapping_neg() % range.max(1);

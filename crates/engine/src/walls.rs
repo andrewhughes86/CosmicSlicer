@@ -43,7 +43,7 @@ struct Flows {
 }
 
 /// `Flow::rounded_rectangle_extrusion_spacing`, in Orca's floats.
-fn flow_spacing(width: f32, height: f32) -> f32 {
+pub fn flow_spacing(width: f32, height: f32) -> f32 {
     width - height * (1.0 - 0.25 * std::f64::consts::PI) as f32
 }
 

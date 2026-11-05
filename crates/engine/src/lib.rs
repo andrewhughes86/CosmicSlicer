@@ -26,6 +26,7 @@ pub mod medial;
 pub mod motion;
 pub mod overhang;
 pub mod plan;
+pub mod rectilinear;
 pub mod seam;
 pub mod segment;
 pub mod settings;

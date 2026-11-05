@@ -211,9 +211,16 @@ pub fn fill_with(area: &[Shape], kind: Kind, p: &Params) -> Vec<Line> {
     if area.is_empty() || !(d > 0.0 && w > 0.0 && w.is_finite() && p.angle.is_finite() && p.z.is_finite()) {
         return Vec::new();
     }
+    if let Some(job) = rectilinear_job(kind, p) {
+        return area
+            .iter()
+            .flat_map(|shape| crate::rectilinear::fill(&geom::paths_of(shape), &job).unwrap_or_default().lines)
+            .map(|l| Line { points: geom::from_nm(&l), closed: false, ordered: job.monotonic })
+            .filter(|l| l.points.len() >= 2)
+            .collect();
+    }
     let bead = if p.height > 0.0 && p.height.is_finite() { crate::settings::Settings::spacing(w, p.height) } else { w };
     let s = bead / d;
-    let source = area;
     // Loops already start half a line in.
     let shrunk;
     let area = if !p.inset || matches!(kind, Kind::Concentric | Kind::SpiralInset) {
@@ -226,14 +233,14 @@ pub fn fill_with(area: &[Shape], kind: Kind, p: &Params) -> Vec<Line> {
     let a = p.angle;
     // Solid fills sit half a line off the grid (OrcaSlicer's), so a square's lines are centred;
     // fitted ones are spread over the region instead, half a line in from its edge.
-    let (s, half) = fitted(source, kind, turned, p, s).unwrap_or((s, if d >= 0.9999 { s / 2.0 } else { 0.0 }));
+    let half = if d >= 0.9999 { s / 2.0 } else { 0.0 };
     // OrcaSlicer links rectilinear lines along the edge: up to three lines' spacing for solid
     // fills, however far for sparse ones.
     let link = if d > 0.8 && !p.bridge { 3.0 * bead } else { f64::INFINITY };
     let mut lines = match kind {
         Kind::Rectilinear { alternate } => parallel(area, s, if alternate { turned(a) } else { a }, half, w, link),
-        Kind::Monotonic => monotonic(area, s, turned(a), half, w, link),
-        Kind::MonotonicLine => monotonic_lines(area, s, turned(a), half, w),
+        Kind::Monotonic => parallel(area, s, turned(a), half, w, link),
+        Kind::MonotonicLine => rows(area, s, turned(a), half, w).into_iter().map(Line::open).collect(),
         Kind::Line => rows(area, s, turned(a), half, w).into_iter().map(Line::open).collect(),
         Kind::Grid => directions(area, w, s * 2.0, &[(a, 0.0), (a + FRAC_PI_2, 0.0)]),
         Kind::Triangles | Kind::Lightning => {
@@ -281,11 +288,6 @@ pub fn fill_with(area: &[Shape], kind: Kind, p: &Params) -> Vec<Line> {
         Kind::Archimedean => archimedean(area, s),
         Kind::Octagram => octagram(area, s),
     };
-    // Lines that end free run on to the outer contour: OrcaSlicer's lines stop nearly at the
-    // region's edge (a twentieth of a spacing in), its links half a spacing in.
-    if p.anchor <= 0.0 && p.inset && matches!(kind, Kind::Rectilinear { .. } | Kind::Monotonic | Kind::MonotonicLine) {
-        extend_ends(&mut lines, &geom::offset(source, -0.05 * bead / d.max(1e-6), Join::Miter), bead * 20.0);
-    }
     if p.anchor > 0.0 && !(p.anchor_max >= 0.05 && matches!(kind, Kind::CrossHatch)) {
         // Never so long that neighbouring anchors meet.
         anchor_ends(&mut lines, area, p.anchor.min(s * 0.45), w * 0.25);
@@ -294,59 +296,49 @@ pub fn fill_with(area: &[Shape], kind: Kind, p: &Params) -> Vec<Line> {
     lines
 }
 
+/// What Orca's `fill_surface_by_lines` needs, for the object fills that go through it.
+/// `spacing` is the flow's, in Orca's floats.
+fn rectilinear_job(kind: Kind, p: &Params) -> Option<crate::rectilinear::Job> {
+    let (monotonic, line) = match kind {
+        Kind::Rectilinear { .. } => (false, false),
+        Kind::Monotonic => (true, false),
+        Kind::MonotonicLine => (true, true),
+        _ => return None,
+    };
+    if !p.inset {
+        return None;
+    }
+    let spacing = if p.height > 0.0 && p.height.is_finite() {
+        f64::from(crate::walls::flow_spacing(p.width as f32, p.height as f32))
+    } else {
+        p.width
+    };
+    let alternate = !matches!(kind, Kind::Rectilinear { alternate: false });
+    Some(crate::rectilinear::Job {
+        spacing,
+        density: p.density.min(1.0) as f32,
+        angle: crate::rectilinear::direction(p.angle, alternate && p.turn_by_layer && p.layer % 2 == 1),
+        dont_connect: line || (!p.fit_solid && !p.bridge && p.anchor_max < 0.05),
+        monotonic,
+        dont_adjust: !p.fit_solid && p.bridge,
+    })
+}
+
 /// The patterns made of straight lines across the region.
 pub fn is_line_pattern(kind: Kind) -> bool {
     matches!(kind, Kind::Rectilinear { .. } | Kind::Monotonic | Kind::MonotonicLine | Kind::Line)
 }
 
-/// OrcaSlicer's solid spacing adjustment: the lines spread evenly over the region's width
-/// across them (at most 20 % further apart), the first half a line in. (spacing, phase).
-///
-/// `area` is the region before lines are kept half a line in from it, and the numbers are the
-/// nanometre integers Orca computes in.
-fn fitted(area: &[Shape], kind: Kind, turned: impl Fn(f64) -> f64, p: &Params, s: f64) -> Option<(f64, f64)> {
-    const NM: f64 = 1e6;
-    if !p.fit_solid || p.density < 0.9999 || !is_line_pattern(kind) {
-        return None;
-    }
-    let a = match kind {
-        Kind::Rectilinear { alternate: false } => p.angle,
-        _ => turned(p.angle),
-    };
-    let normal = DVec2::new(a.cos(), a.sin()).perp();
-    let (lo, hi) = area.iter().flatten().flatten().fold((f64::MAX, f64::MIN), |(lo, hi), q| {
-        let d = (q.dot(normal) * NM).round();
-        (lo.min(d), hi.max(d))
-    });
-    let width = hi - lo;
-    let spacing = (s * NM).trunc();
-    if !(width > 0.0 && width.is_finite() && spacing > 0.0) {
-        return None;
-    }
-    let intervals = ((width - 1e-4) / spacing).trunc();
-    let mut fit = if intervals < 1.0 { spacing } else { ((width - 1e-4) / intervals).trunc() };
-    if fit / spacing > 1.2 {
-        fit = (spacing * 1.2 + 0.5).floor();
-    }
-    let first = lo + ((fit + 100.0) / 2.0).trunc();
-    Some((fit / NM, (first / NM).rem_euclid(fit / NM)))
-}
-
-/// The line width a solid fill of `area` prints at: OrcaSlicer widens the lines by what
-/// [`fitted`] spread them apart, so the fill stays solid. `area` is one region.
+/// The line width a solid fill of `area` (one region) prints at: Orca widens the lines by what
+/// it spread them apart, so the fill stays solid.
 pub fn solid_width(area: &[Shape], kind: Kind, p: &Params) -> f64 {
-    if !p.width.is_finite() || p.width <= 0.0 {
-        return p.width;
-    }
-    let bead = if p.height > 0.0 && p.height.is_finite() {
-        crate::settings::Settings::spacing(p.width, p.height)
-    } else {
-        p.width
-    };
-    let turned = |a: f64| if p.turn_by_layer && p.layer % 2 == 1 { a + FRAC_PI_2 } else { a };
     let moved: Vec<Shape> =
         area.iter().map(|sh| sh.iter().map(|c| c.iter().map(|q| *q - p.origin).collect()).collect()).collect();
-    fitted(&moved, kind, turned, p, bead).map_or(p.width, |(fit, _)| p.width + fit - bead)
+    match (rectilinear_job(kind, p), moved.first()) {
+        (Some(job), Some(shape)) if p.fit_solid => crate::rectilinear::spacing_of(&geom::paths_of(shape), &job)
+            .map_or(p.width, |fit| p.width + fit - job.spacing),
+        _ => p.width,
+    }
 }
 
 /// Turns `p` by `angle`.
@@ -765,109 +757,6 @@ fn parallel(area: &[Shape], spacing: f64, a: f64, phase: f64, width: f64, link: 
 /// Parallel lines in several directions, each `(angle, phase)`.
 fn directions(area: &[Shape], width: f64, spacing: f64, dirs: &[(f64, f64)]) -> Vec<Line> {
     dirs.iter().flat_map(|&(a, phase)| parallel(area, spacing, a, phase.rem_euclid(spacing), width, 0.0)).collect()
-}
-
-/// Monotonic: lines joined zig-zag, printed in order across the region, starting from the far
-/// end of the first (OrcaSlicer's regions start at the low end of its upright frame, which
-/// looks down the lines' direction).
-fn monotonic(area: &[Shape], spacing: f64, a: f64, phase: f64, width: f64, link: f64) -> Vec<Line> {
-    let pieces = rows(area, spacing, a, phase, width);
-    let around = Around::new(area, spacing * 1.9, link);
-    let mut out: Vec<Line> = regions(pieces, a, spacing, phase)
-        .into_iter()
-        .flat_map(|mut r| {
-            if !start_flipped(&r)
-                && let Some(first) = r.first_mut()
-            {
-                first.reverse();
-            }
-            join_zigzag(r, &around, spacing * 1.9, link)
-        })
-        .collect();
-    for l in &mut out {
-        l.ordered = true;
-    }
-    out
-}
-
-/// Whether a monotonic region's rows, running along their direction, start at their near end.
-/// OrcaSlicer searches for the shortest order with a fixed seed; for one region that comes to
-/// starting from the far end, unless the near end makes the steps between rows shorter.
-fn start_flipped(rows: &[Polyline]) -> bool {
-    let steps = |far_first: bool| -> f64 {
-        rows.windows(2)
-            .enumerate()
-            .map(|(i, w)| {
-                // Row `i` ends at its far end when it started at the near one.
-                let ends_far = (i % 2 == 0) != far_first;
-                let end = if ends_far { w[0].last() } else { w[0].first() };
-                let start = if ends_far { w[1].last() } else { w[1].first() };
-                end.zip(start).map_or(0.0, |(a, b)| a.distance(*b))
-            })
-            .sum()
-    };
-    steps(true) > steps(false)
-}
-
-/// Monotonic lines: in order across the region, turn about, unlinked.
-fn monotonic_lines(area: &[Shape], spacing: f64, a: f64, phase: f64, width: f64) -> Vec<Line> {
-    let pieces = rows(area, spacing, a, phase, width);
-    regions(pieces, a, spacing, phase)
-        .into_iter()
-        .flat_map(|r| {
-            let start = usize::from(!start_flipped(&r));
-            r.into_iter().enumerate().map(move |(i, mut l)| {
-                if (i + start) % 2 == 1 {
-                    l.reverse();
-                }
-                Line { points: l, closed: false, ordered: true }
-            })
-        })
-        .collect()
-}
-
-/// Runs each open line's two ends straight on until they meet `outer`, at most `reach`.
-fn extend_ends(lines: &mut [Line], outer: &[Shape], reach: f64) {
-    let edges: Vec<(DVec2, DVec2)> = outer
-        .iter()
-        .flatten()
-        .flat_map(|c| (0..c.len()).filter_map(|i| Some((*c.get(i)?, *c.get((i + 1) % c.len())?))))
-        .collect();
-    let extended = |end: DVec2, inner: DVec2| {
-        let dir = (end - inner).normalize_or_zero();
-        let mut best = reach;
-        for (a, b) in &edges {
-            let side = *b - *a;
-            let det = dir.perp_dot(side);
-            if det.abs() < 1e-12 {
-                continue;
-            }
-            let t = (*a - end).perp_dot(side) / det;
-            let u = (*a - end).perp_dot(dir) / det;
-            if t > 1e-9 && t < best && (0.0..=1.0).contains(&u) {
-                best = t;
-            }
-        }
-        if best < reach { end + dir * best } else { end }
-    };
-    for l in lines.iter_mut().filter(|l| !l.closed) {
-        let n = l.points.len();
-        if n < 2 {
-            continue;
-        }
-        if let (Some(&end), Some(&inner)) = (l.points.first(), l.points.get(1)) {
-            let to = extended(end, inner);
-            if let Some(p) = l.points.first_mut() {
-                *p = to;
-            }
-        }
-        if let (Some(&end), Some(&inner)) = (l.points.get(n - 1), l.points.get(n - 2)) {
-            let to = extended(end, inner);
-            if let Some(p) = l.points.last_mut() {
-                *p = to;
-            }
-        }
-    }
 }
 
 /// Cubic: `dirs` directions over 180°, each sliding with height so the lines build tilted
@@ -1926,7 +1815,10 @@ mod tests {
     #[test]
     fn monotonic_lines_sweep_across_in_order() {
         // OrcaSlicer's monotonic lines: each on its own, across the square in order, turn about.
-        let lines = fill(&square(10.0), kind_of("monotonicline"), 0.42, 1.0, 0.0, 0, 0.0);
+        let mut p = Params::new(0.42, 1.0, 0.0, 0, 0.0);
+        p.inset = true;
+        p.fit_solid = true;
+        let lines = fill_with(&square(10.0), kind_of("monotonicline"), &p);
         assert!(lines.len() > 20 && lines.iter().all(|l| l.ordered && l.points.len() == 2), "{}", lines.len());
         let ys: Vec<f64> = lines.iter().flat_map(|l| l.points.iter().map(|p| p.y)).collect();
         assert!(ys.windows(2).all(|w| w[1] >= w[0] - 1e-9));

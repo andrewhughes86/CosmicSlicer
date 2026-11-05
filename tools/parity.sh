@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Parity check against OrcaSlicer (ROADMAP session 19).
 #
-#   tools/parity.sh <work dir> [profile set ...]      (sets: x1c mk4 voron; default all)
+#   tools/parity.sh <work dir> [profile set ...]      (sets: x2d x1c mk4 voron; default x2d)
 #
 # Writes the reference models to <work dir>/models (generated ones from parity_models.py, and
 # Orca's own handy models converted from Draco by Orca itself), slices each with OrcaSlicer's
@@ -22,7 +22,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 work=$(realpath -m "${1:?usage: tools/parity.sh <work dir> [profile set ...]}")
 shift
 sets=("$@")
-[ ${#sets[@]} -eq 0 ] && sets=(x1c mk4 voron)
+[ ${#sets[@]} -eq 0 ] && sets=(x2d)
 mkdir -p "$work/models"
 
 if [ -n "${ORCA:-}" ]; then
@@ -37,6 +37,7 @@ fi
 
 profile_set() {
     case "$1" in
+        x2d) echo "BBL/machine/Bambu Lab X2D 0.4 nozzle.json|BBL/process/0.20mm Standard @BBL X2D.json|BBL/filament/Bambu PLA Basic @BBL X2D 0.4 nozzle.json" ;;
         x1c) echo "BBL/machine/Bambu Lab X1 Carbon 0.4 nozzle.json|BBL/process/0.20mm Standard @BBL X1C.json|BBL/filament/Bambu PLA Basic @BBL X1C.json" ;;
         mk4) echo "Prusa/machine/Prusa MK4 0.4 nozzle.json|Prusa/process/0.20mm Standard @MK4.json|Prusa/filament/Prusa Generic PLA @MK4.json" ;;
         voron) echo "Voron/machine/Voron 2.4 350 0.4 nozzle.json|Voron/process/0.20mm Standard @Voron.json|OrcaFilamentLibrary/filament/Generic PLA @System.json" ;;

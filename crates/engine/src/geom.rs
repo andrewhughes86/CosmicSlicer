@@ -277,6 +277,35 @@ pub fn offset_loops(shapes: &[Shape], delta: f32) -> Paths {
     guarded(|| offset_shapes(shapes, delta, JoinType::Miter, 3.0))
 }
 
+/// Orca's `offset` of one expolygon (contour first), in Clipper's units.
+pub fn offset_shape_loops(shape: &[Path], delta: f32) -> Paths {
+    guarded(|| {
+        let mut out = Vec::new();
+        offset_shape(shape, delta, JoinType::Miter, 3.0, &mut out)?;
+        Ok(out)
+    })
+}
+
+/// Orca's `shrink` of polygons, by a positive `delta`, in Clipper's units.
+pub fn shrink_polygons(paths: &[Path], delta: f32) -> Paths {
+    guarded(|| {
+        let raw = raw_offset(paths, -delta, JoinType::Miter, 3.0)?;
+        if raw.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut c = Clipper::new();
+        c.add_paths(&raw, PolyType::Subject, true)?;
+        let rect = clipper::outer_rect(c.bounds());
+        c.add_path(&rect, PolyType::Subject, true)?;
+        c.reverse_solution(true);
+        let mut out = c.execute(ClipType::Union, FillType::Negative, FillType::Negative)?;
+        if !out.is_empty() {
+            out.remove(0);
+        }
+        Ok(out)
+    })
+}
+
 /// Orca's `offset` of polygons, to plain loops, in Clipper's units.
 pub fn offset_polygons(paths: &[Path], delta: f32) -> Paths {
     guarded(|| {
