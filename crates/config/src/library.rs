@@ -252,6 +252,8 @@ impl Library {
             }
             let value = match v {
                 Raw::Text(t) => t.clone(),
+                // A list of point lists, which Orca writes with '#' between them.
+                Raw::List(l) if k == "extruder_printable_area" => l.join("#"),
                 Raw::List(l) => l.join(","),
             };
             config.values.insert(k.clone(), value);

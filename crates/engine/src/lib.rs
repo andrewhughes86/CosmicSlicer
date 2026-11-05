@@ -35,6 +35,7 @@ pub mod slicing;
 pub mod support;
 pub mod surfaces;
 pub mod thumbnail;
+pub mod timelapse;
 pub mod toolpath;
 pub mod travel;
 pub mod tree;
@@ -798,7 +799,41 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
     // Seams: chosen for the whole of each object before anything is written.
     progress.set(0.85, "Placing seams");
     let seams = object_seams(job, &placed, &object_settings, &plans);
+    let numbers =
+        |key: &str| -> Vec<f64> { base.get(schema, key).split(',').filter_map(|v| v.trim().parse().ok()).collect() };
+    let indices = |key: &str| numbers(key).into_iter().map(|v| v as usize).collect::<Vec<usize>>();
+    let filament_map: Vec<usize> = indices("filament_map").into_iter().map(|v| v.saturating_sub(1)).collect();
+    let physical_extruders = indices("physical_extruder_map");
+    let picker = (!s.multi.by_object && s.multi.nozzles > 1).then(|| {
+        let points = |text: &str| -> Vec<glam::DVec2> {
+            CosmicSlicer_config::parse_points(text).into_iter().map(glam::DVec2::from).collect()
+        };
+        let objects = (0..outlines.len())
+            .filter_map(|o| {
+                let outline = outlines.get(o)?;
+                let first = *outline.first()?;
+                let (min, max) = outline.iter().fold((first, first), |(a, b), p| (a.min(*p), b.max(*p)));
+                let height =
+                    plans.iter().rev().find(|p| p.objects.iter().any(|(i, _)| *i == o)).map_or(0.0, |p| p.print_z);
+                Some(timelapse::Instance { min, max, height })
+            })
+            .collect();
+        let areas: Vec<Vec<glam::DVec2>> =
+            base.get(schema, "extruder_printable_area").split('#').map(points).filter(|a| a.len() >= 3).collect();
+        timelapse::Picker::new(
+            points(base.get(schema, "printable_area")),
+            &points(base.get(schema, "bed_exclude_area")),
+            &areas,
+            &numbers("extruder_printable_height"),
+            s.multi.clearance_radius,
+            objects,
+        )
+    });
     let cx = gcode::Context {
+        timelapse: picker.as_ref(),
+        most_used_extruder: filament_map.first().copied().unwrap_or(0),
+        filament_map: &filament_map,
+        physical_extruders: &physical_extruders,
         settings: &s,
         filaments: &filaments,
         object_extruder: &extruders,

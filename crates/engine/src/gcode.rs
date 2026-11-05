@@ -107,6 +107,24 @@ pub struct Context<'a> {
     pub bed_shape: String,
     /// Where each object's loops start.
     pub seams: &'a [Option<crate::seam::ObjectSeams>],
+    /// Where a printer with two nozzles parks for timelapse pictures.
+    pub timelapse: Option<&'a crate::timelapse::Picker>,
+    /// `filament_map`, 0-based: each filament's logical extruder.
+    pub filament_map: &'a [usize],
+    /// `physical_extruder_map`.
+    pub physical_extruders: &'a [usize],
+    /// The logical extruder that prints the most.
+    pub most_used_extruder: usize,
+}
+
+impl Context<'_> {
+    fn logical_extruder(&self, filament: usize) -> usize {
+        self.filament_map.get(filament).copied().unwrap_or(0)
+    }
+
+    fn physical(&self, logical: usize) -> usize {
+        self.physical_extruders.get(logical).copied().unwrap_or(logical)
+    }
 }
 
 /// Something asked for at a layer from the layer slider.
@@ -301,6 +319,7 @@ struct Writer<'a> {
     z_pending: bool,
     /// Custom G-code ran: the next travel goes across first, then down.
     pos_unclear: bool,
+    lifted_for_picture: bool,
     /// Object label to close, and to open, with the next travel.
     label_end: Option<String>,
     label_start: Option<String>,
@@ -486,14 +505,17 @@ impl<'a> Writer<'a> {
     }
 
     fn may_lift(&self) -> bool {
-        let m = &self.s().motion;
+        let r = self.retraction();
         let z = self.print_z;
-        self.s().retract.z_hop > 0.0 && z >= m.lift_above && (m.lift_below <= 0.0 || z <= m.lift_below)
+        r.z_hop > 0.0 && z >= r.lift_above && (r.lift_below <= 0.0 || z <= r.lift_below)
     }
 
     /// The retraction settings, with the retraction tower's length for this layer.
     fn retraction(&self) -> crate::settings::Retract {
         let mut r = self.s().retract;
+        if let Some(f) = self.filament() {
+            r = r.with(&f.retract);
+        }
         if let Some(l) = self.calib.retract_length {
             r.length = l;
         }
@@ -512,8 +534,8 @@ impl<'a> Writer<'a> {
         // length first, standing, then the rest spread over the wipe as it moves, but only as
         // much as the extruder can pull back at its retraction speed in the wipe's time; what
         // does not fit is retracted standing too.
-        if r.wipe && self.s().motion.wipe_distance > 0.0 && self.last_path.len() >= 2 {
-            let distance = self.s().motion.wipe_distance;
+        if r.wipe && r.wipe_distance > 0.0 && self.last_path.len() >= 2 {
+            let distance = r.wipe_distance;
             let mut wipe: Vec<DVec2> = Vec::new();
             let mut travelled = 0.0;
             let mut at = self.pos.truncate();
@@ -539,7 +561,7 @@ impl<'a> Writer<'a> {
             }
             .max(10.0);
             if travelled > 0.0 && !firmware {
-                let during = (r.length * (1.0 - m.retract_before_wipe)).min(r.speed * travelled / wipe_speed);
+                let during = (r.length * (1.0 - r.before_wipe)).min(r.speed * travelled / wipe_speed);
                 let before = r.length - during;
                 if before > 1e-6 {
                     let to = self.pos;
@@ -585,7 +607,7 @@ impl<'a> Writer<'a> {
 
     /// The lift for travels between paths.
     fn lift_kind(&self) -> Lift {
-        match self.s().motion.z_hop {
+        match self.retraction().z_hop_type {
             ZHop::Normal => Lift::Normal,
             ZHop::Spiral => Lift::Spiral,
             ZHop::Slope | ZHop::Auto => Lift::Slope,
@@ -612,7 +634,7 @@ impl<'a> Writer<'a> {
     /// A helix up by the hop at once (for custom G-code that runs lifted), OrcaSlicer's eager
     /// lift: a turn of the travel slope's pitch, centred to the head's right.
     fn eager_lift(&mut self) {
-        let hop = self.s().retract.z_hop;
+        let hop = self.retraction().z_hop;
         self.to_lift = None;
         if !self.may_lift() || hop <= 0.0 {
             return;
@@ -632,7 +654,7 @@ impl<'a> Writer<'a> {
         let speed = self.travel_speed();
         let nominal = self.print_z;
         if let Some(kind) = self.to_lift.take() {
-            let hop = self.s().retract.z_hop;
+            let hop = self.retraction().z_hop;
             let target = nominal + hop;
             let here = self.pos.truncate();
             let run = here.distance(to);
@@ -684,7 +706,7 @@ impl<'a> Writer<'a> {
         if self.hop > 0.0 || !self.may_lift() {
             return;
         }
-        let hop = self.s().retract.z_hop;
+        let hop = self.retraction().z_hop;
         let to = self.pos + DVec3::Z * hop;
         self.mv(to, 0.0, self.z_speed(), MoveKind::Travel);
         self.hop = hop;
@@ -699,7 +721,7 @@ impl<'a> Writer<'a> {
         }
         if self.retracted {
             // What was taken back, even if the length changed since (the retraction tower).
-            let length = self.retracted_by + self.s().motion.restart_extra;
+            let length = self.retracted_by + r.restart_extra;
             if self.s().motion.firmware_retraction {
                 self.ops.push(Op::FirmwareRetract { retract: false, length, feed: r.deretract_speed });
             } else {
@@ -746,8 +768,9 @@ impl<'a> Writer<'a> {
         let length = geom::length(&route);
         let leaving_outer = matches!(self.role, Some(Role::OuterWall | Role::OverhangWall));
         let quiet = inside && m.reduce_infill_retraction && !next.is_wall() && self.s().density > 0.0;
-        let retract = length > self.s().retract.min_travel && (leaving_outer || !quiet);
-        self.set_travel_dynamics(next, length < self.s().retract.min_travel);
+        let min_travel = self.retraction().min_travel;
+        let retract = length > min_travel && (leaving_outer || !quiet);
+        self.set_travel_dynamics(next, length < min_travel);
         if retract {
             self.retract();
             let kind = self.lift_kind();
@@ -1908,6 +1931,7 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         to_lift: None,
         z_pending: false,
         pos_unclear: false,
+        lifted_for_picture: false,
         label_end: None,
         label_start: None,
         out_fan: (0.0, Fan::Exact),
@@ -2136,16 +2160,19 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         }
         w.ops.push(Op::Layer(li));
         // No Z move here: as in OrcaSlicer the first travel of the layer takes it there.
-        if s.retract.on_layer_change {
+        if w.retraction().on_layer_change {
             w.retract();
-            let kind = if s.motion.z_hop == ZHop::Auto { Lift::Spiral } else { w.lift_kind() };
+            let kind = if w.retraction().z_hop_type == ZHop::Auto { Lift::Spiral } else { w.lift_kind() };
             w.want_lift(kind);
         }
         if let Some(t) = w.label_end.take() {
             w.line(t);
         }
         w.z_pending = true;
-        w.hop = 0.0;
+        // Still up from the picture at the end of the last layer, for the first travel to come down.
+        if !std::mem::take(&mut w.lifted_for_picture) {
+            w.hop = 0.0;
+        }
         if !s.bbl && !s.gcode.timelapse.is_empty() {
             let t = render("Timelapse G-code", &s.gcode.timelapse, &layer_vars);
             w.line(t);
@@ -2184,26 +2211,36 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         w.seg_fans.clear();
         w.out_fan = (0.0, Fan::Exact);
         w.fan_for(0.0, Fan::Layer);
-        // Bambu Lab's core-XY printers take their timelapse picture here, lifted on a helix.
-        if s.bbl && !s.i3 && n_ext == 1 {
-            if s.retract.on_layer_change {
+        // Bambu Lab's core-XY printers with one nozzle take their timelapse picture here, lifted
+        // on a helix; the rest at the end of the layer or before leaving the pictured nozzle.
+        let traditional = (s.bbl || !s.gcode.timelapse.is_empty()) && ((s.i3 && !s.spiral) || s.multi.nozzles > 1);
+        let mut pictured = false;
+        let snapshot = |w: &mut Writer<'_>, render: &mut dyn FnMut(&str, &str, &[(&str, Value)]) -> String| {
+            if w.retraction().on_layer_change {
                 w.retract();
                 w.eager_lift();
             }
-            if !s.gcode.timelapse.is_empty() {
-                let mut vars = layer_vars.to_vec();
-                vars.extend([
-                    ("max_layer_z", Value::Num(highest)),
-                    ("most_used_physical_extruder_id", Value::Num(0.0)),
-                    ("curr_physical_extruder_id", Value::Num(0.0)),
-                    ("timelapse_pos_x", Value::Num(0.0)),
-                    ("timelapse_pos_y", Value::Num(0.0)),
-                    ("has_timelapse_safe_pos", Value::Bool(false)),
-                ]);
-                let t = render("Timelapse G-code", &s.gcode.timelapse, &vars);
-                w.line(t);
-                w.pos_unclear = true;
+            w.flush_labels();
+            if s.gcode.timelapse.is_empty() {
+                return;
             }
+            let curr = cx.logical_extruder(w.extruder);
+            let at = cx.timelapse.map_or((0, 0), |t| t.pick(plan.print_z, cx.most_used_extruder, curr));
+            let mut vars = layer_vars.to_vec();
+            vars.extend([
+                ("max_layer_z", Value::Num(highest)),
+                ("most_used_physical_extruder_id", Value::Num(cx.physical(cx.most_used_extruder) as f64)),
+                ("curr_physical_extruder_id", Value::Num(cx.physical(curr) as f64)),
+                ("timelapse_pos_x", Value::Num(at.0 as f64)),
+                ("timelapse_pos_y", Value::Num(at.1 as f64)),
+                ("has_timelapse_safe_pos", Value::Bool(at != (0, 0))),
+            ]);
+            let t = render("Timelapse G-code", &s.gcode.timelapse, &vars);
+            w.line(t);
+            w.pos_unclear = true;
+        };
+        if s.bbl && !traditional {
+            snapshot(&mut w, &mut render);
         }
 
         // Pauses, colour changes and custom G-code asked for at this layer.
@@ -2228,6 +2265,11 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         let steps = layer_steps(plan, cx, n_ext, w.extruder);
         for (part, e) in steps {
             if e != w.extruder {
+                let leaving_pictured = cx.logical_extruder(w.extruder) == cx.most_used_extruder;
+                if traditional && !pictured && s.multi.nozzles == 2 && leaving_pictured {
+                    snapshot(&mut w, &mut render);
+                    pictured = true;
+                }
                 let from = w.extruder;
                 toolchanges += 1;
                 let change = crate::macros::ToolChange {
@@ -2270,6 +2312,10 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         }
         if w.tower.is_some() {
             w.tower_finish();
+        }
+        if traditional && !pictured {
+            snapshot(&mut w, &mut render);
+            w.lifted_for_picture = w.hop > 0.0;
         }
         if let Some(f) = &fil {
             w.cool_layer(cool_from, f, seg_start);
@@ -2583,6 +2629,8 @@ fn render_ops(out: &mut String, ops: &[Op], times: &[f64], total: f64, s: &Setti
                 }
             }
             Op::Layer(_) => {
+                // Orca's cooling buffer works layer by layer, so each repeats its first feed.
+                feed = -1.0;
                 let p = if total > 0.0 { (elapsed / total * 100.0).floor() as i64 } else { 0 };
                 let r = ((total - elapsed).max(0.0) / 60.0).round() as i64;
                 line(out, &format!("M73 P{} R{r}", p.clamp(0, 99)));

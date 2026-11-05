@@ -458,22 +458,14 @@ pub struct Motion {
     pub jerk_first_layer: f64,
     pub jerk_travel: f64,
     pub firmware_retraction: bool,
-    pub z_hop: ZHop,
-    /// Lift only between these heights (0 for "no limit" above).
-    pub lift_above: f64,
-    pub lift_below: f64,
     /// Degrees, for sloped lifts.
     pub travel_slope: f64,
-    pub wipe_distance: f64,
-    /// Share of the retraction done while wiping (0 to 1).
-    pub retract_before_wipe: f64,
     /// Wipes at the speed of what was just printed, else at `wipe_speed`.
     pub role_based_wipe: bool,
     /// Of the travel speed.
     pub wipe_speed: RelSpeed,
     /// After an outer loop, a small move inwards hides the seam.
     pub wipe_on_loops: bool,
-    pub restart_extra: f64,
     pub avoid_crossing_walls: bool,
     /// Longest detour avoiding walls may add (mm); 0 for no limit.
     pub max_detour: f64,
@@ -493,10 +485,110 @@ pub struct Retract {
     pub speed: f64,
     pub deretract_speed: f64,
     pub z_hop: f64,
+    pub z_hop_type: ZHop,
+    pub lift_above: f64,
+    pub lift_below: f64,
     pub min_travel: f64,
     pub on_layer_change: bool,
     pub wipe: bool,
+    pub wipe_distance: f64,
+    /// 0..1 of the length, taken back standing before the wipe.
+    pub before_wipe: f64,
+    pub restart_extra: f64,
     pub toolchange_length: f64,
+}
+
+impl Retract {
+    /// These settings with a filament's own (OrcaSlicer's `filament_extruder_override_keys`).
+    pub fn with(mut self, o: &RetractOverride) -> Retract {
+        let RetractOverride {
+            length,
+            speed,
+            deretract_speed,
+            z_hop,
+            z_hop_type,
+            lift_above,
+            lift_below,
+            min_travel,
+            on_layer_change,
+            wipe,
+            wipe_distance,
+            before_wipe,
+            restart_extra,
+        } = *o;
+        self.length = length.unwrap_or(self.length);
+        self.speed = speed.unwrap_or(self.speed);
+        self.deretract_speed = deretract_speed.unwrap_or(self.deretract_speed);
+        self.z_hop = z_hop.unwrap_or(self.z_hop);
+        self.z_hop_type = z_hop_type.unwrap_or(self.z_hop_type);
+        self.lift_above = lift_above.unwrap_or(self.lift_above);
+        self.lift_below = lift_below.unwrap_or(self.lift_below);
+        self.min_travel = min_travel.unwrap_or(self.min_travel);
+        self.on_layer_change = on_layer_change.unwrap_or(self.on_layer_change);
+        self.wipe = wipe.unwrap_or(self.wipe);
+        self.wipe_distance = wipe_distance.unwrap_or(self.wipe_distance);
+        self.before_wipe = before_wipe.unwrap_or(self.before_wipe);
+        self.restart_extra = restart_extra.unwrap_or(self.restart_extra);
+        self
+    }
+}
+
+/// What a filament overrides of the printer's retraction: `nil` leaves the printer's value.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RetractOverride {
+    pub length: Option<f64>,
+    pub speed: Option<f64>,
+    pub deretract_speed: Option<f64>,
+    pub z_hop: Option<f64>,
+    pub z_hop_type: Option<ZHop>,
+    pub lift_above: Option<f64>,
+    pub lift_below: Option<f64>,
+    pub min_travel: Option<f64>,
+    pub on_layer_change: Option<bool>,
+    pub wipe: Option<bool>,
+    pub wipe_distance: Option<f64>,
+    pub before_wipe: Option<f64>,
+    pub restart_extra: Option<f64>,
+}
+
+impl RetractOverride {
+    fn read(r: &Reader<'_>) -> RetractOverride {
+        // The first variant's value; missing or `nil` for none.
+        let text = |key: &str| Some(r.first(key)).filter(|v| !v.is_empty() && v != "nil");
+        let num = |key: &str, lo: f64, hi: f64| {
+            let v = text(key)?;
+            let v: f64 = v.trim_end_matches('%').trim().parse().ok()?;
+            v.is_finite().then(|| v.clamp(lo, hi))
+        };
+        let flag = |key: &str| text(key).map(|v| is_true(&v));
+        RetractOverride {
+            length: num("filament_retraction_length", 0.0, 50.0),
+            speed: num("filament_retraction_speed", 1.0, 1000.0),
+            deretract_speed: num("filament_deretraction_speed", 1.0, 1000.0),
+            z_hop: num("filament_z_hop", 0.0, 10.0),
+            z_hop_type: text("filament_z_hop_types").map(|v| ZHop::of(&v)),
+            lift_above: num("filament_retract_lift_above", 0.0, 10_000.0),
+            lift_below: num("filament_retract_lift_below", 0.0, 10_000.0),
+            min_travel: num("filament_retraction_minimum_travel", 0.0, 1000.0),
+            on_layer_change: flag("filament_retract_when_changing_layer"),
+            wipe: flag("filament_wipe"),
+            wipe_distance: num("filament_wipe_distance", 0.0, 50.0),
+            before_wipe: num("filament_retract_before_wipe", 0.0, 100.0).map(|v| v / 100.0),
+            restart_extra: num("filament_retract_restart_extra", -10.0, 10.0),
+        }
+    }
+}
+
+impl ZHop {
+    /// From `z_hop_types`.
+    pub fn of(text: &str) -> ZHop {
+        match text {
+            "Normal Lift" => ZHop::Normal,
+            "Slope Lift" => ZHop::Slope,
+            "Spiral Lift" => ZHop::Spiral,
+            _ => ZHop::Auto,
+        }
+    }
 }
 
 /// How support areas are shaped (OrcaSlicer's `support_style`).
@@ -632,11 +724,14 @@ pub struct MultiMaterial {
     pub by_object: bool,
     pub clearance_radius: f64,
     pub clearance_height: f64,
+    /// The printer's nozzles (`nozzle_diameter`'s length); two change how timelapse pictures go.
+    pub nozzles: usize,
 }
 
 /// One filament's properties.
 #[derive(Clone, Debug)]
 pub struct Filament {
+    pub retract: RetractOverride,
     /// Custom G-code for when this filament starts and finishes.
     pub start_gcode: String,
     pub end_gcode: String,
@@ -1036,21 +1131,10 @@ impl Settings {
                     jerk_first_layer: jerk("initial_layer_jerk"),
                     jerk_travel: jerk("travel_jerk"),
                     firmware_retraction: r.flag("use_firmware_retraction"),
-                    z_hop: match r.first("z_hop_types").as_str() {
-                        "Normal Lift" => ZHop::Normal,
-                        "Slope Lift" => ZHop::Slope,
-                        "Spiral Lift" => ZHop::Spiral,
-                        _ => ZHop::Auto,
-                    },
-                    lift_above: r.range("retract_lift_above", 0.0, 0.0, 10_000.0),
-                    lift_below: r.range("retract_lift_below", 0.0, 0.0, 10_000.0),
                     travel_slope: r.range("travel_slope", 3.0, 0.5, 90.0),
-                    wipe_distance: r.range("wipe_distance", 1.0, 0.0, 50.0),
-                    retract_before_wipe: r.range("retract_before_wipe", 100.0, 0.0, 100.0) / 100.0,
                     role_based_wipe: r.flag("role_based_wipe_speed"),
                     wipe_speed: r.rel_speed("wipe_speed"),
                     wipe_on_loops: r.flag("wipe_on_loops"),
-                    restart_extra: r.range("retract_restart_extra", 0.0, -10.0, 10.0),
                     avoid_crossing_walls: r.flag("reduce_crossing_wall"),
                     max_detour: r.mm_or_percent("max_travel_detour_distance", 100.0).unwrap_or(0.0),
                     reduce_infill_retraction: r.flag("reduce_infill_retraction"),
@@ -1073,9 +1157,15 @@ impl Settings {
                 speed: r.speed("retraction_speed", 30.0),
                 deretract_speed: r.speed("deretraction_speed", r.speed("retraction_speed", 30.0)),
                 z_hop: r.range("z_hop", 0.0, 0.0, 10.0),
+                z_hop_type: ZHop::of(&r.first("z_hop_types")),
+                lift_above: r.range("retract_lift_above", 0.0, 0.0, 10_000.0),
+                lift_below: r.range("retract_lift_below", 0.0, 0.0, 10_000.0),
                 min_travel: r.range("retraction_minimum_travel", 2.0, 0.0, 1000.0),
                 on_layer_change: r.flag("retract_when_changing_layer"),
                 wipe: r.flag("wipe"),
+                wipe_distance: r.range("wipe_distance", 1.0, 0.0, 50.0),
+                before_wipe: r.range("retract_before_wipe", 100.0, 0.0, 100.0) / 100.0,
+                restart_extra: r.range("retract_restart_extra", 0.0, -10.0, 10.0),
                 toolchange_length: r.range("retract_length_toolchange", 10.0, 0.0, 200.0),
             },
             skirt_loops: r.count("skirt_loops", 1, 50),
@@ -1213,6 +1303,7 @@ impl Settings {
                 by_object: r.text("print_sequence") == "by object",
                 clearance_radius: r.range("extruder_clearance_radius", 40.0, 0.0, 1000.0),
                 clearance_height: r.range("extruder_clearance_height_to_rod", 40.0, 0.0, 1000.0),
+                nozzles: r.text("nozzle_diameter").split(',').count().clamp(1, 64),
             },
             seam: r.text("seam_position"),
             outer_first: r.text("wall_sequence").starts_with("outer"),
@@ -1258,6 +1349,7 @@ impl Filament {
         let nozzle_temp = r.range("nozzle_temperature", 210.0, 0.0, 500.0);
         let bed_temp = r.range(bed_key, 60.0, 0.0, 200.0);
         Filament {
+            retract: RetractOverride::read(&r),
             start_gcode: r.text("filament_start_gcode"),
             end_gcode: r.text("filament_end_gcode"),
             diameter: r.range("filament_diameter", 1.75, 0.5, 5.0),
