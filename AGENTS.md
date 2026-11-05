@@ -63,7 +63,7 @@ OrcaSlicer's crashes are the reason this exists.
 - `crates/engine` — the slicer (`calib`: the calibration prints' per-layer changes and the drawn
   pressure advance tests): `slicing` (mesh → layer shapes), `walls`, `plan` (top /
   bottom / solid / sparse regions per island), `infill`, `skirt`, `support`, `gcode` (order,
-  travel, cooling, G-code, estimates, Preview moves). `geom` wraps i_overlay under
+  travel, cooling, G-code, estimates, Preview moves). `geom` wraps `clipper` (Orca's Clipper, ported) under
   `catch_unwind`; `settings` clamps every value it reads. `slice()` never panics.
   `SLICE_FILE=x.stl cargo test --release -p CosmicSlicer-engine slice_a_file -- --nocapture`
   times a real model. `tools/parity.sh <dir> [x1c mk4 voron]` slices a reference set with
@@ -71,10 +71,11 @@ OrcaSlicer's crashes are the reason this exists.
   ignores `inherits`) and with ours using the settings Orca wrote into its G-code, then
   `parity_tests` compares them (time, filament, features, retractions, toolpath maps and
   layer pictures in `<dir>/<model>@<set>/`). `tools/parity_diff.py <case> [--layer N] [--feature F]`
-  compares the two files line by line; `PARITY.md` lists every known difference and why. `seam`,
+  compares the two files line by line; `PARITY.md` lists every known difference and why. `clipper`, `slicing`, `seam`,
   `connect` and `arcs` are ports of Orca's SeamPlacer, connect_infill and ArcFitter down to libstdc++'s
   random numbers and sort, so keep them so. Orca's behaviour is the reference: when they
-  differ, read Orca's source for the rule rather than guessing.
+  differ, read Orca's source for the rule rather than guessing, and never imitate a tie-break: its
+  ties turn on nanometres, so port the arithmetic (`PARITY.md`).
 - `crates/ui-egui` — the UI. `project.rs` maps the session to and from 3MF projects (presets by name, edits kept);
   `slicer.rs` runs the engine on a thread (results checked against a
   settings fingerprint and the model revision); `preview.rs` colours toolpaths. `state.rs` is the session (all edits go through its methods, which

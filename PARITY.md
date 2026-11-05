@@ -3,37 +3,56 @@
 The goal: the same model and settings give the same G-code as OrcaSlicer. Where they differ, this
 file says why. Numbers come from `tools/parity.sh` then `tools/parity_diff.py --all <dir>`, over
 14 models on the Bambu X1C, Prusa MK4 and Voron 2.4 profiles, plus one two-colour case on the X1C
-(2026-11-04).
+(numbers below 2026-11-05).
 
 "Identical lines" counts text lines, so one different seam or one extra progress line counts.
 "Same place" counts millimetres of extrusion within 0.01 mm of an Orca segment with the same ends.
 
 ## Where it stands
 
-| Same place, all models | Share |
-|---|---|
-| Custom G-code | 100 % |
-| Bottom surface | 84 % |
-| Top surface | 67 % |
-| Internal solid infill | 51 % |
-| Sparse infill | 43 % |
-| Internal bridge | 42 % |
-| Outer wall | 37 % |
-| Inner wall | 33 % |
-| Bridge, gap infill, prime tower | 0 % |
+Identical lines by model:
 
-Identical lines: cube 78 % (X1C), 66 % (Voron), 61 % (MK4). Best real parts: thinwalls 75 %, small
-70 %, large 65 %, calicat 55 %, ksr_fdmtest 53 % (X1C). Worst: Stanford Bunny 5 to 7 %, Benchy 11 to
-25 %. Over all lines: X1C 25 %, Voron 16 %, MK4 14 %.
+| Model | X1C | MK4 | Voron |
+|---|---|---|---|
+| cube20 | 89 % | 79 % | 73 % |
+| cylinder | 90 % | 45 % | 42 % |
+| thinwalls | 78 % | 43 % | 44 % |
+| small | 75 % | 65 % | 63 % |
+| ksr_fdmtest_v4 | 66 % | 31 % | 32 % |
+| bridge | 66 % | 56 % | 59 % |
+| calicat | 64 % | 48 % | 52 % |
+| steps | 62 % | 48 % | 46 % |
+| large | 59 % | 54 % | 39 % |
+| 3DBenchy | 46 % | 11 % | 11 % |
+| OrcaCube_v2 | 44 % | 13 % | 14 % |
+| Voron_Design_Cube_v7 | 44 % | 15 % | 19 % |
+| overhangs | 40 % | 27 % | 31 % |
+| Stanford_Bunny | 14 % | 4 % | 5 % |
 
-On the cube's X1C case walls, top and bottom surfaces are 100 % in the same place. Benchy's walls
-trace Orca's path to a median of 0.001 to 0.006 mm; they differ in where vertices fall, not in shape.
+MK4 and Voron use Arachne walls, which are not ported yet; the X1C uses classic walls, which are.
+Without arc fitting the X1C cylinder reaches 94 %.
+
+Benchy on the X1C, millimetres in the same place: gap infill 95 %, inner wall 92 %, sparse infill
+92 %, top surface 91 %, internal bridge 53 %, outer wall 50 %, bottom surface 40 %, internal solid
+33 %, bridge 0 %.
+
+## The lesson of these numbers
+
+Orca's "ties" are mostly not ties. Two infill arcs that should be equal differ by a nanometre, and
+a cylinder's vertex angles differ by 1e-7 radians, so which one wins depends on exact integers from
+the mesh onwards. Every mm-and-double approximation upstream reshuffles those choices downstream:
+porting the slicer's rounding alone took Benchy's inner walls from 31 % to 92 %. So port arithmetic,
+not just algorithms, and never imitate a tie-break: both imitations this project tried (sorting
+lines by row, starting seam polygons at the rear) matched one test model and broke others.
 
 ## Ported from Orca's source, so these match by construction
 
-Seam placement (`seam.rs`), infill line joining (`connect.rs`), arc fitting (`arcs.rs`), number and
-move format, layer change order, lifts, wipes, object labels, solid spacing and line widths, narrow
-solid detection, monotonic lines, line ends, file header, footer, start and end order, machine limits.
+Mesh slicing (`slicing.rs`: float vertices, `slice_facet`, closing, simplification), Clipper and its
+wrappers (`clipper.rs`, `geom.rs`), classic walls and gap fill in Orca's integers (`walls.rs`),
+simplifying and arc fitting before seams (`toolpath::simplify`), seam placement (`seam.rs`), infill
+line joining (`connect.rs`), cross hatch (`infill.rs`), arc fitting (`arcs.rs`), number and move
+format, layer change order, lifts, wipes, object labels, line widths, narrow solid detection,
+monotonic lines, line ends, file header, footer, start and end order, machine limits.
 
 ## Differences that cannot go away
 
@@ -50,7 +69,7 @@ solid detection, monotonic lines, line ends, file header, footer, start and end 
 |---|---|---|
 | MK4 and Voron walls, 30 to 34 % | Their profiles use Arachne. Ours uses the medial axis for the same job, so widths and vertices differ. | Port Arachne, a large job. |
 | Arcs on curved walls | Orca fits arcs on the loop as generated, then splits at the seam. We fit after the seam, starting elsewhere, so breaks fall on other vertices. | Fit before placing the seam and carry arcs through `Path::rotate`. |
-| Vertices on curved walls | Loops start at the vertex Clipper happens to return; ours come from i_overlay. Fitting and simplifying run from that start. | Reproduce Clipper's start vertex, or port its output order. |
+| Rectilinear spacing | `infill.rs` still works out solid lines in millimetres, not on Orca's rotated integers: they drift 0.01 mm across a region. Internal solid, top and bottom surfaces. Fitting and simplifying run from that start. | Reproduce Clipper's start vertex, or port its output order. |
 | M73 progress lines | Orca places them from its own time estimate after slicing. Ours sit at layer starts. Every layer has some. | Port the post-processor's placement. |
 | Cooled speed, a few units off (F4641 vs F4644 on the cube) | Decided by total layer time, so it settles only when the toolpath does. Includes Orca's parser quirk, ported. | Follows from the rows above. |
 | Time and filament totals | Orca's estimator also counts heating and loading; `filament used` includes the start purge. | Port `GCodeProcessor` accounting. |
