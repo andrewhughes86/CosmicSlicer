@@ -791,6 +791,10 @@ pub fn object(
                             }
                         }
                     }
+                    let arcs = s.motion.arc_fitting == crate::settings::ArcFitting::All;
+                    for p in out.walls.iter_mut().flatten().chain(&mut out.fills) {
+                        crate::toolpath::simplify(p, s.resolution, arcs && !s.spiral);
+                    }
                     out
                 })
                 .collect()

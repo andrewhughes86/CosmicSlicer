@@ -989,7 +989,9 @@ fn polygon_angles(polygon: &[DVec2], lengths: &[f32], arm: f32) -> Vec<f32> {
             steps += 1;
         }
         if let (Some(a), Some(b), Some(c)) = (polygon.get(prev), polygon.get(current), polygon.get(next)) {
-            let (u, v) = (*b - *a, *c - *b);
+            // On Orca's integer points: regular polygons' angles differ by less than the
+            // rounding of anything else.
+            let (u, v) = (((*b - *a) / NM).round(), ((*c - *b) / NM).round());
             *slot = u.perp_dot(v).atan2(u.dot(v)) as f32;
         }
         to_prev += length(current);
@@ -1013,15 +1015,8 @@ fn add_perimeter(layer: &mut Layer, source: &Loop<'_>, z: f32, arm: f32, centre:
     if polygon.len() < 3 {
         return;
     }
-    // Tie-break: the polygon starts at its rear-most point, right-most of those.
-    let first = polygon
-        .iter()
-        .enumerate()
-        .max_by(|a, b| (a.1.y, a.1.x).partial_cmp(&(b.1.y, b.1.x)).unwrap_or(std::cmp::Ordering::Equal))
-        .map_or(0, |(i, _)| i);
-    polygon.rotate_left(first);
     if let Some(p) = polygon.first().copied() {
-        // A loop's polygon closes on its first point.
+        // A loop's polygon closes on its first point (`collect_points`).
         polygon.push(p);
     }
     let was_clockwise = geom::signed_area2(&polygon) < 0.0;
@@ -1862,7 +1857,7 @@ fn stagger(points: &[DVec2], segment: usize, from: DVec2, mut depth: f32) -> DVe
 fn start_at(path: &mut Path, p: DVec2) {
     const SAME_VERTEX: f64 = 0.0015;
     if let Some(i) = path.points.iter().position(|v| v.distance(p) <= SAME_VERTEX) {
-        path.rotate(i);
+        path.start_at_vertex(i);
         return;
     }
     let (segment, on) = closest_on_loop(&path.points, p);
@@ -1871,20 +1866,15 @@ fn start_at(path: &mut Path, p: DVec2) {
     if let (Some(a), Some(b)) = (a, b) {
         const SNAP: f64 = 0.001;
         if a.distance(p) < b.distance(p) && a.distance(p) < SNAP {
-            path.rotate(segment);
+            path.start_at_vertex(segment);
             return;
         }
         if b.distance(p) < SNAP {
-            path.rotate(segment + 1);
+            path.start_at_vertex(segment + 1);
             return;
         }
     }
-    path.points.insert(segment + 1, on);
-    if path.overhang.len() == n {
-        let mark = path.overhang.get(segment).copied().unwrap_or(0);
-        path.overhang.insert(segment + 1, mark);
-    }
-    path.rotate(segment + 1);
+    path.start_on_segment(segment, on);
 }
 
 /// Every seam of object `object` on the plans.
@@ -1920,12 +1910,17 @@ pub fn build(
             let width = outer.first().map_or(0.0, |p| p.width);
             let (enforce, block) = (grow(&island.seam_enforce, width), grow(&island.seam_block, width));
             for path in outer.iter().filter(|p| p.closed) {
-                let source = Loop {
-                    points: path.points.iter().map(|p| ((*p - centre) / NM).round() * NM).collect(),
-                    width: path.width as f32,
-                    enforce: &enforce,
-                    block: &block,
-                };
+                // `collect_points`: each of the loop's paths in turn, so where one hangs
+                // differently from the last, their shared point comes twice.
+                let mut points: Vec<DVec2> = Vec::with_capacity(path.points.len());
+                for (i, p) in path.points.iter().enumerate() {
+                    let p = ((*p - centre) / NM).round() * NM;
+                    if i > 0 && path.overhang_at(i) != path.overhang_at(i - 1) {
+                        points.push(p);
+                    }
+                    points.push(p);
+                }
+                let source = Loop { points, width: path.width as f32, enforce: &enforce, block: &block };
                 add_perimeter(&mut layer, &source, z, arm, centre);
             }
         }

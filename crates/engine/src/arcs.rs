@@ -3,6 +3,8 @@
 
 use glam::DVec2;
 
+use crate::clipper::Pt;
+
 /// One move of a fitted path.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Piece {
@@ -227,9 +229,42 @@ fn try_arc(pts: &[DVec2], tolerance: f64) -> Option<Arc> {
     within_slice(&arc, pts).then_some(arc)
 }
 
+/// One stretch of a fitted path: its points, the previous stretch's last first, and the arc
+/// through them when it is one. An arc keeps its points (simplified), as Orca's do for wipes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Run {
+    pub points: Vec<DVec2>,
+    pub arc: Option<RunArc>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RunArc {
+    /// In millimetres.
+    pub center: DVec2,
+    /// In nanometres.
+    pub radius: f64,
+    pub ccw: bool,
+}
+
 /// Fits arcs to the path after `pts[0]` (the current position), within `tol` mm, and simplifies
 /// what is left straight: OrcaSlicer's `ArcFitter::do_arc_fitting_and_simplify`.
 pub fn fit(pts: &[DVec2], tol: f64) -> Vec<Piece> {
+    let mut out = Vec::new();
+    for run in fit_runs(pts, tol) {
+        match run.arc {
+            Some(a) => {
+                if let Some(&end) = run.points.last() {
+                    out.push(Piece::Arc { end, center: a.center, ccw: a.ccw });
+                }
+            }
+            None => out.extend(run.points.iter().skip(1).copied().map(Piece::Line)),
+        }
+    }
+    out
+}
+
+/// [`fit`], as stretches with their points.
+pub fn fit_runs(pts: &[DVec2], tol: f64) -> Vec<Run> {
     let nm: Vec<DVec2> = pts.iter().map(|p| (*p * SCALE).round()).collect();
     let tolerance = tol * SCALE;
     let n = nm.len();
@@ -276,21 +311,17 @@ pub fn fit(pts: &[DVec2], tol: f64) -> Vec<Piece> {
     if front != back {
         line_to(&mut runs, front, back);
     }
-    let mut out = Vec::new();
-    for (from, to, arc) in runs {
-        match arc {
-            Some(a) => {
-                if let Some(&end) = pts.get(to) {
-                    out.push(Piece::Arc { end, center: a.circle.center / SCALE, ccw: a.ccw });
-                }
-            }
-            None => {
-                let Some(part) = pts.get(from..=to) else { continue };
-                out.extend(crate::geom::simplify(part, tol).into_iter().skip(1).map(Piece::Line));
-            }
-        }
-    }
-    out
+    let simplified = |from: usize, to: usize| -> Vec<DVec2> {
+        let part: Vec<Pt> =
+            nm.get(from..=to).unwrap_or_default().iter().map(|p| Pt::new(p.x as i64, p.y as i64)).collect();
+        crate::geom::from_nm(&crate::geom::douglas_peucker(&part, tolerance))
+    };
+    runs.into_iter()
+        .map(|(from, to, arc)| Run {
+            points: simplified(from, to),
+            arc: arc.map(|a| RunArc { center: a.circle.center / SCALE, radius: a.circle.radius, ccw: a.ccw }),
+        })
+        .collect()
 }
 
 /// Length of an arc from `from` to `end`.

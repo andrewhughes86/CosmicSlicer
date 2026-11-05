@@ -5,6 +5,7 @@
 //! OrcaSlicer's Arachne generator does with variable-width walls, and its classic generator with
 //! thin-wall detection and gap fill.
 
+use crate::clipper::Paths;
 use crate::geom::{self, Join, Op, Shape};
 use crate::medial;
 use crate::settings::Settings;
@@ -24,32 +25,94 @@ pub struct Walled {
 /// OrcaSlicer's `INSET_OVERLAP_TOLERANCE`.
 const OVERLAP_TOLERANCE: f64 = 0.4;
 
+/// The integers `PerimeterGenerator::process_classic` works in.
+struct Flows {
+    /// Inner walls: width and spacing.
+    pw: i64,
+    ps: i64,
+    /// The outer wall.
+    epw: i64,
+    eps: i64,
+    /// From the outer wall to the first inner one.
+    eps2: i64,
+    /// Solid infill's spacing.
+    solid: i64,
+    min_spacing: i64,
+    ext_min_spacing: i64,
+    ext_min_smaller: i64,
+}
+
+/// `Flow::rounded_rectangle_extrusion_spacing`, in Orca's floats.
+fn flow_spacing(width: f32, height: f32) -> f32 {
+    width - height * (1.0 - 0.25 * std::f64::consts::PI) as f32
+}
+
+/// `scale_` of a float, truncated: `Flow::scaled_width`.
+fn scale_f(v: f32) -> i64 {
+    (f64::from(v) / 1.0e-6) as i64
+}
+
+fn half(v: i64) -> f64 {
+    v as f64 / 2.0
+}
+
+impl Flows {
+    fn new(s: &Settings, h: f64, first_layer: bool) -> Self {
+        let height = h as f32;
+        let (w_out, w_in, w_solid) = if first_layer {
+            (s.widths.first_layer, s.widths.first_layer, s.widths.first_layer)
+        } else {
+            (s.widths.outer, s.widths.inner, s.widths.solid)
+        };
+        let (w_out, w_in) = (w_out as f32, w_in as f32);
+        let (s_out, s_in) = (flow_spacing(w_out, height), flow_spacing(w_in, height));
+        let (pw, ps) = (scale_f(w_in), scale_f(s_in));
+        let (epw, eps) = (scale_f(w_out), scale_f(s_out));
+        // `scaled<coord_t>` of a float divides in floats.
+        let scaled = |v: f32| (v / 1.0e-6_f64 as f32) as i64;
+        let eps2 = if s.walls.precise_outer { scaled(0.5 * (w_out + w_in)) } else { scaled(0.5 * (s_out + s_in)) };
+        let solid = scale_f(flow_spacing(w_solid as f32, height));
+        Self {
+            pw,
+            ps,
+            epw,
+            eps,
+            eps2,
+            solid,
+            min_spacing: (ps as f64 * (1.0 - OVERLAP_TOLERANCE)) as i64,
+            ext_min_spacing: (eps as f64 * (1.0 - OVERLAP_TOLERANCE)) as i64,
+            ext_min_smaller: (eps as f64 * (1.0 - NARROW_OVERLAP)) as i64,
+        }
+    }
+}
+
 /// OrcaSlicer's gap fill for classic walls: what the walls leave between them is found loop by
-/// loop (`found`) and filled along its medial axis. Returns the lines and the area they cover,
-/// which infill keeps out of.
-fn classic_gaps(
-    found: &[Shape],
-    (wo, wi): (f64, f64),
-    si: f64,
-    h: f64,
-    s: &Settings,
-    speed: f64,
-) -> (Vec<Path>, Vec<Shape>) {
+/// loop (`found`) and filled along its medial axis. Returns the lines and, in Clipper's units,
+/// the area they cover, which infill keeps out of.
+fn classic_gaps(found: &[Shape], f: &Flows, h: f64, s: &Settings, speed: f64) -> (Vec<Path>, Paths) {
     if found.is_empty() {
         return (Vec::new(), Vec::new());
     }
-    let found = geom::union(found);
-    let min = 0.2 * wi.min(wo) * (1.0 - OVERLAP_TOLERANCE);
-    let max = 2.0 * si;
-    let opened = geom::offset(&geom::offset(&found, -min / 2.0, Join::Miter), min / 2.0, Join::Miter);
-    let closed = geom::offset(&geom::offset(&found, -max / 2.0, Join::Miter), max / 2.0 + 1e-5, Join::Miter);
+    let min = 0.2 * f.pw.min(f.epw) as f64 * (1.0 - OVERLAP_TOLERANCE);
+    let max = 2.0 * f.ps as f64;
+    let opened = geom::offset2_nm(found, -((min / 2.0) as f32), (min / 2.0) as f32, Join::Miter);
+    let closed = geom::offset2_nm(found, -((max / 2.0) as f32), (max / 2.0 + 10.0) as f32, Join::Miter);
     let parts = geom::boolean(&opened, &closed, Op::Difference);
     let mut lines = Vec::new();
-    let tolerance =
-        if s.motion.arc_fitting == crate::settings::ArcFitting::Off { s.resolution } else { 0.2 * s.resolution };
+    let tolerance = surface_resolution(s);
     for part in &parts {
-        let simple: Shape = part.iter().map(|c| geom::simplify_loop(c, tolerance)).filter(|c| c.len() >= 3).collect();
-        match medial::medial_axis(&simple, min, max) {
+        let simple: Shape = geom::paths_of(part)
+            .iter()
+            .map(|c| {
+                let mut closed = c.clone();
+                closed.extend(c.first().copied());
+                let mut p = geom::douglas_peucker(&closed, tolerance / 1.0e-6);
+                p.pop();
+                geom::from_nm(&p)
+            })
+            .filter(|c: &Vec<glam::DVec2>| c.len() >= 3)
+            .collect();
+        match medial::medial_axis(&simple, min * 1.0e-6, max * 1.0e-6) {
             Some(axis) => lines.extend(
                 axis.into_iter()
                     .filter(|l| l.points.windows(2).map(|w| w[0].distance(w[1])).sum::<f64>() >= s.walls.filter_gap),
@@ -58,17 +121,19 @@ fn classic_gaps(
         }
     }
     let paths = medial::variable_width(&lines, Role::GapFill, speed, s.walls.gap_flow, h);
-    let covered: Vec<Shape> = paths
+    let covered = paths
         .iter()
         .flat_map(|p| {
-            let half = p.width / 2.0 + 1e-5;
-            p.points.windows(2).map(move |w| {
-                let n = (w[1] - w[0]).normalize_or_zero().perp() * half;
-                vec![vec![w[0] - n, w[1] - n, w[1] + n, w[0] + n]]
-            })
+            let delta = (p.width / 2.0 / 1.0e-6) as f32 + 10.0;
+            p.points.windows(2).flat_map(move |w| geom::offset_line(w, delta))
         })
         .collect();
-    (paths, geom::union(&covered))
+    (paths, covered)
+}
+
+/// `surface_simplify_resolution`, in millimetres: finer under arc fitting.
+fn surface_resolution(s: &Settings) -> f64 {
+    if s.motion.arc_fitting == crate::settings::ArcFitting::Off { s.resolution } else { 0.2 * s.resolution }
 }
 
 struct TopSplit {
@@ -82,34 +147,38 @@ struct TopSplit {
 
 /// OrcaSlicer's `split_top_surfaces`, for "only one wall on top". `orig` is the outer wall's
 /// centre line.
-fn split_top_surfaces(
-    orig: &[Shape],
-    upper: &[Shape],
-    lower: &[Shape],
-    s: &Settings,
-    (wo, wi): (f64, f64),
-    (so, si): (f64, f64),
-) -> TopSplit {
-    let n = s.wall_loops.max(1) as f64 - 1.0;
-    let mut offset_top = 0.9 * (wo + si * n);
-    let inner = 0.9 * if s.wall_loops <= 1 { 0.0 } else { si * n };
-    offset_top = if offset_top > inner { offset_top - inner } else { 0.0 };
-    let min_width = (so / 2.0 + 1e-5).max(s.walls.min_top_width);
-    let grown_upper = geom::offset(upper, min_width, Join::Miter);
-    let first_clip = geom::offset(orig, -so, Join::Miter);
-    let bridge_offset = so.max(wi);
-    let margin = (1.0f64).min(s.nozzle / 0.4);
-    let checker =
-        geom::offset(&geom::boolean(orig, lower, Op::Difference), 1.5 * bridge_offset + margin + si / 2.0, Join::Miter);
-    let no_bridge = geom::boolean(orig, &checker, Op::Difference);
-    let top = geom::boolean(&no_bridge, &grown_upper, Op::Difference);
-    let temp_gap = geom::boolean(&top, &first_clip, Op::Difference);
-    let grown_top = geom::offset(&top, offset_top + min_width - so / 2.0, Join::Miter);
-    let inner_polygons = geom::boolean(orig, &grown_top, Op::Difference);
-    let top = geom::boolean(&first_clip, &inner_polygons, Op::Difference);
-    let clip = geom::offset(orig, so / 2.0 - s.widths.sparse / 2.0, Join::Miter);
+fn split_top_surfaces(orig: &[Shape], upper: &[Shape], lower: &[Shape], s: &Settings, f: &Flows) -> TopSplit {
+    let n = s.wall_loops as i64;
+    let inner_share = 0.9 * if n <= 1 { 0.0 } else { (f.ps * (n - 1)) as f64 };
+    let mut offset_top = if n == 0 { 0 } else { (0.9 * ((f.epw + f.ps * (n - 1)) as f64 * 1.0e-6) / 1.0e-6) as i64 };
+    offset_top = if offset_top as f64 > inner_share { offset_top - inner_share as i64 } else { 0 };
+    let min_width = (half(f.eps) + 10.0).max(s.walls.min_top_width / 1.0e-6);
+
+    let upper_paths = geom::offset_polygons(&geom::shape_paths(upper), min_width as f32);
+    let orig_paths = geom::shape_paths(orig);
+    let first_clip = geom::offset_nm(orig, -(f.eps as f32), Join::Miter);
+    let checker = if lower.is_empty() {
+        Vec::new()
+    } else {
+        let bridge_offset = (f.eps as f64).max(f.pw as f64);
+        let margin = f64::from((1.0_f64 / 1.0e-6) as f32).min(f64::from((s.nozzle * 1.0 / 0.4 / 1.0e-6) as f32));
+        let exposed = geom::diff(&orig_paths, &geom::shape_paths(lower), true);
+        geom::offset_nm(&exposed, (1.5 * bridge_offset + margin + half(f.ps)) as f32, Join::Miter)
+    };
+    let no_bridge = geom::diff(&orig_paths, &geom::shape_paths(&checker), true);
+    let top = geom::diff(&geom::shape_paths(&no_bridge), &upper_paths, true);
+    let temp_gap = geom::diff(&geom::shape_paths(&top), &geom::shape_paths(&first_clip), false);
+    let grown_top = geom::offset_nm(&top, (offset_top as f64 + min_width - half(f.eps)) as f32, Join::Miter);
+    let inner_polygons = geom::diff(&orig_paths, &geom::shape_paths(&grown_top), true);
+    let top = geom::diff(&geom::shape_paths(&first_clip), &geom::shape_paths(&inner_polygons), true);
+    let clip = geom::offset_nm(orig, (half(f.eps) - s.widths.sparse / 2.0 / 1.0e-6) as f32, Join::Miter);
     let rest = geom::boolean(&inner_polygons, orig, Op::Intersect);
-    let rest = if s.speeds.gap > 0.0 { geom::boolean(&rest, &temp_gap, Op::Union) } else { rest };
+    let rest = if s.speeds.gap > 0.0 {
+        let both: Vec<Shape> = rest.iter().chain(&temp_gap).cloned().collect();
+        geom::union(&both)
+    } else {
+        rest
+    };
     TopSplit { top, rest, clip }
 }
 
@@ -194,6 +263,9 @@ pub fn walls(
     speed_scale: f64,
     around: Option<(&[Shape], &[Shape])>,
 ) -> Walled {
+    if !s.walls.arachne {
+        return classic_walls(island, s, h, first_layer, last_layer, loops, speed_scale, around);
+    }
     let wo = if first_layer { s.widths.first_layer } else { s.widths.outer };
     let wi = if first_layer { s.widths.first_layer } else { s.widths.inner };
     let (so, si) = (Settings::spacing(wo, h), Settings::spacing(wi, h));
@@ -202,18 +274,8 @@ pub fn walls(
     } else {
         (s.speeds.outer * speed_scale, s.speeds.inner * speed_scale)
     };
-    let gap_speed = if first_layer { s.speeds.first_layer } else { s.speeds.gap * speed_scale };
     let loops = if first_layer && s.walls.one_wall_first_layer { loops.min(1) } else { loops };
     let source = std::slice::from_ref(island);
-    // OrcaSlicer's narrow loops (classic walls without thin-wall detection): an island too
-    // narrow for an outer wall at its usual spacing, and not long, gets one a little thinner,
-    // kept however small (pin tips).
-    let narrow_loop = !s.walls.thin_walls && !s.walls.arachne && {
-        let m = so * (1.0 - NARROW_OVERLAP);
-        geom::offset(&geom::offset(source, -(wo + m) / 2.0, Join::Miter), m / 2.0, Join::Miter).is_empty()
-            && geom::area(source) < (wo + m) * NARROW_LOOP_LENGTH
-    };
-    let wo = if narrow_loop { wo - 0.5 * NARROW_OVERLAP * so } else { wo };
     let mut walls: Vec<Vec<Path>> = Vec::new();
     let mut gaps: Vec<Path> = Vec::new();
     let min_feature = s.walls.min_feature;
@@ -222,35 +284,15 @@ pub fn walls(
     let mut inner_edge_at = 0.0;
     let mut complete = true;
     // What inner walls are offset from, and how far that already is from the outline.
-    let mut inner_from: Vec<Shape> = source.to_vec();
-    let mut inner_base = 0.0;
-    let mut top_fills: Vec<Shape> = Vec::new();
-    let mut fill_clip: Vec<Shape> = Vec::new();
-    // Classic walls: each loop comes from the one before, and what that leaves is the gaps.
-    let classic = !s.walls.arachne;
-    let min_spacing = si * (1.0 - OVERLAP_TOLERANCE);
-    let step =
-        |k: usize| if k == 1 { if s.walls.precise_outer { (wo + wi) / 2.0 } else { (so + si) / 2.0 } } else { si };
-    let next_loop = |last: &[Shape], d: f64| {
-        let inner = geom::offset(last, -(d + min_spacing / 2.0 - 1e-6), Join::Miter);
-        geom::offset(&inner, min_spacing / 2.0 - 1e-6, Join::Miter)
-    };
-    let gaps_between = |last: &[Shape], next: &[Shape], d: f64| {
-        let from = geom::offset(last, -0.5 * d, Join::Miter);
-        geom::boolean(&from, &geom::offset(next, 0.5 * d + 1e-5, Join::Miter), Op::Difference)
-    };
-    let mut last_ring: Vec<Shape> = Vec::new();
-    let mut found: Vec<Shape> = Vec::new();
+    let inner_from: Vec<Shape> = source.to_vec();
+    let inner_base = 0.0;
     for k in 0..loops {
         if k == 1 {
             // "Precise outer wall": the first inner wall sits a full width in, so the outer
-            // wall is not squashed outwards and the part keeps its size (OrcaSlicer's Arachne
-            // lays its beads at their spacing, classic at their width).
+            // wall is not squashed outwards and the part keeps its size (Arachne lays its
+            // beads at their spacing).
             let outer = if s.walls.precise_outer { wo } else { (wo + so) / 2.0 };
-            centre = match (s.walls.precise_outer, s.walls.arachne) {
-                (true, false) => wo + wi / 2.0,
-                _ => outer + si / 2.0,
-            };
+            centre = outer + si / 2.0;
         } else if k > 1 {
             centre += si;
         }
@@ -263,14 +305,8 @@ pub fn walls(
             source.to_vec()
         };
         // The centre line: `available` offset in by half the width.
-        let centred = if classic && k > 0 {
-            let next = next_loop(&last_ring, step(k));
-            found.extend(gaps_between(&last_ring, &next, step(k)));
-            next
-        } else {
-            geom::offset(&inner_from, -(centre - inner_base), Join::Miter)
-        };
-        let rings = geom::without_slivers(centred.clone(), if narrow_loop { 0.0 } else { wo * wo * 0.25 });
+        let centred = geom::offset(&inner_from, -(centre - inner_base), Join::Miter);
+        let rings = geom::without_slivers(centred.clone(), wo * wo * 0.25);
         // Where this wall cannot reach: thin walls at the outside, gaps further in.
         let narrow = if rings.is_empty() {
             available.clone()
@@ -288,9 +324,8 @@ pub fn walls(
                         }
                     }
                 }
-            } else if s.walls.arachne {
-                // Arachne prints these as inner walls of varying width; classic walls find
-                // their gaps below.
+            } else {
+                // Arachne prints these as inner walls of varying width.
                 gaps.extend(fill_narrow(
                     &narrow,
                     s,
@@ -324,19 +359,6 @@ pub fn walls(
         } else {
             walls.push(paths);
         }
-        last_ring.clone_from(&centred);
-        if k == 0
-            && k + 1 < loops
-            && s.only_one_wall_top
-            && let Some((upper, lower)) = around
-        {
-            let split = split_top_surfaces(&centred, upper, lower, s, (wo, wi), (so, si));
-            top_fills = split.top;
-            fill_clip = split.clip;
-            inner_from.clone_from(&split.rest);
-            last_ring = split.rest;
-            inner_base = centre;
-        }
     }
     let has_loops = walls.iter().flatten().any(|p| p.closed);
     let (inner_edge, infill_area) = if !has_loops {
@@ -349,61 +371,209 @@ pub fn walls(
     } else {
         let s_last = if walls.len() == 1 { so } else { si };
         let edge = geom::offset(&inner_from, -(inner_edge_at - inner_base), Join::Miter);
-        // OrcaSlicer's overlap: classic walls the share of half the last wall's spacing and
-        // half a solid line's (top and bottom surfaces' share on the first layer), Arachne the
-        // share of the last wall's spacing.
+        // OrcaSlicer's overlap: the share of the last wall's spacing.
         let share = if first_layer || last_layer { s.solid_wall_overlap } else { s.infill_wall_overlap };
-        let overlap = if s.walls.arachne {
-            share * s_last
-        } else {
-            let solid = if first_layer { s.widths.first_layer } else { s.widths.solid };
-            share * (s_last + Settings::spacing(solid, h)) / 2.0
-        };
-        let mut area = geom::offset(&inner_from, -(inner_edge_at - overlap - inner_base), Join::Miter);
-        if s.walls.arachne {
-            // Strips inside the last wall too narrow for infill go to a line of their own.
-            let narrow = narrow_parts(&edge, wi, min_feature);
-            if !narrow.is_empty() {
-                gaps.extend(fill_narrow(
-                    &narrow,
-                    s,
-                    wi * 1.5,
-                    Role::InnerWall,
-                    inner_speed,
-                    1.0,
-                    s.walls.filter_gap.max(wi),
-                ));
-                area = geom::boolean(&area, &geom::offset(&narrow, wi * 0.25, Join::Miter), Op::Difference);
-            }
-        } else {
-            // One more loop's worth of gaps; what they fill stays out of the infill, and areas
-            // narrower than a solid line collapse.
-            let d = step(walls.len());
-            if s.speeds.gap > 0.0 && complete {
-                found.extend(gaps_between(&last_ring, &next_loop(&last_ring, d), d));
-            }
-            let (lines, covered) = classic_gaps(&found, (wo, wi), si, h, s, gap_speed);
-            gaps.extend(lines);
-            let left = if covered.is_empty() {
-                last_ring.clone()
-            } else {
-                geom::boolean(&last_ring, &covered, Op::Difference)
-            };
-            let solid = if first_layer { s.widths.first_layer } else { s.widths.solid };
-            let least = Settings::spacing(solid, h) * (1.0 - OVERLAP_TOLERANCE);
-            let inset = s_last / 2.0 - overlap;
-            area = geom::offset(&geom::offset(&left, -(inset + least / 2.0), Join::Miter), least / 2.0, Join::Miter);
-        }
-        // The top's own fill joins what is left inside the walls.
-        if !top_fills.is_empty() {
-            let share = if first_layer || last_layer { 0.0 } else { s.solid_wall_overlap };
-            let reach = share * (s_last + Settings::spacing(s.widths.solid, h)) / 2.0;
-            let top = geom::boolean(&fill_clip, &geom::offset(&top_fills, so / 2.0, Join::Miter), Op::Intersect);
-            area = geom::boolean(&area, &geom::offset(&top, reach, Join::Miter), Op::Union);
+        let mut area = geom::offset(&inner_from, -(inner_edge_at - share * s_last - inner_base), Join::Miter);
+        // Strips inside the last wall too narrow for infill go to a line of their own.
+        let narrow = narrow_parts(&edge, wi, min_feature);
+        if !narrow.is_empty() {
+            gaps.extend(fill_narrow(
+                &narrow,
+                s,
+                wi * 1.5,
+                Role::InnerWall,
+                inner_speed,
+                1.0,
+                s.walls.filter_gap.max(wi),
+            ));
+            area = geom::boolean(&area, &geom::offset(&narrow, wi * 0.25, Join::Miter), Op::Difference);
         }
         (edge, area)
     };
     Walled { walls, gaps, infill_area: geom::without_slivers(infill_area, wi * wi), inner_edge }
+}
+
+/// A share of `ratio_over`: `ConfigOptionFloatOrPercent::get_abs_value` of a percentage.
+fn percent_of(share: f64, ratio_over: f64) -> f64 {
+    ratio_over * ((share * 100.0 * 1.0e6).round() / 1.0e6) / 100.0
+}
+
+/// `PerimeterGenerator::process_classic`, in its integers: each loop is the one before offset
+/// in, and what that leaves behind is the gaps.
+#[allow(clippy::too_many_arguments)]
+fn classic_walls(
+    island: &Shape,
+    s: &Settings,
+    h: f64,
+    first_layer: bool,
+    last_layer: bool,
+    loops: usize,
+    speed_scale: f64,
+    around: Option<(&[Shape], &[Shape])>,
+) -> Walled {
+    let f = Flows::new(s, h, first_layer);
+    let wo = if first_layer { s.widths.first_layer } else { s.widths.outer };
+    let wi = if first_layer { s.widths.first_layer } else { s.widths.inner };
+    let (outer_speed, inner_speed) = if first_layer {
+        (s.speeds.first_layer, s.speeds.first_layer)
+    } else {
+        (s.speeds.outer * speed_scale, s.speeds.inner * speed_scale)
+    };
+    let gap_speed = if first_layer { s.speeds.first_layer } else { s.speeds.gap * speed_scale };
+    let loops = if first_layer && s.walls.one_wall_first_layer { loops.min(1) } else { loops };
+    let has_gap_fill = s.speeds.gap > 0.0;
+
+    let mut last = geom::union_paths(&geom::simplify_p(island, surface_resolution(s) / 1.0e-6));
+    let mut walls: Vec<Vec<Path>> = Vec::new();
+    let mut gaps_found: Vec<Shape> = Vec::new();
+    let mut top_fills: Vec<Shape> = Vec::new();
+    let mut fill_clip: Vec<Shape> = Vec::new();
+    let mut thin_lines = Vec::new();
+    // Orca's `loop_number`: the last loop's index, -1 for none.
+    let mut loop_number = loops as i64 - 1;
+    if loops > 0 {
+        let mut i = 0_i64;
+        loop {
+            let mut offsets: Vec<Shape> = Vec::new();
+            let mut smaller: Vec<Shape> = Vec::new();
+            if i == 0 {
+                if s.walls.thin_walls {
+                    offsets = geom::offset2_nm(
+                        &last,
+                        -((half(f.epw) + half(f.ext_min_spacing) - 1.0) as f32),
+                        (half(f.ext_min_spacing) - 1.0) as f32,
+                        Join::Miter,
+                    );
+                    let min_width = (s.nozzle / 3.0 / 1.0e-6) as i64;
+                    let around_walls = geom::offset_loops(&offsets, (half(f.epw) as f32) + 10.0);
+                    let thin = geom::diff(&geom::shape_paths(&last), &around_walls, false);
+                    let d = (min_width as f64 / 2.0) as f32;
+                    for part in geom::offset2_nm(&thin, -d, d, Join::Miter) {
+                        let (lo, hi) = (min_width as f64 * 1.0e-6, (f.epw + f.eps2) as f64 * 1.0e-6);
+                        thin_lines.extend(medial::medial_axis(&part, lo, hi).unwrap_or_default());
+                    }
+                } else {
+                    for shape in &last {
+                        let one = std::slice::from_ref(shape);
+                        let inset = geom::offset2_nm(
+                            one,
+                            -((half(f.epw) + half(f.ext_min_smaller)) as f32),
+                            half(f.ext_min_smaller) as f32,
+                            Join::Miter,
+                        );
+                        let limit = (f.epw + f.ext_min_smaller) as f64 * (NARROW_LOOP_LENGTH / 1.0e-6);
+                        if inset.is_empty() && geom::shape_area(shape) / 1.0e-12 < limit {
+                            let thinner = 1.0e-6 * (f.epw as f64 - 0.5 * NARROW_OVERLAP * f.eps as f64);
+                            let thinner = scale_f(thinner as f32);
+                            smaller.extend(geom::offset_nm(one, -(half(thinner) as f32), Join::Miter));
+                        } else {
+                            offsets.extend(geom::offset_nm(one, -(half(f.epw) as f32), Join::Miter));
+                        }
+                    }
+                }
+            } else {
+                let distance = if i == 1 { f.eps2 } else { f.ps };
+                offsets = geom::offset2_nm(
+                    &last,
+                    -((distance as f64 + half(f.min_spacing) - 1.0) as f32),
+                    (half(f.min_spacing) - 1.0) as f32,
+                    Join::Miter,
+                );
+                if has_gap_fill {
+                    let d = 0.5 * distance as f64;
+                    gaps_found.extend(geom::diff(
+                        &geom::offset_loops(&last, -(d as f32)),
+                        &geom::offset_loops(&offsets, (d + 10.0) as f32),
+                        false,
+                    ));
+                }
+            }
+            if offsets.is_empty() && smaller.is_empty() {
+                loop_number = i - 1;
+                last.clear();
+                break;
+            } else if i > loop_number {
+                break;
+            }
+            let width = if i == 0 { wo } else { wi };
+            let (role, speed) = if i == 0 { (Role::OuterWall, outer_speed) } else { (Role::InnerWall, inner_speed) };
+            let mut paths: Vec<Path> = Vec::new();
+            for (set, width) in [(&offsets, width), (&smaller, wo - 0.5 * NARROW_OVERLAP * Settings::spacing(wo, h))] {
+                paths.extend(
+                    set.iter()
+                        .flat_map(|shape| oriented(shape, s.walls.ccw))
+                        .filter(|c| c.len() >= 3)
+                        .map(|points| Path::new(role, points, true, width, speed, 1.0)),
+                );
+            }
+            walls.push(paths);
+            last = offsets;
+            if i == 0
+                && i != loop_number
+                && s.only_one_wall_top
+                && let Some((upper, lower)) = around
+            {
+                let split = split_top_surfaces(&last, upper, lower, s, &f);
+                top_fills = split.top;
+                fill_clip = split.clip;
+                last = split.rest;
+            }
+            if i == loop_number && !has_gap_fill {
+                break;
+            }
+            i += 1;
+        }
+    }
+
+    if !thin_lines.is_empty() {
+        let thin = medial::variable_width(&thin_lines, Role::OuterWall, outer_speed, 1.0, h);
+        if walls.is_empty() {
+            walls.push(Vec::new());
+        }
+        if let Some(outer) = walls.first_mut() {
+            outer.extend(thin);
+        }
+    }
+
+    let (gap_lines, covered) = classic_gaps(&gaps_found, &f, h, s, gap_speed);
+    if !covered.is_empty() {
+        last = geom::diff(&geom::shape_paths(&last), &covered, false);
+    }
+
+    let inset = match loop_number {
+        n if n < 0 => 0,
+        0 => f.eps / 2,
+        _ => f.ps / 2,
+    };
+    let outer_share = if first_layer || last_layer { s.solid_wall_overlap } else { s.infill_wall_overlap };
+    let of = |share: f64| (percent_of(share, (inset + f.solid / 2) as f64 * 1.0e-6) / 1.0e-6) as i64;
+    let overlap = if inset > 0 { of(outer_share) } else { 0 };
+    let top_overlap = if inset > 0 && !(first_layer || last_layer) { of(s.solid_wall_overlap) } else { 0 };
+    let edge_inset = inset;
+    let inset = inset - overlap;
+
+    let tolerance = s.resolution / 1.0e-6;
+    let simple: Paths = last.iter().flat_map(|shape| geom::simplify_p(shape, tolerance)).collect();
+    let not_filled = geom::union_paths(&simple);
+    let least = (f.solid as f64 * (1.0 - OVERLAP_TOLERANCE)) as i64;
+    let mut infill_area =
+        geom::offset2_nm(&not_filled, (-(inset as f64) - half(least)) as f32, half(least) as f32, Join::Miter);
+    if !top_fills.is_empty() {
+        let grown = geom::offset_nm(&top_fills, (f.eps / 2) as f32, Join::Miter);
+        let top = geom::boolean(&fill_clip, &grown, Op::Intersect);
+        let reach = geom::offset_nm(&top, top_overlap as f32, Join::Miter);
+        let both: Vec<Shape> = infill_area.iter().chain(&reach).cloned().collect();
+        infill_area = geom::union(&both);
+    }
+    let inner_edge = if walls.iter().flatten().any(|p| p.closed) {
+        geom::offset_nm(&not_filled, -(edge_inset as f32), Join::Miter)
+    } else {
+        vec![island.clone()]
+    };
+    if !walls.iter().flatten().any(|p| p.closed) && loops > 0 {
+        infill_area.clear();
+    }
+    Walled { walls, gaps: gap_lines, infill_area, inner_edge }
 }
 
 #[cfg(test)]

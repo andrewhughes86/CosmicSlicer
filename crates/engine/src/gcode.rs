@@ -803,14 +803,20 @@ impl<'a> Writer<'a> {
     /// close short of the start by the seam gap, or ramp in and out as a scarf seam.
     fn steps(&self, path: &Path, scarf: bool) -> Vec<Step> {
         let n = path.points.len();
-        let plain = |to: DVec2, hang: u8| Step { to, hang, dz: 0.0, flow: 1.0, scarf: false };
-        let mut steps: Vec<Step> =
-            (1..n).filter_map(|k| path.points.get(k).map(|&p| plain(p, path.hang_at(k - 1)))).collect();
+        let plain = |to: DVec2, i: usize| Step {
+            to,
+            bend: if scarf { None } else { path.bend_at(i) },
+            hang: path.hang_at(i),
+            dz: 0.0,
+            flow: 1.0,
+            scarf: false,
+        };
+        let mut steps: Vec<Step> = (1..n).filter_map(|k| path.points.get(k).map(|&p| plain(p, k - 1))).collect();
         let Some(start) = path.start() else { return steps };
         if !path.closed {
             return steps;
         }
-        steps.push(plain(start, path.hang_at(n - 1)));
+        steps.push(plain(start, n - 1));
         // Spiral vase: the wall climbs from the last layer's height to this one's as it goes
         // round, with no seam (and on the first spiral layer, the flow grows from nothing).
         if let Some(first_turn) = self.spiral.filter(|_| path.role == Role::OuterWall) {
@@ -1026,7 +1032,24 @@ impl<'a> Writer<'a> {
         pts.push(from);
         pts.extend(run.iter().map(|st| st.to));
         // Each step's own height and flow (a scarf's), else straight or fitted arcs.
-        let pieces: Vec<(Piece, f64, f64)> = if fit {
+        let pieces: Vec<(Piece, f64, f64)> = if path.fitted && run.iter().all(|st| st.dz == 0.0) {
+            // Neighbouring steps on one arc print as that arc.
+            let mut out: Vec<(Piece, f64, f64)> = Vec::with_capacity(run.len());
+            let mut last_id = None;
+            for st in run {
+                match st.bend {
+                    Some(b) if last_id == Some(b.id) => {
+                        if let Some((Piece::Arc { end, .. }, ..)) = out.last_mut() {
+                            *end = st.to;
+                        }
+                    }
+                    Some(b) => out.push((Piece::Arc { end: st.to, center: b.center, ccw: b.ccw }, st.dz, st.flow)),
+                    None => out.push((Piece::Line(st.to), st.dz, st.flow)),
+                }
+                last_id = st.bend.map(|b| b.id);
+            }
+            out
+        } else if fit {
             let tolerance = if path.role == Role::SparseInfill { 0.04 } else { s.resolution };
             arcs::fit(&pts, tolerance).into_iter().map(|p| (p, 0.0, 1.0)).collect()
         } else if run.iter().all(|st| st.dz == 0.0 && st.flow == 1.0) && self.spiral.is_none() {
@@ -1096,7 +1119,7 @@ impl<'a> Writer<'a> {
     /// Picks where a loop starts, by the seam setting, and rotates it to start there. `depth`
     /// is the wall's depth (0 outer), for staggered inner seams.
     fn place_seam(&mut self, path: &mut Path, object: Option<usize>, depth: Option<usize>) {
-        if !path.closed || path.points.len() < 3 {
+        if !path.closed || path.points.len() < 2 {
             return;
         }
         let here = self.pos.truncate();
@@ -1568,6 +1591,8 @@ impl<'a> Writer<'a> {
 #[derive(Clone, Copy, Debug)]
 struct Step {
     to: DVec2,
+    /// The segment's fitted arc.
+    bend: Option<crate::toolpath::Bend>,
     /// How much of the line hangs past the layer below, percent.
     hang: u8,
     dz: f64,
@@ -1612,7 +1637,13 @@ fn split_steps(from: DVec2, steps: &[Step], cuts: &[f64]) -> Vec<(Step, f64)> {
             if cut <= dist + 1e-9 {
                 c += 1;
             } else if cut < dist + len - 1e-9 {
-                out.push((Step { to: at + (st.to - at) * ((cut - dist) / len), ..*st }, cut));
+                let mut to = at + (st.to - at) * ((cut - dist) / len);
+                // Still on its arc (`ArcSegment::clip_end`).
+                if let Some(b) = st.bend {
+                    let radius = st.to.distance(b.center);
+                    to = b.center + (to - b.center).normalize_or_zero() * radius;
+                }
+                out.push((Step { to, ..*st }, cut));
                 c += 1;
             } else {
                 break;
@@ -1708,6 +1739,7 @@ fn stagger(path: &mut Path, back: f64) {
         if seg > left {
             let cut = p + (q - p) * (left / seg);
             // A new point on segment `prev`, which keeps its overhang mark.
+            path.bends.clear();
             path.points.insert(prev + 1, cut);
             if path.overhang.len() == n {
                 let d = path.hang_at(prev);
@@ -2760,7 +2792,7 @@ mod tests {
     #[test]
     fn loops_stop_short_by_the_seam_gap() {
         let p = l_shape();
-        let plain = |to: DVec2| Step { to, hang: 0, dz: 0.0, flow: 1.0, scarf: false };
+        let plain = |to: DVec2| Step { to, bend: None, hang: 0, dz: 0.0, flow: 1.0, scarf: false };
         let mut steps: Vec<Step> = p.points.iter().skip(1).chain(p.points.first()).map(|q| plain(*q)).collect();
         trim_end(DVec2::ZERO, &mut steps, 0.04);
         assert_eq!(steps.len(), 6);
@@ -2773,7 +2805,7 @@ mod tests {
 
     #[test]
     fn steps_split_at_distances() {
-        let plain = |to: DVec2| Step { to, hang: 0, dz: 0.0, flow: 1.0, scarf: false };
+        let plain = |to: DVec2| Step { to, bend: None, hang: 0, dz: 0.0, flow: 1.0, scarf: false };
         let steps = vec![plain(DVec2::new(10.0, 0.0)), plain(DVec2::new(10.0, 10.0))];
         let split = split_steps(DVec2::ZERO, &steps, &[2.5, 5.0, 10.0, 12.0]);
         let ds: Vec<f64> = split.iter().map(|(_, d)| *d).collect();

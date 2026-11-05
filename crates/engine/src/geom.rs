@@ -25,6 +25,8 @@ pub type Polyline = Vec<DVec2>;
 const SCALE: f64 = 1.0e6;
 /// Orca's `SCALED_RESOLUTION`: how finely round joins are stepped, in Clipper's units.
 const ROUND_TOLERANCE: f64 = 0.0125 * SCALE;
+/// `ClipperSafetyOffset`.
+const CLIPPER_SAFETY_OFFSET: f32 = 10.0;
 /// `ClipperOffsetShortestEdgeFactor`.
 const SHORTEST_EDGE_FACTOR: f64 = 0.005;
 /// Past this, a coordinate is garbage (a thousand kilometres).
@@ -107,11 +109,15 @@ fn offsetter(join: JoinType, limit: f64, delta: f32) -> ClipperOffset {
 
 /// `raw_offset`: each path alone, holes shrinking when contours grow; not united.
 fn raw_offset(paths: &[Path], delta: f32, join: JoinType, limit: f64) -> Result<Paths, Failed> {
+    raw_offset_end(paths, delta, join, limit, EndType::ClosedPolygon)
+}
+
+fn raw_offset_end(paths: &[Path], delta: f32, join: JoinType, limit: f64, end: EndType) -> Result<Paths, Failed> {
     let mut out = Vec::with_capacity(paths.len());
     for path in paths {
         let mut co = offsetter(join, limit, delta);
-        co.add_path(path, join, EndType::ClosedPolygon);
-        let ccw = clipper::orientation(path);
+        co.add_path(path, join, end);
+        let ccw = end != EndType::ClosedPolygon || clipper::orientation(path);
         let mut this = co.execute(f64::from(if ccw { delta } else { -delta }))?;
         if !ccw {
             this.iter_mut().for_each(|p| p.reverse());
@@ -190,7 +196,7 @@ fn offset_tree(paths: &[Path], delta: f32, join: JoinType, limit: f64) -> Result
 }
 
 fn scaled(distance: f64) -> f32 {
-    (distance * SCALE) as f32
+    (distance / 1.0e-6) as f32
 }
 
 fn clipper_join(join: Join) -> (JoinType, f64) {
@@ -231,9 +237,14 @@ pub fn offset(shapes: &[Shape], distance: f64, join: Join) -> Vec<Shape> {
     if !distance.is_finite() {
         return Vec::new();
     }
+    offset_nm(shapes, scaled(distance), join)
+}
+
+/// `offset_ex` with Orca's own float delta, in Clipper's units.
+pub fn offset_nm(shapes: &[Shape], delta: f32, join: Join) -> Vec<Shape> {
     let (join, limit) = clipper_join(join);
     guarded(|| {
-        let (out, _) = offset_shapes_raw(shapes, scaled(distance), join, limit)?;
+        let (out, _) = offset_shapes_raw(shapes, delta, join, limit)?;
         Ok(to_shapes(&union_tree(&out, FillType::NonZero)?))
     })
 }
@@ -243,14 +254,136 @@ pub fn offset2(shapes: &[Shape], first: f64, second: f64, join: Join) -> Vec<Sha
     if !first.is_finite() || !second.is_finite() {
         return Vec::new();
     }
+    offset2_nm(shapes, scaled(first), scaled(second), join)
+}
+
+/// `offset2_ex` with Orca's own float deltas, in Clipper's units.
+pub fn offset2_nm(shapes: &[Shape], first: f32, second: f32, join: Join) -> Vec<Shape> {
     let (join, limit) = clipper_join(join);
     guarded(|| {
-        let (delta, delta2) = (scaled(first), scaled(second));
-        let (mut out, kept) = offset_shapes_raw(shapes, delta, join, limit)?;
-        if kept > 1 && delta > 0.0 {
-            out = clip_paths(ClipType::Union, &out, &[], FillType::NonZero)?;
+        let out = offset_shapes(shapes, first, join, limit)?;
+        Ok(to_shapes(&offset_tree(&out, second, join, limit)?))
+    })
+}
+
+/// `expolygons_offset`: united only when something outwards might now overlap.
+fn offset_shapes(shapes: &[Shape], delta: f32, join: JoinType, limit: f64) -> Result<Paths, Failed> {
+    let (out, kept) = offset_shapes_raw(shapes, delta, join, limit)?;
+    if kept > 1 && delta > 0.0 { clip_paths(ClipType::Union, &out, &[], FillType::NonZero) } else { Ok(out) }
+}
+
+/// Orca's `offset` of expolygons, to plain loops, in Clipper's units.
+pub fn offset_loops(shapes: &[Shape], delta: f32) -> Paths {
+    guarded(|| offset_shapes(shapes, delta, JoinType::Miter, 3.0))
+}
+
+/// Orca's `offset` of polygons, to plain loops, in Clipper's units.
+pub fn offset_polygons(paths: &[Path], delta: f32) -> Paths {
+    guarded(|| {
+        let raw = raw_offset(paths, delta, JoinType::Miter, 3.0)?;
+        clip_paths(ClipType::Union, &raw, &[], FillType::NonZero)
+    })
+}
+
+/// A line's outline: Orca's `offset` of a polyline, square joins and butt ends.
+pub fn offset_line(line: &[DVec2], delta: f32) -> Paths {
+    let path = [to_path(line)];
+    guarded(|| raw_offset_end(&path, delta, JoinType::Square, 0.0, EndType::OpenButt))
+}
+
+/// `diff_ex`; `safety` is its `ApplySafetyOffset`, growing `clip` by 10 units first.
+pub fn diff(subject: &[Path], clip: &[Path], safety: bool) -> Vec<Shape> {
+    guarded(|| {
+        let grown;
+        let clip = if safety {
+            grown = raw_offset(clip, CLIPPER_SAFETY_OFFSET, JoinType::Miter, 3.0)?;
+            grown.as_slice()
+        } else {
+            clip
+        };
+        Ok(to_shapes(&clip_tree(ClipType::Difference, subject, clip, FillType::NonZero)?))
+    })
+}
+
+/// `union_ex` of plain loops.
+pub fn union_paths(paths: &[Path]) -> Vec<Shape> {
+    guarded(|| Ok(to_shapes(&clip_tree(ClipType::Union, paths, &[], FillType::NonZero)?)))
+}
+
+/// All the shapes' contours in Clipper's units, outers before their holes.
+pub fn shape_paths(shapes: &[Shape]) -> Paths {
+    to_paths(shapes)
+}
+
+/// Orca's `_douglas_peucker`, in Clipper's units.
+pub fn douglas_peucker(pts: &[Pt], tolerance: f64) -> Path {
+    let squared = tolerance * tolerance;
+    let at = |i: usize| pts.get(i).copied().unwrap_or_default();
+    let distance = |p: Pt, a: Pt, b: Pt| {
+        let v = ((b.x - a.x) as f64, (b.y - a.y) as f64);
+        let va = ((p.x - a.x) as f64, (p.y - a.y) as f64);
+        let l2 = v.0 * v.0 + v.1 * v.1;
+        let square = |x: f64, y: f64| x * x + y * y;
+        if l2 == 0.0 {
+            return square(va.0, va.1);
         }
-        Ok(to_shapes(&offset_tree(&out, delta2, join, limit)?))
+        let t = (va.0 * v.0 + va.1 * v.1) / l2;
+        if t <= 0.0 {
+            square(va.0, va.1)
+        } else if t >= 1.0 {
+            square((p.x - b.x) as f64, (p.y - b.y) as f64)
+        } else {
+            square(t * v.0 - va.0, t * v.1 - va.1)
+        }
+    };
+    let Some(last) = pts.len().checked_sub(1) else { return Vec::new() };
+    let (mut anchor, mut floater) = (0, last);
+    let mut out = vec![at(0)];
+    if anchor == floater {
+        return out;
+    }
+    let mut stack = vec![floater];
+    loop {
+        let mut furthest = (0.0, anchor);
+        for i in anchor + 1..floater {
+            let d = distance(at(i), at(anchor), at(floater));
+            if d > furthest.0 {
+                furthest = (d, i);
+            }
+        }
+        if furthest.0 <= squared {
+            out.push(at(floater));
+            anchor = floater;
+            stack.pop();
+            let Some(&next) = stack.last() else { break };
+            floater = next;
+        } else {
+            floater = furthest.1;
+            stack.push(floater);
+        }
+    }
+    out
+}
+
+/// `ExPolygon::simplify_p`: each contour simplified, then Clipper's strictly simple union.
+pub fn simplify_p(shape: &Shape, tolerance: f64) -> Paths {
+    let pp: Paths = paths_of(shape)
+        .into_iter()
+        .map(|c| {
+            let mut closed = c;
+            if let Some(&first) = closed.first() {
+                closed.push(first);
+            }
+            let mut p = douglas_peucker(&closed, tolerance);
+            p.pop();
+            p
+        })
+        .collect();
+    guarded(|| {
+        let mut c = Clipper::new();
+        c.strictly_simple(true);
+        c.add_paths(&pp, PolyType::Subject, true)?;
+        c.execute(ClipType::Union, FillType::NonZero, FillType::NonZero)
     })
 }
 
@@ -338,6 +471,11 @@ pub fn clip_open(lines: &[Path], clip: &[Path], op: ClipType) -> Paths {
         .filter(|n| n.open && n.contour.len() >= 2)
         .map(|n| n.contour.clone())
         .collect()
+}
+
+/// Shapes back from plain loops of Clipper's units, which must be outers and holes in order.
+pub fn loops_to_contours(paths: &[Path]) -> Vec<Contour> {
+    paths.iter().map(|p| from_path(p)).collect()
 }
 
 /// A shape's contours in Clipper's units, outer first.

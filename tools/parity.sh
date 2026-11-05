@@ -69,10 +69,26 @@ for set in "${sets[@]}"; do
         case_dir="$work/$m@$set"
         mkdir -p "$case_dir"
         cp "$work/models/$m.stl" "$case_dir/"
+        # Arrange turns a model centred on its origin (the cylinder by 145 degrees, whatever
+        # --orient says), and then no vertex matches: such a model is placed on the bed instead.
+        arrange=1
+        if [ "$m" = cylinder ]; then
+            arrange=0
+            python3 -I - "$case_dir/$m.stl" <<'PY'
+import struct, sys
+d = bytearray(open(sys.argv[1], 'rb').read())
+for i in range(struct.unpack('<I', d[80:84])[0]):
+    o = 84 + 50 * i + 12
+    for k in range(3):
+        x, y, z = struct.unpack('<3f', d[o + 12 * k:o + 12 * k + 12])
+        d[o + 12 * k:o + 12 * k + 12] = struct.pack('<3f', x + 128, y + 128, z)
+open(sys.argv[1], 'wb').write(d)
+PY
+        fi
         [ "${SKIP_ORCA:-}" = 1 ] && [ -s "$case_dir/orca.gcode" ] && continue
         rm -f "$case_dir/orca.gcode" "$case_dir/plate_1.gcode"
         started=$(date +%s.%N)
-        if $orca --slice 0 --arrange 1 --outputdir "$case_dir" \
+        if $orca --slice 0 --orient 0 --arrange $arrange --outputdir "$case_dir" \
             --load-settings "$flat/machine.json;$flat/process.json" \
             --load-filaments "$flat/filament.json" "$case_dir/$m.stl" >"$case_dir/orca.log" 2>&1 \
             && [ -s "$case_dir/plate_1.gcode" ]; then
@@ -94,7 +110,7 @@ for set in "${sets[@]}"; do
             "$flat/filament.json" "$flat/filament2.json"
         if [ "${SKIP_ORCA:-}" != 1 ] || [ ! -s "$case_dir/orca.gcode" ]; then
             rm -f "$case_dir/orca.gcode" "$case_dir/plate_1.gcode"
-            if $orca --slice 0 --arrange 1 --outputdir "$case_dir" \
+            if $orca --slice 0 --orient 0 --arrange 1 --outputdir "$case_dir" \
                 --load-settings "$flat/machine.json;$flat/process.json" \
                 --load-filaments "$flat/filament.json;$flat/filament2.json" --load-filament-ids "1,2" \
                 "$case_dir/a_cube20.stl" "$case_dir/b_cylinder.stl" >"$case_dir/orca.log" 2>&1 \
