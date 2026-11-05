@@ -28,6 +28,8 @@ struct Regions {
     bottom: Vec<Shape>,
     /// Bridges whose angle is known, on layers `prepare`d by [`surfaces`].
     bridges: Vec<(Vec<Shape>, f64)>,
+    /// Solid infill bridging sparse infill: `Some` once [`surfaces`] has found them.
+    internal: Option<Vec<(Vec<Shape>, f64)>>,
     solid: Vec<Shape>,
     sparse: Vec<Shape>,
 }
@@ -87,7 +89,7 @@ fn classify(area: &[Shape], slices: &[Vec<Shape>], i: usize, s: &Settings, w: f6
     let solid = geom::boolean(&geom::boolean(&solid_all, &top, Op::Difference), &bottom, Op::Difference);
     let solid = geom::without_slivers(solid, sliver);
     if s.wall_loops == 0 {
-        return Regions { top, bottom, solid, sparse, bridges: Vec::new() };
+        return Regions { top, bottom, solid, sparse, bridges: Vec::new(), internal: None };
     }
     // OrcaSlicer's external surface expansion: top and bottom surfaces reach out under the
     // walls' thickness (×√2) into the solid infill round them, and a wall's spacing into
@@ -113,7 +115,7 @@ fn classify(area: &[Shape], slices: &[Vec<Shape>], i: usize, s: &Settings, w: f6
     };
     let bottom = grow(bottom);
     let top = grow(geom::boolean(&top, &bottom, Op::Difference));
-    Regions { top, bottom, solid, sparse, bridges: Vec::new() }
+    Regions { top, bottom, solid, sparse, bridges: Vec::new(), internal: None }
 }
 
 /// OrcaSlicer's clean-up of the solid shell on a layer ("ensure vertical shell thickness"):
@@ -560,7 +562,11 @@ fn lightning_lines(
             let solid_above: Vec<Shape> = up
                 .iter()
                 .flat_map(|w| &w.pieces)
-                .flat_map(|p| p.regions.top.iter().chain(&p.regions.bottom).chain(&p.regions.solid).cloned())
+                .flat_map(|p| {
+                    let bridges = p.regions.bridges.iter().chain(p.regions.internal.iter().flatten());
+                    let bridges = bridges.flat_map(|b| b.0.iter());
+                    p.regions.top.iter().chain(&p.regions.bottom).chain(&p.regions.solid).chain(bridges).cloned()
+                })
                 .collect();
             if solid_above.is_empty() || here.is_empty() {
                 return Vec::new();
@@ -659,7 +665,23 @@ pub fn object(
                 height: layers.get(i).map_or(s.layer_height, |l| l.height),
             })
             .collect();
-        let typed = surfaces::prepare(&input, s);
+        let origin = slices
+            .iter()
+            .filter_map(|sl| geom::bounds(sl))
+            .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
+            .map_or(glam::DVec2::ZERO, |(lo, hi)| (lo + hi) / 2.0);
+        // The sparse infill's lines, unjoined, for the bridges above to anchor on.
+        let lines_below = |k: usize, near: &[Shape]| -> Vec<Polyline> {
+            let area: Vec<Shape> = input.get(k).map_or(Vec::new(), |l| geom::boolean(&l.fill, near, Op::Intersect));
+            let Some(layer) = layers.get(k) else { return Vec::new() };
+            let mut p = Params::new(s.widths.sparse, s.density, sparse_angle_at(s, k), k, layer.print_z);
+            p.origin = origin;
+            p.inset = true;
+            p.height = s.layer_height;
+            p.turn_by_layer = s.infill.sparse_template.is_empty();
+            infill::fill_with(&area, infill::kind_of(&s.sparse_pattern), &p).into_iter().map(|l| l.points).collect()
+        };
+        let typed = surfaces::prepare(&input, s, &lines_below);
         walled.par_iter_mut().zip(typed.into_par_iter()).for_each(|(layer, t)| {
             let many = layer.iter().flat_map(|w| &w.pieces).count() > 1;
             for piece in layer.iter_mut().flat_map(|w| &mut w.pieces) {
@@ -672,10 +694,13 @@ pub fn object(
                 };
                 let bridges: Vec<(Vec<Shape>, f64)> =
                     t.bridges.iter().map(|(b, a)| (clip(b), *a)).filter(|(b, _)| !b.is_empty()).collect();
+                let internal = t.internal_bridges.iter().map(|(b, a)| (clip(b), *a)).filter(|(b, _)| !b.is_empty());
+                let internal = Some(internal.collect());
                 let regions = Regions {
                     top: clip(&t.top),
                     bottom: clip(&t.bottom),
                     bridges,
+                    internal,
                     solid: clip(&t.solid),
                     sparse: clip(&t.sparse),
                 };
@@ -960,9 +985,28 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
     }
     // Solid infill over sparse infill bridges it: an internal bridge.
     let (internal, mut solid) = match at.sparse_below {
+        _ if r.internal.is_some() => (Vec::new(), r.solid.clone()),
         Some(sb) if !sb.is_empty() && !r.solid.is_empty() => internal_bridges(&r.solid, sb, s, h),
         _ => (Vec::new(), r.solid.clone()),
     };
+    for (area, angle) in r.internal.iter().flatten() {
+        let b = &s.bridges;
+        let (w, flow) = bridge_bead(s, b.thick_internal, solid_w, h, b.internal_flow);
+        for part in area {
+            let mut p = Params::new(bridge_spacing(b.thick_internal, w, h), b.internal_density, *angle, i, z);
+            p.origin = at.origin;
+            p.inset = true;
+            p.bridge = true;
+            p.turn_by_layer = false;
+            out.extend(paths_of(
+                infill::fill_with(std::slice::from_ref(part), Kind::Rectilinear { alternate: false }, &p),
+                Role::InternalBridge,
+                w,
+                b.internal_speed,
+                flow,
+            ));
+        }
+    }
     // Sparse infill left once bridges have reached out over it.
     let mut sparse_left: Option<Vec<Shape>> = None;
     if !internal.is_empty() {

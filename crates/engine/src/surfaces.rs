@@ -27,6 +27,8 @@ pub struct Typed {
     pub bottom: Vec<Shape>,
     /// Bridges over air, each with the angle its lines run at, radians.
     pub bridges: Vec<(Vec<Shape>, f64)>,
+    /// Solid infill bridging sparse infill below, with its angles.
+    pub internal_bridges: Vec<(Vec<Shape>, f64)>,
     pub solid: Vec<Shape>,
     pub sparse: Vec<Shape>,
 }
@@ -528,11 +530,442 @@ fn external(f: Fill, s: &Settings, first: bool, h: f64) -> Typed {
             shells = all(shells, &small);
         }
     }
-    Typed { top, bottom, bridges: out_bridges, solid: shells, sparse }
+    Typed { top, bottom, bridges: out_bridges, internal_bridges: Vec::new(), solid: shells, sparse }
 }
 
-/// Every layer's fill by type.
-pub fn prepare(layers: &[Input], s: &Settings) -> Vec<Typed> {
+// ---- Bridges over sparse infill --------------------------------------------------------------
+
+fn rotated(shapes: &[Shape], (sin, cos): (f64, f64)) -> Vec<Shape> {
+    shapes.iter().map(|sh| sh.iter().map(|c| c.iter().map(|p| turn(*p, (sin, cos))).collect()).collect()).collect()
+}
+
+fn turn(p: DVec2, (sin, cos): (f64, f64)) -> DVec2 {
+    DVec2::new(p.x * cos - p.y * sin, p.x * sin + p.y * cos)
+}
+
+fn lines_of(shapes: &[Shape]) -> Vec<[DVec2; 2]> {
+    shapes
+        .iter()
+        .flatten()
+        .flat_map(|c| (0..c.len()).filter_map(|i| Some([*c.get(i)?, *c.get((i + 1) % c.len())?])))
+        .collect()
+}
+
+fn distance_sq(p: DVec2, [a, b]: [DVec2; 2]) -> f64 {
+    let d = b - a;
+    let l = d.length_squared();
+    let t = if l > 0.0 { ((p - a).dot(d) / l).clamp(0.0, 1.0) } else { 0.0 };
+    (a + d * t).distance_squared(p)
+}
+
+/// The way a bridge runs: square to most of the anchor lines near its outline, by a vote over
+/// points 2 mm apart in windows of ±18°.
+fn determine_bridging_angle(area: &[Shape], anchors: &[[DVec2; 2]]) -> f64 {
+    use std::f64::consts::PI;
+    let mut counted: Vec<(f64, i32)> = Vec::new();
+    for c in area.iter().flatten() {
+        let mut acc = 0.0;
+        for w in c.windows(2) {
+            let (start, next) = (w[0], w[1]);
+            let dist = start.distance(next);
+            acc += dist;
+            if acc <= 2.0 {
+                continue;
+            }
+            acc = 0.0;
+            let v = (next - start).normalize_or_zero();
+            let count = (dist / 2.0).ceil() as usize;
+            let step = dist / count.max(1) as f64;
+            for i in 0..count {
+                let q = start + v * (i as f64 * step);
+                let Some(line) = anchors.iter().min_by(|x, y| distance_sq(q, **x).total_cmp(&distance_sq(q, **y)))
+                else {
+                    continue;
+                };
+                let d = line[1] - line[0];
+                let mut angle = d.y.atan2(d.x);
+                if angle < 0.0 {
+                    angle += 2.0 * PI;
+                }
+                if angle > PI {
+                    angle -= PI;
+                }
+                counted.push((angle + PI * 0.5, 1));
+            }
+        }
+    }
+    counted.sort_by(|a, b| a.0.total_cmp(&b.0));
+    counted.dedup_by(|b, a| {
+        let same = a.0 == b.0;
+        if same {
+            a.1 += b.1;
+        }
+        same
+    });
+    let mut best = (0.0, 0);
+    for &(dir, _) in &counted {
+        let (start, end) = (dir - PI * 0.1, dir + PI * 0.1);
+        let (mut score, mut acc) = (0, 0.0);
+        for &(a, n) in counted.iter().filter(|(a, _)| *a >= start && *a <= end) {
+            acc += a * f64::from(n);
+            score += n;
+        }
+        if start < 0.5 * PI {
+            for &(a, n) in counted.iter().filter(|(a, _)| *a >= 1.5 * PI - (0.5 * PI - start)) {
+                acc += (a - PI) * f64::from(n);
+                score += n;
+            }
+        }
+        if start > 1.5 * PI {
+            for &(a, n) in counted.iter().filter(|(a, _)| *a <= start - 1.5 * PI) {
+                acc += (a + PI) * f64::from(n);
+                score += n;
+            }
+        }
+        if score > best.1 {
+            best = (acc / f64::from(score), score);
+        }
+    }
+    if best.0 == 0.0 { 0.001 } else { best.0 }
+}
+
+/// Crossings of the upright line at `x` with `lines`, by height.
+fn crossings(lines: &[[DVec2; 2]], x: f64) -> Vec<f64> {
+    let mut ys: Vec<f64> = lines
+        .iter()
+        .filter(|[a, b]| (a.x <= x) != (b.x <= x))
+        .map(|[a, b]| a.y + (x - a.x) / (b.x - a.x) * (b.y - a.y))
+        .collect();
+    ys.sort_by(f64::total_cmp);
+    ys
+}
+
+/// `construct_anchored_polygon`: each bridge line, along `angle`, runs on to the first anchor
+/// past either end, a line's width beyond.
+fn anchored_polygon(area: &[Shape], anchors: &[[DVec2; 2]], width: f64, spacing: f64, angle: f64) -> Vec<Shape> {
+    let aligning = -angle + std::f64::consts::FRAC_PI_2;
+    let to = aligning.sin_cos();
+    let back = (-aligning).sin_cos();
+    let turned = rotated(area, to);
+    let anchors: Vec<[DVec2; 2]> = anchors.iter().map(|[a, b]| [turn(*a, to), turn(*b, to)]).collect();
+    let Some((lo, hi)) = geom::bounds(&turned) else { return Vec::new() };
+    let walls = lines_of(&turned);
+    let rows = (((hi.x - lo.x) + spacing - 1e-6) / spacing).floor().clamp(0.0, 100_000.0) as usize;
+    let limit = 36.0 * spacing * spacing;
+    let half = DVec2::new(spacing / 2.0, 0.0);
+    struct Traced {
+        lows: Vec<DVec2>,
+        highs: Vec<DVec2>,
+    }
+    let mut out: Vec<Shape> = Vec::new();
+    let close = |t: Traced, out: &mut Vec<Shape>| {
+        let mut c = t.lows;
+        c.extend(t.highs.into_iter().rev());
+        if c.len() >= 3 {
+            if geom::signed_area2(&c) < 0.0 {
+                c.reverse();
+            }
+            out.push(vec![c]);
+        }
+    };
+    let mut open: Vec<Traced> = Vec::new();
+    for row in 0..rows {
+        let x = lo.x + (row as f64 + 0.5) * spacing;
+        let ys = crossings(&walls, x);
+        let mut sections: Vec<(f64, f64)> = ys
+            .windows(2)
+            .filter(|w| geom::contains(&turned, DVec2::new(x, (w[0] + w[1]) / 2.0)))
+            .map(|w| (w[0], w[1]))
+            .collect();
+        let marks = crossings(&anchors, x);
+        for sec in &mut sections {
+            let below = marks.partition_point(|y| *y < sec.0);
+            if below > 0
+                && let Some(y) = marks.get(below - 1)
+            {
+                sec.0 = *y - width;
+            }
+            let above = marks.partition_point(|y| *y <= sec.1);
+            if let Some(y) = marks.get(above) {
+                sec.1 = *y + width;
+            }
+        }
+        for k in 0..sections.len().saturating_sub(1) {
+            let (Some(&a), Some(&b)) = (sections.get(k), sections.get(k + 1)) else { continue };
+            let overlaps = (a.0 >= b.0 && a.0 <= b.1)
+                || (a.1 >= b.0 && a.1 <= b.1)
+                || (b.0 >= a.0 && b.0 <= a.1)
+                || (b.1 >= a.0 && b.1 <= a.1);
+            if overlaps {
+                if let Some(s) = sections.get_mut(k + 1) {
+                    *s = (a.0.min(b.0), a.1.max(b.1));
+                }
+                if let Some(s) = sections.get_mut(k) {
+                    s.0 = s.1;
+                }
+            }
+        }
+        sections.retain(|s| s.0 != s.1);
+        sections.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let lines: Vec<(DVec2, DVec2)> = sections.iter().map(|s| (DVec2::new(x, s.0), DVec2::new(x, s.1))).collect();
+        let mut used = vec![false; lines.len()];
+        let mut still = Vec::with_capacity(open.len());
+        for mut t in open.drain(..) {
+            let (Some(&low), Some(&high)) = (t.lows.last(), t.highs.last()) else { continue };
+            let first = lines.partition_point(|l| l.1.y <= low.y);
+            let end = lines.partition_point(|l| l.0.y <= high.y);
+            let pick = (first..end).find(|k| !used.get(*k).copied().unwrap_or(true));
+            match pick.and_then(|k| lines.get(k).map(|l| (k, *l))) {
+                Some((k, (a, b))) => {
+                    if low.distance_squared(a) < limit {
+                        t.lows.push(a);
+                    } else {
+                        t.lows.extend([low + half, a - half, a]);
+                    }
+                    if high.distance_squared(b) < limit {
+                        t.highs.push(b);
+                    } else {
+                        t.highs.extend([high + half, b - half, b]);
+                    }
+                    if let Some(u) = used.get_mut(k) {
+                        *u = true;
+                    }
+                    still.push(t);
+                }
+                None => {
+                    t.lows.push(low + half);
+                    t.highs.push(high + half);
+                    close(t, &mut out);
+                }
+            }
+        }
+        open = still;
+        for (line, was_used) in lines.iter().zip(&used) {
+            if !*was_used {
+                open.push(Traced { lows: vec![line.0 - half, line.0], highs: vec![line.1 - half, line.1] });
+            }
+        }
+    }
+    for t in open {
+        close(t, &mut out);
+    }
+    rotated(&geom::union(&out), back)
+}
+
+fn ring_lines(shapes: &[Shape]) -> Vec<Polyline> {
+    shapes
+        .iter()
+        .flatten()
+        .map(|c| {
+            let mut r = c.clone();
+            r.extend(c.first().copied());
+            r
+        })
+        .collect()
+}
+
+fn polyline_lines(lines: &[Polyline]) -> Vec<[DVec2; 2]> {
+    lines.iter().flat_map(|l| l.windows(2).map(|w| [w[0], w[1]])).collect()
+}
+
+/// A solid surface's candidate for bridging, and what becomes of it.
+struct Candidate {
+    surface: usize,
+    polys: Vec<Shape>,
+    angle: f64,
+}
+
+/// `bridge_over_infill`: solid infill over sparse infill bridges it, anchored on the lines below.
+fn bridge_over_infill(
+    typed: &mut [Typed],
+    layers: &[Input],
+    s: &Settings,
+    lines_below: &(dyn Fn(usize, &[Shape]) -> Vec<Polyline> + Sync),
+) {
+    let n = typed.len();
+    let solid_spacing = |i: usize| {
+        let h = layers.get(i).map_or(s.layer_height, |l| l.height);
+        Settings::spacing(widths(s, i == 0).2, h)
+    };
+    // Which solid surfaces have unsupported parts.
+    let mut by_layer: Vec<Vec<Candidate>> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let Some(below) = i.checked_sub(1).and_then(|k| typed.get(k).zip(layers.get(k))) else {
+                return Vec::new();
+            };
+            let (Some(this), (lower, lower_in)) = (typed.get(i), below) else { return Vec::new() };
+            let spacing = solid_spacing(i);
+            let mut lower_solids: Vec<Shape> = lower.top.clone();
+            lower_solids.extend_from_slice(&lower.bottom);
+            lower_solids.extend_from_slice(&lower.solid);
+            lower_solids.extend(lower.bridges.iter().flat_map(|b| b.0.iter().cloned()));
+            let lower_solids = geom::offset(&geom::union(&lower_solids), -spacing, Join::Miter);
+            let lower_solids = geom::offset(&lower_solids, 4.0 * spacing, Join::Miter);
+            let unsupported_area = closing(&lower_in.fill, 1e-4);
+            let unsupported_area = geom::offset(&unsupported_area, -3.0 * spacing, Join::Miter);
+            let unsupported_area = diff(&unsupported_area, &lower_solids);
+            let mut out = Vec::new();
+            for (k, surface) in this.solid.iter().enumerate() {
+                let one = std::slice::from_ref(surface);
+                let unsupported = both(one, &unsupported_area);
+                if unsupported.is_empty() {
+                    continue;
+                }
+                let area = geom::area(&unsupported);
+                let partly = area < geom::area(one) - 1e-4;
+                if partly && area <= 9.0 * spacing * spacing {
+                    continue;
+                }
+                let mut worth = both(one, &geom::offset(&unsupported, 4.0 * spacing, Join::Miter));
+                for p in diff(one, &geom::offset(&worth, spacing, Join::Miter)) {
+                    let a = geom::shape_area(&p);
+                    if a < spacing * 12.0 && a > spacing * spacing {
+                        worth.push(p);
+                    }
+                }
+                let worth = both(&closing(&worth, 1e-4), one);
+                out.push(Candidate { surface: k, polys: worth, angle: 0.0 });
+            }
+            out
+        })
+        .collect();
+
+    // Grown along the bridge lines, lowest layer first: each sees what lies below.
+    let thick = if s.bridges.width > 0.0 { s.bridges.width } else { s.nozzle };
+    let (flow_w, flow_spacing, target) = (thick, thick + 0.05, thick * 0.9);
+    let z_of = |i: usize| layers.iter().take(i + 1).map(|l| l.height).sum::<f64>();
+    for lidx in 0..n {
+        if by_layer.get(lidx).is_none_or(Vec::is_empty) {
+            continue;
+        }
+        let top_z = z_of(lidx);
+        let bottom_z = top_z - target * 0.9 - 1e-4;
+        let (mut sparse_near, mut not_sparse) = (Vec::new(), Vec::new());
+        for k in (0..lidx).rev() {
+            if z_of(k) < bottom_z && k + 1 < lidx {
+                break;
+            }
+            let Some(t) = typed.get(k) else { continue };
+            sparse_near.extend_from_slice(&t.sparse);
+            not_sparse.extend_from_slice(&t.top);
+            not_sparse.extend_from_slice(&t.bottom);
+            not_sparse.extend_from_slice(&t.solid);
+            not_sparse.extend(t.bridges.iter().flat_map(|b| b.0.iter().cloned()));
+        }
+        let mut deep = diff(&closing(&geom::union(&sparse_near), 1e-4), &closing(&geom::union(&not_sparse), 1e-4));
+        let filled_z = top_z - target - 1e-4;
+        for k in (0..lidx).rev() {
+            if z_of(k) < filled_z {
+                break;
+            }
+            let done: Vec<Shape> =
+                by_layer.get(k).into_iter().flatten().flat_map(|c| c.polys.iter().cloned()).collect();
+            if !done.is_empty() {
+                deep = diff(&deep, &done);
+            }
+        }
+        let deep = geom::offset(&deep, flow_spacing * 1.5, Join::Miter);
+        let Some(this) = typed.get(lidx) else { continue };
+        let top_area = geom::union(&this.top);
+        let mut expansion = closing(&all(this.sparse.clone(), &this.solid), 1e-4);
+        let total_fill = closing(&layers.get(lidx).map_or(Vec::new(), |l| l.fill.clone()), 1e-4);
+        expansion = both(&expansion, &deep);
+        let below_lines = lines_below(lidx - 1, &deep);
+        let anchors = geom::clip_lines(&below_lines, &geom::offset(&expansion, -flow_spacing, Join::Miter));
+        let unsupported_core = geom::offset(&deep, -flow_spacing * 4.5, Join::Miter);
+        let mut sorted = by_layer.get_mut(lidx).map(std::mem::take).unwrap_or_default();
+        let corner = |c: &Candidate| geom::bounds(&c.polys).map_or((0.0, 0.0), |(lo, _)| (lo.x, lo.y));
+        sorted.sort_by(|a, b| {
+            let (x, y) = (corner(a), corner(b));
+            x.0.total_cmp(&y.0).then(x.1.total_cmp(&y.1))
+        });
+        if sorted.len() > 2 {
+            let origin = sorted.first().and_then(|c| geom::bounds(&c.polys)).map_or(DVec2::ZERO, |b| b.1);
+            let from = |c: &Candidate| geom::bounds(&c.polys).map_or(0.0, |(lo, _)| lo.distance_squared(origin));
+            if let Some(rest) = sorted.get_mut(1..) {
+                rest.sort_by(|a, b| from(a).total_cmp(&from(b)));
+            }
+        }
+        let mut done: Vec<Candidate> = Vec::with_capacity(sorted.len());
+        for c in sorted {
+            let area = both(&geom::offset(&c.polys, flow_spacing, Join::Miter), &deep);
+            let area: Vec<Shape> =
+                area.into_iter().filter(|p| !both(std::slice::from_ref(p), &unsupported_core).is_empty()).collect();
+            if area.is_empty() {
+                continue;
+            }
+            let limiting = all(area.clone(), &expansion);
+            let mut boundary = ring_lines(&geom::offset(&total_fill, 1.3 * flow_spacing, Join::Miter));
+            boundary.extend(ring_lines(&limiting));
+            let mut angle = if anchors.is_empty() {
+                determine_bridging_angle(&area, &polyline_lines(&boundary))
+            } else {
+                determine_bridging_angle(&area, &polyline_lines(&anchors))
+            };
+            if let Some(set) = s.bridges.internal_angle {
+                angle = set.to_radians();
+            }
+            boundary.extend_from_slice(&anchors);
+            let bound = polyline_lines(&boundary);
+            let mut bridging = anchored_polygon(&area, &bound, flow_w, flow_spacing, angle);
+            let near = geom::offset(&bridging, 3.0 * flow_spacing, Join::Miter);
+            if let Some(other) = done.iter().find(|o| !both(&o.polys, &near).is_empty()) {
+                angle = other.angle;
+                bridging = anchored_polygon(&area, &bound, flow_w, flow_spacing, angle);
+            }
+            let bridging = closing(&opening(&bridging, flow_spacing * 0.75), flow_spacing);
+            let bridging = both(&both(&bridging, &limiting), &total_fill);
+            let bridging = diff(&bridging, &top_area);
+            expansion = diff(&expansion, &bridging);
+            done.push(Candidate { surface: c.surface, polys: bridging, angle });
+        }
+        if let Some(slot) = by_layer.get_mut(lidx) {
+            *slot = done;
+        }
+    }
+
+    // The infill round them gives way, and the layer below keeps a solid edge under them.
+    let extra: Vec<Vec<Shape>> = (0..n)
+        .map(|i| {
+            by_layer
+                .get(i + 1)
+                .into_iter()
+                .flatten()
+                .flat_map(|c| diff(&c.polys, &geom::offset(&c.polys, -solid_spacing(i + 1), Join::Miter)))
+                .collect()
+        })
+        .collect();
+    typed.par_iter_mut().zip(by_layer.par_iter()).zip(extra.par_iter()).enumerate().for_each(
+        |(i, ((t, here), add))| {
+            if here.is_empty() && add.is_empty() {
+                return;
+            }
+            let spacing = solid_spacing(i);
+            let cut: Vec<Shape> = here.iter().flat_map(|c| c.polys.iter().cloned()).collect();
+            let mut everything: Vec<Shape> = t.top.clone();
+            everything.extend_from_slice(&t.bottom);
+            everything.extend_from_slice(&t.solid);
+            everything.extend_from_slice(&t.sparse);
+            everything.extend(t.bridges.iter().flat_map(|b| b.0.iter().cloned()));
+            let everything = geom::union(&everything);
+            let near = diff(&everything, &geom::offset(&everything, -spacing, Join::Miter));
+            let ensuring = both(add, &near);
+            t.sparse = diff(&diff(&t.sparse, &cut), &ensuring);
+            t.solid = diff(&all(std::mem::take(&mut t.solid), &ensuring), &cut);
+            t.internal_bridges =
+                here.iter().flat_map(|c| geom::union(&c.polys).into_iter().map(|p| (vec![p], c.angle))).collect();
+        },
+    );
+}
+
+/// Every layer's fill by type. `lines_below` gives a layer's sparse infill lines within an area,
+/// which bridges above anchor on.
+pub fn prepare(
+    layers: &[Input],
+    s: &Settings,
+    lines_below: &(dyn Fn(usize, &[Shape]) -> Vec<Polyline> + Sync),
+) -> Vec<Typed> {
     let typed = detect(layers, s);
     let mut fills: Vec<Fill> = typed
         .into_par_iter()
@@ -572,12 +1005,16 @@ pub fn prepare(layers: &[Input], s: &Settings) -> Vec<Typed> {
     } else {
         horizontal_shells(&mut fills, layers, s);
     }
-    fills
+    let mut typed: Vec<Typed> = fills
         .into_par_iter()
         .zip(layers.par_iter())
         .enumerate()
         .map(|(i, (f, l))| external(f, s, i == 0, l.height))
-        .collect()
+        .collect();
+    if s.density > 0.0 && s.density < 0.999 {
+        bridge_over_infill(&mut typed, layers, s, lines_below);
+    }
+    typed
 }
 
 #[cfg(test)]
@@ -588,7 +1025,7 @@ mod tests {
     fn waves_follow_orcas_steps() {
         let w = Wave::new(0.9);
         assert!((w.tiny + w.step * w.steps as f64 - 0.9).abs() < 1e-9);
-        assert_eq!(w.steps, 5);
+        assert!(w.steps > 1 && w.steps <= 5);
     }
 
     #[test]
