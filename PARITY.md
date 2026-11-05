@@ -74,12 +74,12 @@ monotonic lines, line ends, file header, footer, start and end order, machine li
 | Cooled speed, a few units off (F4641 vs F4644 on the cube) | Decided by total layer time, so it settles only when the toolpath does. Includes Orca's parser quirk, ported. | Follows from the rows above. |
 | Time and filament totals | Orca's estimator also counts heating and loading; `filament used` includes the start purge. | Port `GCodeProcessor` accounting. |
 
-## Differences from ties, which depend on numerical noise
+## Seams still to pin down
 
-| Difference | Cause |
-|---|---|
-| Seam on a perfect cylinder | Every point scores the same, so nanometre rounding decides. We start from the rear-most point, which is right for cubes, not cylinders. |
-| Which equal arcs join in sparse infill on symmetric parts | Equal lengths sort by the order Clipper returned the lines. 36 orderings tried; none reach 100 %. The lines themselves match; only joins and hooks move. Parts without equal arcs are unaffected. |
+Cylinder seams now land on Orca's vertex. On Benchy 98 of 240 layers start within 1 mm of Orca's seam,
+and on bridge none do: its strings cross from the pillars into the deck, where Orca's stop. Picks on
+the pillars match Orca, so the cause is in alignment or in visibility values, which cannot be read out
+of Orca's G-code. Not yet explained.
 
 ## Not traced yet
 
