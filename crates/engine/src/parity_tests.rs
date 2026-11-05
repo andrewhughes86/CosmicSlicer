@@ -90,13 +90,43 @@ fn compare(case: &Path) -> Report {
     if models.is_empty() {
         return fail("no model .stl".into());
     }
-    let orca = view_gcode(orca_text, &cfg, &filaments_of(&cfg));
-    let Some(job) = job_for(&models, &cfg, &orca.preview) else { return fail("model unreadable".into()) };
+    let orca = view_gcode(orca_text.clone(), &cfg, &filaments_of(&cfg));
+    let Some(mut job) = job_for(&models, &cfg, &orca.preview) else { return fail("model unreadable".into()) };
     let started = std::time::Instant::now();
-    let ours = match slice(&job, &Progress::default()) {
+    let mut ours = match slice(&job, &Progress::default()) {
         Ok(s) => s,
         Err(e) => return fail(format!("our slice failed: {e:?}")),
     };
+    // Where Orca's arrange put the object shows only in its walls, and a part's walls need not
+    // be centred on it: one slice shows how far off that guess was.
+    let first = view_gcode(ours.gcode.clone(), &cfg, &filaments_of(&cfg));
+    let mut moved = false;
+    for (k, object) in job.objects.iter_mut().enumerate() {
+        let tool = (models.len() > 1).then_some(k);
+        let (Some(want), Some(have)) =
+            (first_layer_centre(&orca.preview, tool), first_layer_centre(&first.preview, tool))
+        else {
+            continue;
+        };
+        let (dx, dy) = (want[0] - have[0], want[1] - have[1]);
+        if dx.abs().max(dy.abs()) > 0.05 && dx.abs().max(dy.abs()) < 5.0 {
+            let at = object.matrix.w_axis;
+            let snap = |v: f64| ((v * 1000.0).round() / 1000.0) as f32;
+            object.matrix =
+                Mat4::from_translation(Vec3::new(snap(f64::from(at.x) + dx), snap(f64::from(at.y) + dy), at.z));
+            moved = true;
+        }
+    }
+    // The first layer's walls can mislead too, so the better of the two stands.
+    if moved {
+        let lines: HashSet<&str> = orca_text.lines().filter(|l| l.starts_with("G1 X")).collect();
+        let score = |g: &str| g.lines().filter(|l| lines.contains(l)).count();
+        match slice(&job, &Progress::default()) {
+            Ok(s) if score(&s.gcode) > score(&ours.gcode) => ours = s,
+            Ok(_) => {}
+            Err(e) => return fail(format!("our slice failed: {e:?}")),
+        }
+    }
     let secs = started.elapsed().as_secs_f64();
     let _ = std::fs::write(case.join("ours.gcode"), &ours.gcode);
     // Both through the same reader, so the comparison is of the toolpaths, not the estimators.
@@ -353,6 +383,13 @@ fn object_centre(p: &Preview, tool: Option<usize>) -> Option<[f64; 2]> {
         }
     }
     (lo[0] <= hi[0]).then(|| [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0])
+}
+
+/// The middle of the first layer's outer walls, which overhangs do not change.
+fn first_layer_centre(p: &Preview, tool: Option<usize>) -> Option<[f64; 2]> {
+    let layer = p.layers.iter().find(|l| !l.segments.is_empty())?;
+    let one = Preview { segments: p.segments.get(layer.segments.clone())?.to_vec(), ..Preview::default() };
+    object_centre(&one, tool)
 }
 
 /// Cells each layer's object toolpaths pass over, keyed by height (0.01 mm).

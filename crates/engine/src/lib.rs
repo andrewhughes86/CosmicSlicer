@@ -13,6 +13,7 @@
 
 pub mod arcs;
 pub mod calib;
+pub mod chain;
 pub mod clipper;
 pub mod connect;
 pub mod fuzzy;
@@ -509,7 +510,8 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
         for (k, v) in &o.overrides {
             cfg.set(k.clone(), v.clone());
         }
-        let os = Settings::read(schema, &cfg);
+        let mut os = Settings::read(schema, &cfg);
+        os.origin = Some(glam::DVec2::new(p.shift.0 as f64 * 1e-6, p.shift.1 as f64 * 1e-6));
         let painted = paint_layers(o, p, &layers, &cancelled);
         let regions = layer_regions(schema, &cfg, o, &layers, &vslices, &painted);
         if let Some(angle) = os.printable_overhang {

@@ -195,11 +195,20 @@ fn internal_bridges(solid: &[Shape], sparse_below: &[Shape], s: &Settings, h: f6
 /// Paths from fill lines; lines that must keep their order share a new group.
 fn paths_of(lines: Vec<infill::Line>, role: Role, width: f64, speed: f64, flow: f64) -> Vec<Path> {
     let group = if lines.iter().any(|l| l.ordered) { Path::new_group() } else { 0 };
+    let mut collections: Vec<(u32, u32)> = Vec::new();
     lines
         .into_iter()
         .filter(|l| l.points.len() >= 2)
         .map(|l| {
+            let collection = match collections.iter().find(|c| c.0 == l.part) {
+                Some(c) => c.1,
+                None => {
+                    collections.push((l.part, Path::new_group()));
+                    collections.last().map_or(0, |c| c.1)
+                }
+            };
             let mut p = Path::new(role, l.points, l.closed, width, speed, flow);
+            p.collection = collection;
             if l.ordered {
                 p.group = group;
             }
@@ -595,6 +604,18 @@ struct Around<'a> {
 }
 
 /// The islands of one object on every layer.
+/// Where the object's fill patterns are measured from: its centre, as Orca keeps its slices
+/// (the mesh's when known, which a slice's outline can miss between layers).
+fn object_origin(slices: &[Vec<Shape>], s: &Settings) -> glam::DVec2 {
+    s.origin.unwrap_or_else(|| {
+        slices
+            .iter()
+            .filter_map(|sl| geom::bounds(sl))
+            .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
+            .map_or(glam::DVec2::ZERO, |(lo, hi)| (lo + hi) / 2.0)
+    })
+}
+
 pub fn object(
     slices: &[Vec<Shape>],
     layers: &[LayerZ],
@@ -665,11 +686,7 @@ pub fn object(
                 height: layers.get(i).map_or(s.layer_height, |l| l.height),
             })
             .collect();
-        let origin = slices
-            .iter()
-            .filter_map(|sl| geom::bounds(sl))
-            .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
-            .map_or(glam::DVec2::ZERO, |(lo, hi)| (lo + hi) / 2.0);
+        let origin = object_origin(slices, s);
         // The sparse infill's lines, unjoined, for the bridges above to anchor on.
         let lines_below = |k: usize, near: &[Shape]| -> Vec<Polyline> {
             let area: Vec<Shape> = input.get(k).map_or(Vec::new(), |l| geom::boolean(&l.fill, near, Op::Intersect));
@@ -719,11 +736,7 @@ pub fn object(
     let combined = combine(&sparse, layers, s);
     let topmost = slices.iter().rposition(|sl| !sl.is_empty()).unwrap_or(0);
     // The middle of the object's footprint over all its layers (OrcaSlicer's object origin).
-    let origin = slices
-        .iter()
-        .filter_map(|sl| geom::bounds(sl))
-        .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
-        .map_or(glam::DVec2::ZERO, |(lo, hi)| (lo + hi) / 2.0);
+    let origin = object_origin(slices, s);
     // Second pass: paths.
     (0..walled.len())
         .into_par_iter()

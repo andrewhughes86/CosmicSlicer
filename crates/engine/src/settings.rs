@@ -66,6 +66,8 @@ pub struct Settings {
     pub printable_overhang: Option<f64>,
     /// A Bambu Lab printer: OrcaSlicer writes those files' comments its own way.
     pub bbl: bool,
+    /// The object's centre on the plate, once placed: what fill patterns are measured from.
+    pub origin: Option<glam::DVec2>,
     /// A bed-slinger (OrcaSlicer's "i3" structure): timelapse pictures differ.
     pub i3: bool,
     /// Object names and label comments in the G-code.
@@ -1317,6 +1319,7 @@ impl Settings {
             bridges,
             seams,
             bbl: r.text("printer_model").starts_with("Bambu"),
+            origin: None,
             i3: r.text("printer_structure") == "i3",
             label_objects: r.flag("gcode_label_objects"),
             xy_contour: r.range("xy_contour_compensation", 0.0, -10.0, 10.0),

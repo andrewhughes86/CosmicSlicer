@@ -22,11 +22,13 @@ pub struct Line {
     pub closed: bool,
     /// Printed in the order given (monotonic patterns), not nearest first.
     pub ordered: bool,
+    /// Which shape of the filled area it came from, for the patterns that fill one at a time.
+    pub part: u32,
 }
 
 impl Line {
     fn open(points: Polyline) -> Line {
-        Line { points, closed: false, ordered: false }
+        Line { points, closed: false, ordered: false, part: 0 }
     }
 }
 
@@ -214,8 +216,17 @@ pub fn fill_with(area: &[Shape], kind: Kind, p: &Params) -> Vec<Line> {
     if let Some(job) = rectilinear_job(kind, p) {
         return area
             .iter()
-            .flat_map(|shape| crate::rectilinear::fill(&geom::paths_of(shape), &job).unwrap_or_default().lines)
-            .map(|l| Line { points: geom::from_nm(&l), closed: false, ordered: job.monotonic })
+            .enumerate()
+            .flat_map(|(part, shape)| {
+                let lines = crate::rectilinear::fill(&geom::paths_of(shape), &job).unwrap_or_default().lines;
+                lines.into_iter().map(move |l| (part, l))
+            })
+            .map(|(part, l)| Line {
+                points: geom::from_nm(&l),
+                closed: false,
+                ordered: job.monotonic,
+                part: part as u32,
+            })
             .filter(|l| l.points.len() >= 2)
             .collect();
     }
@@ -831,7 +842,14 @@ fn cross_zag(area: &[Shape], a: f64, w: f64, d: f64, p: &Params) -> Vec<Line> {
 /// further apart. The grid is fixed four lines at a time from the object's origin.
 fn cross_hatch(area: &[Shape], p: &Params, s: f64) -> Vec<Line> {
     let density = p.density.min(1.0);
-    area.iter().flat_map(|shape| cross_hatch_one(shape, p, s * density, density)).collect()
+    area.iter()
+        .enumerate()
+        .flat_map(|(part, shape)| {
+            let mut lines = cross_hatch_one(shape, p, s * density, density);
+            lines.iter_mut().for_each(|l| l.part = part as u32);
+            lines
+        })
+        .collect()
 }
 
 /// `FillCrossHatch::_fill_surface_single`, in Orca's integers: the region turned into the
@@ -1429,7 +1447,10 @@ impl<'a> Edges<'a> {
 
 /// Loops inset `spacing` apart until the area runs out.
 fn concentric(area: &[Shape], spacing: f64) -> Vec<Line> {
-    concentric_loops(area, spacing).into_iter().map(|points| Line { points, closed: true, ordered: false }).collect()
+    concentric_loops(area, spacing)
+        .into_iter()
+        .map(|points| Line { points, closed: true, ordered: false, part: 0 })
+        .collect()
 }
 
 fn concentric_loops(area: &[Shape], spacing: f64) -> Vec<Polyline> {

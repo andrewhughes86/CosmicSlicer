@@ -209,7 +209,7 @@ fn pop_heap(heap: &mut Vec<Candidate>) -> Option<Candidate> {
         heap.swap(hole, child);
         hole = child;
     }
-    if n % 2 == 0 && child == (n - 2) / 2 {
+    if n.is_multiple_of(2) && child == (n - 2) / 2 {
         child = 2 * (child + 1);
         heap.swap(hole, child - 1);
         hole = child - 1;

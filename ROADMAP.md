@@ -488,7 +488,7 @@ Done so far (2026-11-02):
   runaway test once took VS Code down).
 - Performance: `Progress::timings` gives seconds per stage; `budget_tests` slices a reference
   set (Orca's calibration towers, spheres with tree and grid support, a gyroid torus) against
-  time budgets and a 1.5 GB peak, run on its own in CI. Faster: i_overlay in 32-bit integers
+  time budgets and a 1.5 GB peak, run on its own in CI. Faster: i_overlay in 32-bit integers (since replaced by a port of Orca's Clipper)
   (2× per offset), narrow-part detection that reuses the walls' centre-line offset and stops
   early, support toolpaths and travel regions made in parallel, column supports split into
   parallel growth, a sequential carry and parallel finishing. G-code memory: the motion
@@ -515,7 +515,7 @@ Done so far (2026-11-02):
   facing inwards, kept). Self-intersections within one shell are not repaired yet.
 - The round primitives (sphere, cone, torus) were open at their poles, tip and seam; `lathe`
   now shares those vertices, and every primitive is checked closed.
-- Still open: offsets cost ~1 ms each in i_overlay (the speed test structure's walls);
+- Still open then: offsets cost ~1 ms each in i_overlay, since replaced by Clipper (the speed test structure's walls);
   self-intersections within a shell; booleans run on the UI thread (Benchy 0.2 s).
 
 ## 19 · Parity with OrcaSlicer — in progress

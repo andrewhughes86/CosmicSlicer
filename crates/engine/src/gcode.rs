@@ -127,6 +127,20 @@ impl Context<'_> {
     }
 }
 
+/// Renders custom G-code: what it is called, its text, and this layer's variables.
+type Render<'r> = dyn FnMut(&str, &str, &[(&str, Value)]) -> String + 'r;
+
+/// A point in Orca's units, for the chaining's distances.
+fn nm_point(p: DVec2) -> [f64; 2] {
+    [(p.x * 1.0e6).round(), (p.y * 1.0e6).round()]
+}
+
+/// A path's first or last point, for chaining.
+fn end_point(path: &Path, first: bool) -> [f64; 2] {
+    let at = if first || path.closed { path.points.first() } else { path.points.last() };
+    at.map_or([0.0; 2], |p| nm_point(*p))
+}
+
 /// Something asked for at a layer from the layer slider.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerEvent {
@@ -1216,6 +1230,60 @@ impl<'a> Writer<'a> {
 
     /// Prints paths nearest first, reversing open lines when their far end is nearer. Ordered
     /// groups print whole, in their order, from wherever the first of them is reached.
+    /// Orca's `extrude_infill`: the regions chained, then the lines within each unless they keep
+    /// their order; ironing last.
+    fn print_fills(&mut self, paths: Vec<Path>, object: usize) {
+        let (ironing, fills): (Vec<Path>, Vec<Path>) = paths.into_iter().partition(|p| p.role == Role::Ironing);
+        for paths in [fills, ironing] {
+            let mut sets: Vec<Vec<Path>> = Vec::new();
+            for p in paths {
+                match sets
+                    .iter_mut()
+                    .find(|s| p.collection != 0 && s.first().is_some_and(|f| f.collection == p.collection))
+                {
+                    Some(set) => set.push(p),
+                    None => sets.push(vec![p]),
+                }
+            }
+            let ends: Vec<_> = sets
+                .iter()
+                .map(|s| {
+                    (
+                        s.first().map_or([0.0; 2], |p| end_point(p, true)),
+                        s.last().map_or([0.0; 2], |p| end_point(p, false)),
+                    )
+                })
+                .collect();
+            let turns: Vec<bool> = sets.iter().map(|s| s.iter().all(|p| p.group == 0)).collect();
+            let mut sets: Vec<Option<Vec<Path>>> = sets.into_iter().map(Some).collect();
+            for (i, reversed) in crate::chain::chain(&ends, &turns, nm_point(self.pos.truncate())) {
+                let Some(mut set) = sets.get_mut(i).and_then(Option::take) else { continue };
+                if reversed && !set.iter().all(|p| p.closed) {
+                    set.reverse();
+                    set.iter_mut().for_each(Path::reverse);
+                }
+                if set.iter().any(|p| p.group != 0) {
+                    for mut p in set {
+                        self.place_seam(&mut p, Some(object), None);
+                        self.extrude(&p);
+                    }
+                    continue;
+                }
+                let ends: Vec<_> = set.iter().map(|p| (end_point(p, true), end_point(p, false))).collect();
+                let order = crate::chain::chain(&ends, &vec![true; set.len()], nm_point(self.pos.truncate()));
+                let mut set: Vec<Option<Path>> = set.into_iter().map(Some).collect();
+                for (j, reversed) in order {
+                    let Some(mut p) = set.get_mut(j).and_then(Option::take) else { continue };
+                    if reversed && !p.closed {
+                        p.reverse();
+                    }
+                    self.place_seam(&mut p, Some(object), None);
+                    self.extrude(&p);
+                }
+            }
+        }
+    }
+
     fn print_nearest(&mut self, paths: Vec<Path>, object: Option<usize>, depth: Option<usize>) {
         let mut groups: Vec<Vec<Path>> = Vec::new();
         let mut free: Vec<Path> = Vec::with_capacity(paths.len());
@@ -1440,7 +1508,7 @@ impl<'a> Writer<'a> {
                 self.print_nearest(ws.clone(), Some(object), Some(k));
             }
         }
-        self.print_nearest(island.fills.clone(), Some(object), None);
+        self.print_fills(island.fills.clone(), object);
         self.region = None;
         self.pending_region = None;
     }
@@ -2215,7 +2283,7 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         // on a helix; the rest at the end of the layer or before leaving the pictured nozzle.
         let traditional = (s.bbl || !s.gcode.timelapse.is_empty()) && ((s.i3 && !s.spiral) || s.multi.nozzles > 1);
         let mut pictured = false;
-        let snapshot = |w: &mut Writer<'_>, render: &mut dyn FnMut(&str, &str, &[(&str, Value)]) -> String| {
+        let snapshot = |w: &mut Writer<'_>, render: &mut Render<'_>| {
             if w.retraction().on_layer_change {
                 w.retract();
                 w.eager_lift();

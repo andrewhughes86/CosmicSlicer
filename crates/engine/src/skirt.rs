@@ -171,6 +171,7 @@ pub fn brim(footprint: &[Shape], s: &Settings, object_height: f64, material: &st
             flow: 1.0,
             overhang: Vec::new(),
             group: 0,
+            collection: 0,
             bends: Vec::new(),
             fitted: false,
         });
@@ -303,6 +304,7 @@ fn ear_loops(ears: &[Shape], outlines: &[Shape], s: &Settings) -> (Vec<Path>, Ve
                 flow: 1.0,
                 overhang: Vec::new(),
                 group: 0,
+                collection: 0,
                 bends: Vec::new(),
                 fitted: false,
             });
@@ -375,6 +377,7 @@ pub fn skirt(around: &[Shape], s: &Settings, width: f64, height: f64) -> Vec<Pat
                 flow: 1.0,
                 overhang: Vec::new(),
                 group: 0,
+                collection: 0,
                 bends: Vec::new(),
                 fitted: false,
             });
