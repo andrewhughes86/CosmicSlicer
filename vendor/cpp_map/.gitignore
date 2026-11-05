@@ -1,0 +1,14 @@
+/target
+Cargo.lock
+
+**/.settings
+**/.cproject
+**/.proj
+**/*.rs.bk
+**.autosave
+**.DS_Store
+boostvoronoi.iml
+.vscode
+.project
+.idea
+/sync_version.py

@@ -1,21 +1,18 @@
 //! Planar regions: shapes made of an outer boundary and holes, with offsets, booleans, line
-//! clipping and point tests through the `i_overlay` engine.
+//! clipping and point tests, through OrcaSlicer's Clipper ([`crate::clipper`]) and its
+//! `ClipperUtils` wrappers, so regions come out with the same vertices in the same order.
 //!
 //! A [`Shape`] is its outer contour (counter-clockwise) followed by its holes (clockwise), with
-//! no repeated closing point. Every third-party call runs under `catch_unwind`; a panic there
-//! comes back as an empty result, never as a crash. The engine works in 32-bit integers,
-//! scaled to each call's bounds (about 1e-7 mm on a 250 mm bed): twice as fast as 64-bit.
+//! no repeated closing point. Millimetres go in and out; Clipper works in Orca's 1 nm integers.
+//! Everything runs under `catch_unwind`, and a failed call comes back empty, never as a crash.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use glam::DVec2;
-use i_overlay::core::fill_rule::FillRule;
-use i_overlay::core::overlay_rule::OverlayRule;
-use i_overlay::float::clip::FloatClip;
-use i_overlay::float::single::SingleFloatOverlay;
-use i_overlay::mesh::float::outline::offset::OutlineOffset;
-use i_overlay::mesh::float::style::{LineJoin, OutlineStyle};
-use i_overlay::string::clip::ClipRule;
+
+use crate::clipper::{
+    self, ClipType, Clipper, ClipperOffset, EndType, Failed, FillType, JoinType, Path, Paths, PolyTree, PolyType, Pt,
+};
 
 /// One closed contour.
 pub type Contour = Vec<DVec2>;
@@ -24,31 +21,183 @@ pub type Shape = Vec<Contour>;
 /// An open line.
 pub type Polyline = Vec<DVec2>;
 
-type Raw = Vec<Vec<Vec<[f64; 2]>>>;
+/// Orca's `SCALING_FACTOR`: units per millimetre.
+const SCALE: f64 = 1.0e6;
+/// Orca's `SCALED_RESOLUTION`: how finely round joins are stepped, in Clipper's units.
+const ROUND_TOLERANCE: f64 = 0.0125 * SCALE;
+/// `ClipperOffsetShortestEdgeFactor`.
+const SHORTEST_EDGE_FACTOR: f64 = 0.005;
+/// Past this, a coordinate is garbage (a thousand kilometres).
+const FAR: f64 = 1.0e9;
 
-fn to_raw(shapes: &[Shape]) -> Raw {
-    shapes
-        .iter()
-        .map(|s| {
-            s.iter()
-                .filter(|c| c.len() >= 3 && c.iter().all(|p| p.is_finite()))
-                .map(|c| c.iter().map(|p| [p.x, p.y]).collect())
-                .collect::<Vec<_>>()
-        })
-        .filter(|s: &Vec<Vec<[f64; 2]>>| !s.is_empty())
-        .collect()
+fn usable(p: DVec2) -> bool {
+    p.is_finite() && p.x.abs() < FAR && p.y.abs() < FAR
 }
 
-fn from_raw(raw: Raw) -> Vec<Shape> {
-    raw.into_iter()
-        .map(|s| {
-            s.into_iter()
-                .map(|c| c.into_iter().map(|[x, y]| DVec2::new(x, y)).collect::<Contour>())
-                .filter(|c| c.len() >= 3)
-                .collect::<Shape>()
-        })
-        .filter(|s: &Shape| !s.is_empty())
-        .collect()
+fn to_pt(p: DVec2) -> Pt {
+    Pt::new((p.x * SCALE).round() as i64, (p.y * SCALE).round() as i64)
+}
+
+fn to_path(c: &[DVec2]) -> Path {
+    c.iter().map(|p| to_pt(*p)).collect()
+}
+
+fn from_path(c: &[Pt]) -> Contour {
+    c.iter().map(|p| DVec2::new(p.x as f64 / SCALE, p.y as f64 / SCALE)).collect()
+}
+
+/// The usable contours, each shape's outer first, as Orca's `ExPolygonsProvider` gives them.
+fn to_paths(shapes: &[Shape]) -> Paths {
+    shapes.iter().flatten().filter(|c| c.len() >= 3 && c.iter().all(|p| usable(*p))).map(|c| to_path(c)).collect()
+}
+
+/// `PolyTreeToExPolygons`: each outer with its holes, then what sits inside those holes.
+fn to_shapes(tree: &PolyTree) -> Vec<Shape> {
+    let mut out = Vec::new();
+    let mut stack: Vec<usize> = tree.children.iter().rev().copied().collect();
+    while let Some(n) = stack.pop() {
+        let Some(node) = tree.nodes.get(n) else { continue };
+        let mut shape = vec![from_path(&node.contour)];
+        let mut nested = Vec::new();
+        for hole in node.children.iter().filter_map(|h| tree.nodes.get(*h)) {
+            shape.push(from_path(&hole.contour));
+            nested.extend(hole.children.iter().copied());
+        }
+        out.push(shape);
+        stack.extend(nested.into_iter().rev());
+    }
+    out
+}
+
+/// Runs Clipper, turning a failure or a panic into an empty result.
+fn guarded<T: Default>(run: impl FnOnce() -> Result<T, Failed>) -> T {
+    catch_unwind(AssertUnwindSafe(|| run().unwrap_or_default())).unwrap_or_default()
+}
+
+/// `clipper_do` into plain paths.
+fn clip_paths(op: ClipType, subject: &[Path], clip: &[Path], fill: FillType) -> Result<Paths, Failed> {
+    let mut c = Clipper::new();
+    c.add_paths(subject, PolyType::Subject, true)?;
+    c.add_paths(clip, PolyType::Clip, true)?;
+    c.execute(op, fill, fill)
+}
+
+fn union_tree(paths: &[Path], fill: FillType) -> Result<PolyTree, Failed> {
+    let mut c = Clipper::new();
+    c.add_paths(paths, PolyType::Subject, true)?;
+    c.execute_tree(ClipType::Union, fill, fill)
+}
+
+/// `clipper_do_polytree`: the operation into paths, then a union to find which loops are holes.
+fn clip_tree(op: ClipType, subject: &[Path], clip: &[Path], fill: FillType) -> Result<PolyTree, Failed> {
+    let out = clip_paths(op, subject, clip, fill)?;
+    if out.is_empty() { Ok(PolyTree::default()) } else { union_tree(&out, fill) }
+}
+
+fn offsetter(join: JoinType, limit: f64, delta: f32) -> ClipperOffset {
+    let mut co = ClipperOffset::new();
+    if join == JoinType::Round {
+        co.arc_tolerance = limit;
+    } else {
+        co.miter_limit = limit;
+    }
+    co.shortest_edge = (f64::from(delta) * SHORTEST_EDGE_FACTOR).abs();
+    co
+}
+
+/// `raw_offset`: each path alone, holes shrinking when contours grow; not united.
+fn raw_offset(paths: &[Path], delta: f32, join: JoinType, limit: f64) -> Result<Paths, Failed> {
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        let mut co = offsetter(join, limit, delta);
+        co.add_path(path, join, EndType::ClosedPolygon);
+        let ccw = clipper::orientation(path);
+        let mut this = co.execute(f64::from(if ccw { delta } else { -delta }))?;
+        if !ccw {
+            this.iter_mut().for_each(|p| p.reverse());
+        }
+        out.append(&mut this);
+    }
+    Ok(out)
+}
+
+/// `offset_expolygon_inner`; whether anything of the shape survived.
+fn offset_shape(shape: &[Path], delta: f32, join: JoinType, limit: f64, out: &mut Paths) -> Result<bool, Failed> {
+    let Some((contour, holes)) = shape.split_first() else { return Ok(false) };
+    let mut co = offsetter(join, limit, delta);
+    co.add_path(contour, join, EndType::ClosedPolygon);
+    let mut contours = co.execute(f64::from(delta))?;
+    if contours.is_empty() {
+        return Ok(false);
+    }
+    let mut shifted = Vec::new();
+    for hole in holes {
+        let mut co = offsetter(join, limit, delta);
+        co.add_path(hole, join, EndType::ClosedPolygon);
+        shifted.append(&mut co.execute(f64::from(-delta))?);
+    }
+    if shifted.is_empty() {
+        out.append(&mut contours);
+    } else if delta < 0.0 {
+        let mut left = clip_paths(ClipType::Difference, &contours, &shifted, FillType::NonZero)?;
+        if left.is_empty() {
+            return Ok(false);
+        }
+        out.append(&mut left);
+    } else {
+        out.append(&mut contours);
+        shifted.iter_mut().for_each(|p| p.reverse());
+        out.append(&mut shifted);
+    }
+    Ok(true)
+}
+
+/// `expolygons_offset_raw`: the shapes one at a time, and how many survived.
+fn offset_shapes_raw(shapes: &[Shape], delta: f32, join: JoinType, limit: f64) -> Result<(Paths, usize), Failed> {
+    let mut out = Vec::new();
+    let mut kept = 0;
+    for shape in shapes {
+        let paths: Paths = shape.iter().filter(|c| c.iter().all(|p| usable(*p))).map(|c| to_path(c)).collect();
+        kept += usize::from(offset_shape(&paths, delta, join, limit, &mut out)?);
+    }
+    Ok((out, kept))
+}
+
+/// `expand_paths`.
+fn expand_tree(paths: &[Path], delta: f32, join: JoinType, limit: f64) -> Result<PolyTree, Failed> {
+    union_tree(&raw_offset(paths, delta, join, limit)?, FillType::NonZero)
+}
+
+/// `shrink_paths`.
+fn shrink_tree(paths: &[Path], delta: f32, join: JoinType, limit: f64) -> Result<PolyTree, Failed> {
+    let raw = raw_offset(paths, -delta, join, limit)?;
+    if raw.is_empty() {
+        return Ok(PolyTree::default());
+    }
+    let mut c = Clipper::new();
+    c.add_paths(&raw, PolyType::Subject, true)?;
+    let rect = clipper::outer_rect(c.bounds());
+    c.add_path(&rect, PolyType::Subject, true)?;
+    c.reverse_solution(true);
+    let mut tree = c.execute_tree(ClipType::Union, FillType::Negative, FillType::Negative)?;
+    tree.remove_outermost();
+    Ok(tree)
+}
+
+/// `offset_paths`.
+fn offset_tree(paths: &[Path], delta: f32, join: JoinType, limit: f64) -> Result<PolyTree, Failed> {
+    if delta > 0.0 { expand_tree(paths, delta, join, limit) } else { shrink_tree(paths, -delta, join, limit) }
+}
+
+fn scaled(distance: f64) -> f32 {
+    (distance * SCALE) as f32
+}
+
+fn clipper_join(join: Join) -> (JoinType, f64) {
+    match join {
+        Join::Miter => (JoinType::Miter, 3.0),
+        Join::Round => (JoinType::Round, ROUND_TOLERANCE),
+    }
 }
 
 /// Twice the signed area of a loop: positive when counter-clockwise.
@@ -77,26 +226,47 @@ pub enum Join {
 }
 
 /// Offsets shapes by `distance`: outwards when positive, inwards when negative. Insetting can
-/// split shapes or remove them.
+/// split shapes or remove them. Orca's `offset_ex`.
 pub fn offset(shapes: &[Shape], distance: f64, join: Join) -> Vec<Shape> {
     if !distance.is_finite() {
         return Vec::new();
     }
-    if distance.abs() < 1.0e-9 {
-        return shapes.to_vec();
-    }
-    let raw = to_raw(shapes);
-    if raw.is_empty() {
+    let (join, limit) = clipper_join(join);
+    guarded(|| {
+        let (out, _) = offset_shapes_raw(shapes, scaled(distance), join, limit)?;
+        Ok(to_shapes(&union_tree(&out, FillType::NonZero)?))
+    })
+}
+
+/// Offsets twice, the second time over the first's loops all together: Orca's `offset2_ex`.
+pub fn offset2(shapes: &[Shape], first: f64, second: f64, join: Join) -> Vec<Shape> {
+    if !first.is_finite() || !second.is_finite() {
         return Vec::new();
     }
-    let join = match join {
-        // Corners sharper than about 30° are cut, as Slic3r's miter limit does.
-        Join::Miter => LineJoin::Miter(0.5),
-        Join::Round => LineJoin::Round(0.25),
-    };
-    let style = OutlineStyle::new(distance).line_join(join);
-    let out = catch_unwind(AssertUnwindSafe(|| raw.outline_as::<i32>(&style))).unwrap_or_default();
-    from_raw(out)
+    let (join, limit) = clipper_join(join);
+    guarded(|| {
+        let (delta, delta2) = (scaled(first), scaled(second));
+        let (mut out, kept) = offset_shapes_raw(shapes, delta, join, limit)?;
+        if kept > 1 && delta > 0.0 {
+            out = clip_paths(ClipType::Union, &out, &[], FillType::NonZero)?;
+        }
+        Ok(to_shapes(&offset_tree(&out, delta2, join, limit)?))
+    })
+}
+
+/// Grows then shrinks: Orca's `closing_ex`, with both distances positive.
+pub fn closing(shapes: &[Shape], grow: f64, shrink: f64, join: Join) -> Vec<Shape> {
+    if !grow.is_finite() || !shrink.is_finite() {
+        return Vec::new();
+    }
+    let (join, limit) = clipper_join(join);
+    guarded(|| {
+        let grown = raw_offset(&to_paths(shapes), scaled(grow), join, limit)?;
+        let mut c = Clipper::new();
+        c.add_paths(&grown, PolyType::Subject, true)?;
+        let united = c.execute(ClipType::Union, FillType::NonZero, FillType::NonZero)?;
+        Ok(to_shapes(&shrink_tree(&united, scaled(shrink), join, limit)?))
+    })
 }
 
 /// How two sets of shapes combine.
@@ -109,80 +279,80 @@ pub enum Op {
 
 /// `a` combined with `b`.
 pub fn boolean(a: &[Shape], b: &[Shape], op: Op) -> Vec<Shape> {
-    let (ra, rb) = (to_raw(a), to_raw(b));
-    if ra.is_empty() {
-        return if op == Op::Union { union(b) } else { Vec::new() };
-    }
-    if rb.is_empty() {
-        return match op {
-            Op::Intersect => Vec::new(),
-            _ => union(a),
-        };
-    }
-    let rule = match op {
-        Op::Union => OverlayRule::Union,
-        Op::Difference => OverlayRule::Difference,
-        Op::Intersect => OverlayRule::Intersect,
+    let kind = match op {
+        Op::Union => ClipType::Union,
+        Op::Difference => ClipType::Difference,
+        Op::Intersect => ClipType::Intersection,
     };
-    let out = catch_unwind(AssertUnwindSafe(|| ra.overlay_as::<i32>(&rb, rule, FillRule::NonZero))).unwrap_or_default();
-    from_raw(out)
+    let (pa, pb) = (to_paths(a), to_paths(b));
+    guarded(|| Ok(to_shapes(&clip_tree(kind, &pa, &pb, FillType::NonZero)?)))
 }
 
 /// The shapes merged where they overlap.
 pub fn union(shapes: &[Shape]) -> Vec<Shape> {
-    let raw = to_raw(shapes);
-    if raw.is_empty() {
-        return Vec::new();
-    }
-    let empty: Raw = Vec::new();
-    let out = catch_unwind(AssertUnwindSafe(|| raw.overlay_as::<i32>(&empty, OverlayRule::Subject, FillRule::NonZero)))
-        .unwrap_or_default();
-    from_raw(out)
+    let paths = to_paths(shapes);
+    guarded(|| Ok(to_shapes(&clip_tree(ClipType::Union, &paths, &[], FillType::NonZero)?)))
 }
 
 /// Shapes from closed loops in any orientation, filled where they wind (a mesh's slice).
 pub fn union_loops(loops: &[Contour]) -> Vec<Shape> {
-    let raw: Vec<Vec<[f64; 2]>> = loops
+    let paths: Paths = loops
         .iter()
-        .filter(|p| p.len() >= 3 && p.iter().all(|q| q.is_finite()) && signed_area2(p).abs() > 1.0e-10)
-        .map(|p| p.iter().map(|q| [q.x, q.y]).collect())
+        .filter(|p| p.len() >= 3 && p.iter().all(|q| usable(*q)) && signed_area2(p).abs() > 1.0e-10)
+        .map(|p| to_path(p))
         .collect();
-    if raw.is_empty() {
-        return Vec::new();
-    }
-    let empty: Vec<Vec<[f64; 2]>> = Vec::new();
-    let out = catch_unwind(AssertUnwindSafe(|| raw.overlay_as::<i32>(&empty, OverlayRule::Subject, FillRule::NonZero)))
-        .unwrap_or_default();
-    from_raw(out)
+    guarded(|| Ok(to_shapes(&clip_tree(ClipType::Union, &paths, &[], FillType::NonZero)?)))
 }
 
 /// The parts of `lines` that lie inside `shapes`.
 pub fn clip_lines(lines: &[Polyline], shapes: &[Shape]) -> Vec<Polyline> {
-    clip(lines, shapes, false)
+    clip(lines, shapes, ClipType::Intersection)
 }
 
 /// The parts of `lines` outside `shapes`.
 pub fn clip_lines_outside(lines: &[Polyline], shapes: &[Shape]) -> Vec<Polyline> {
-    clip(lines, shapes, true)
+    clip(lines, shapes, ClipType::Difference)
 }
 
-fn clip(lines: &[Polyline], shapes: &[Shape], invert: bool) -> Vec<Polyline> {
-    let paths: Vec<Vec<[f64; 2]>> = lines
-        .iter()
-        .filter(|l| l.len() >= 2 && l.iter().all(|p| p.is_finite()))
-        .map(|l| l.iter().map(|p| [p.x, p.y]).collect())
-        .collect();
-    let raw = to_raw(shapes);
-    if paths.is_empty() || raw.is_empty() {
+/// Orca's `_clipper_pl_open`. As there, a line may come back reversed.
+fn clip(lines: &[Polyline], shapes: &[Shape], op: ClipType) -> Vec<Polyline> {
+    let paths: Paths =
+        lines.iter().filter(|l| l.len() >= 2 && l.iter().all(|p| usable(*p))).map(|l| to_path(l)).collect();
+    clip_open(&paths, &to_paths(shapes), op).iter().map(|l| from_path(l)).collect()
+}
+
+/// Open paths clipped by closed ones, in Clipper's units and order.
+pub fn clip_open(lines: &[Path], clip: &[Path], op: ClipType) -> Paths {
+    if lines.is_empty() {
         return Vec::new();
     }
-    let rule = ClipRule { invert, boundary_included: false };
-    let out =
-        catch_unwind(AssertUnwindSafe(|| paths.clip_by_as::<i32>(&raw, FillRule::NonZero, rule))).unwrap_or_default();
-    out.into_iter()
-        .map(|l| l.into_iter().map(|[x, y]| DVec2::new(x, y)).collect::<Polyline>())
-        .filter(|l| l.len() >= 2)
+    let tree = guarded(|| {
+        let mut c = Clipper::new();
+        c.add_paths(lines, PolyType::Subject, false)?;
+        c.add_paths(clip, PolyType::Clip, true)?;
+        c.execute_tree(op, FillType::NonZero, FillType::NonZero)
+    });
+    tree.children
+        .iter()
+        .filter_map(|n| tree.nodes.get(*n))
+        .filter(|n| n.open && n.contour.len() >= 2)
+        .map(|n| n.contour.clone())
         .collect()
+}
+
+/// A shape's contours in Clipper's units, outer first.
+pub fn paths_of(shape: &Shape) -> Paths {
+    to_paths(std::slice::from_ref(shape))
+}
+
+/// A line in Clipper's units.
+pub fn to_nm(line: &[DVec2]) -> Path {
+    to_path(line)
+}
+
+/// A line back from Clipper's units.
+pub fn from_nm(line: &[Pt]) -> Polyline {
+    from_path(line)
 }
 
 /// The area the shapes cover.

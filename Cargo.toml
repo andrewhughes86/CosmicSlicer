@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["vendor"]
 resolver = "3"
 members = [
     "apps/CosmicSlicer",
@@ -43,8 +44,8 @@ egui = "0.36.2"
 egui-wgpu = "0.36.2"
 epaint_default_fonts = "0.36.2"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+boostvoronoi = "0.12"
 glam = "0.30"
-i_overlay = { version = "9.1", default-features = false }
 log = "0.4"
 miniz_oxide = "0.8"
 png = "0.18"
@@ -80,11 +81,12 @@ opt-level = 2
 [profile.dev.package.spade]
 opt-level = 2
 
-[profile.dev.package.i_overlay]
-opt-level = 3
-
 [profile.dev.package.resvg]
 opt-level = 2
 
 [profile.dev.package.tiny-skia]
 opt-level = 2
+
+# A fixed seed in its skip list, so the Voronoi diagrams repeat (see vendor/cpp_map).
+[patch.crates-io]
+cpp_map = { path = "vendor/cpp_map" }

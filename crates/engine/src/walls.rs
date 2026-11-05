@@ -21,6 +21,56 @@ pub struct Walled {
     pub inner_edge: Vec<Shape>,
 }
 
+/// OrcaSlicer's `INSET_OVERLAP_TOLERANCE`.
+const OVERLAP_TOLERANCE: f64 = 0.4;
+
+/// OrcaSlicer's gap fill for classic walls: what the walls leave between them is found loop by
+/// loop (`found`) and filled along its medial axis. Returns the lines and the area they cover,
+/// which infill keeps out of.
+fn classic_gaps(
+    found: &[Shape],
+    (wo, wi): (f64, f64),
+    si: f64,
+    h: f64,
+    s: &Settings,
+    speed: f64,
+) -> (Vec<Path>, Vec<Shape>) {
+    if found.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let found = geom::union(found);
+    let min = 0.2 * wi.min(wo) * (1.0 - OVERLAP_TOLERANCE);
+    let max = 2.0 * si;
+    let opened = geom::offset(&geom::offset(&found, -min / 2.0, Join::Miter), min / 2.0, Join::Miter);
+    let closed = geom::offset(&geom::offset(&found, -max / 2.0, Join::Miter), max / 2.0 + 1e-5, Join::Miter);
+    let parts = geom::boolean(&opened, &closed, Op::Difference);
+    let mut lines = Vec::new();
+    let tolerance =
+        if s.motion.arc_fitting == crate::settings::ArcFitting::Off { s.resolution } else { 0.2 * s.resolution };
+    for part in &parts {
+        let simple: Shape = part.iter().map(|c| geom::simplify_loop(c, tolerance)).filter(|c| c.len() >= 3).collect();
+        match medial::medial_axis(&simple, min, max) {
+            Some(axis) => lines.extend(
+                axis.into_iter()
+                    .filter(|l| l.points.windows(2).map(|w| w[0].distance(w[1])).sum::<f64>() >= s.walls.filter_gap),
+            ),
+            None => log::warn!("gap fill: no Voronoi diagram for a region"),
+        }
+    }
+    let paths = medial::variable_width(&lines, Role::GapFill, speed, s.walls.gap_flow, h);
+    let covered: Vec<Shape> = paths
+        .iter()
+        .flat_map(|p| {
+            let half = p.width / 2.0 + 1e-5;
+            p.points.windows(2).map(move |w| {
+                let n = (w[1] - w[0]).normalize_or_zero().perp() * half;
+                vec![vec![w[0] - n, w[1] - n, w[1] + n, w[0] + n]]
+            })
+        })
+        .collect();
+    (paths, geom::union(&covered))
+}
+
 struct TopSplit {
     /// The fill on top surfaces, where inner walls give way.
     top: Vec<Shape>,
@@ -133,6 +183,7 @@ const NARROW_LOOP_LENGTH: f64 = 10.0;
 /// with "only one wall on top", spiral vase). `last_layer` is the object's top layer, whose
 /// infill overlaps the walls as much as the first layer's. `around` is the layers above and
 /// below, for "only one wall on top": on top surfaces inner walls give way to the top's fill.
+#[allow(clippy::too_many_arguments)]
 pub fn walls(
     island: &Shape,
     s: &Settings,
@@ -175,6 +226,21 @@ pub fn walls(
     let mut inner_base = 0.0;
     let mut top_fills: Vec<Shape> = Vec::new();
     let mut fill_clip: Vec<Shape> = Vec::new();
+    // Classic walls: each loop comes from the one before, and what that leaves is the gaps.
+    let classic = !s.walls.arachne;
+    let min_spacing = si * (1.0 - OVERLAP_TOLERANCE);
+    let step =
+        |k: usize| if k == 1 { if s.walls.precise_outer { (wo + wi) / 2.0 } else { (so + si) / 2.0 } } else { si };
+    let next_loop = |last: &[Shape], d: f64| {
+        let inner = geom::offset(last, -(d + min_spacing / 2.0 - 1e-6), Join::Miter);
+        geom::offset(&inner, min_spacing / 2.0 - 1e-6, Join::Miter)
+    };
+    let gaps_between = |last: &[Shape], next: &[Shape], d: f64| {
+        let from = geom::offset(last, -0.5 * d, Join::Miter);
+        geom::boolean(&from, &geom::offset(next, 0.5 * d + 1e-5, Join::Miter), Op::Difference)
+    };
+    let mut last_ring: Vec<Shape> = Vec::new();
+    let mut found: Vec<Shape> = Vec::new();
     for k in 0..loops {
         if k == 1 {
             // "Precise outer wall": the first inner wall sits a full width in, so the outer
@@ -197,7 +263,13 @@ pub fn walls(
             source.to_vec()
         };
         // The centre line: `available` offset in by half the width.
-        let centred = geom::offset(&inner_from, -(centre - inner_base), Join::Miter);
+        let centred = if classic && k > 0 {
+            let next = next_loop(&last_ring, step(k));
+            found.extend(gaps_between(&last_ring, &next, step(k)));
+            next
+        } else {
+            geom::offset(&inner_from, -(centre - inner_base), Join::Miter)
+        };
         let rings = geom::without_slivers(centred.clone(), if narrow_loop { 0.0 } else { wo * wo * 0.25 });
         // Where this wall cannot reach: thin walls at the outside, gaps further in.
         let narrow = if rings.is_empty() {
@@ -216,14 +288,18 @@ pub fn walls(
                         }
                     }
                 }
-            } else {
-                // Arachne prints these as inner walls of varying width; classic as gap fill.
-                let (role, speed, flow) = if s.walls.arachne {
-                    (Role::InnerWall, inner_speed, 1.0)
-                } else {
-                    (Role::GapFill, gap_speed, s.walls.gap_flow)
-                };
-                gaps.extend(fill_narrow(&narrow, s, wi * 1.5, role, speed, flow, s.walls.filter_gap.max(wi)));
+            } else if s.walls.arachne {
+                // Arachne prints these as inner walls of varying width; classic walls find
+                // their gaps below.
+                gaps.extend(fill_narrow(
+                    &narrow,
+                    s,
+                    wi * 1.5,
+                    Role::InnerWall,
+                    inner_speed,
+                    1.0,
+                    s.walls.filter_gap.max(wi),
+                ));
             }
         }
         if rings.is_empty() {
@@ -248,6 +324,7 @@ pub fn walls(
         } else {
             walls.push(paths);
         }
+        last_ring.clone_from(&centred);
         if k == 0
             && k + 1 < loops
             && s.only_one_wall_top
@@ -256,7 +333,8 @@ pub fn walls(
             let split = split_top_surfaces(&centred, upper, lower, s, (wo, wi), (so, si));
             top_fills = split.top;
             fill_clip = split.clip;
-            inner_from = split.rest;
+            inner_from.clone_from(&split.rest);
+            last_ring = split.rest;
             inner_base = centre;
         }
     }
@@ -281,20 +359,40 @@ pub fn walls(
             let solid = if first_layer { s.widths.first_layer } else { s.widths.solid };
             share * (s_last + Settings::spacing(solid, h)) / 2.0
         };
-        // Strips inside the last wall too narrow for infill are gap filled instead.
-        // (OrcaSlicer's classic walls look one loop further: what is under two spacings
-        // across there is gap fill, not infill.)
-        let gap_width = if s.walls.arachne { wi } else { 2.0 * si };
-        let narrow = narrow_parts(&edge, gap_width, min_feature);
         let mut area = geom::offset(&inner_from, -(inner_edge_at - overlap - inner_base), Join::Miter);
-        if !narrow.is_empty() {
-            let (role, speed, flow) = if s.walls.arachne {
-                (Role::InnerWall, inner_speed, 1.0)
+        if s.walls.arachne {
+            // Strips inside the last wall too narrow for infill go to a line of their own.
+            let narrow = narrow_parts(&edge, wi, min_feature);
+            if !narrow.is_empty() {
+                gaps.extend(fill_narrow(
+                    &narrow,
+                    s,
+                    wi * 1.5,
+                    Role::InnerWall,
+                    inner_speed,
+                    1.0,
+                    s.walls.filter_gap.max(wi),
+                ));
+                area = geom::boolean(&area, &geom::offset(&narrow, wi * 0.25, Join::Miter), Op::Difference);
+            }
+        } else {
+            // One more loop's worth of gaps; what they fill stays out of the infill, and areas
+            // narrower than a solid line collapse.
+            let d = step(walls.len());
+            if s.speeds.gap > 0.0 && complete {
+                found.extend(gaps_between(&last_ring, &next_loop(&last_ring, d), d));
+            }
+            let (lines, covered) = classic_gaps(&found, (wo, wi), si, h, s, gap_speed);
+            gaps.extend(lines);
+            let left = if covered.is_empty() {
+                last_ring.clone()
             } else {
-                (Role::GapFill, gap_speed, s.walls.gap_flow)
+                geom::boolean(&last_ring, &covered, Op::Difference)
             };
-            gaps.extend(fill_narrow(&narrow, s, wi * 1.5, role, speed, flow, s.walls.filter_gap.max(wi)));
-            area = geom::boolean(&area, &geom::offset(&narrow, wi * 0.25, Join::Miter), Op::Difference);
+            let solid = if first_layer { s.widths.first_layer } else { s.widths.solid };
+            let least = Settings::spacing(solid, h) * (1.0 - OVERLAP_TOLERANCE);
+            let inset = s_last / 2.0 - overlap;
+            area = geom::offset(&geom::offset(&left, -(inset + least / 2.0), Join::Miter), least / 2.0, Join::Miter);
         }
         // The top's own fill joins what is left inside the walls.
         if !top_fills.is_empty() {
@@ -395,7 +493,7 @@ mod tests {
         assert_eq!(w.walls.len(), 2);
         let gap: f64 = w.gaps.iter().filter(|p| p.role == Role::GapFill).map(Path::length).sum();
         assert!(gap > 20.0, "{gap}");
-        assert!(w.gaps.iter().all(|p| p.width >= s.walls.min_bead - 1e-9 && p.width < 0.42 * 1.5 + 1e-9));
+        assert!(w.gaps.iter().all(|p| p.width > 0.05 && p.width < 1.0));
     }
 
     #[test]

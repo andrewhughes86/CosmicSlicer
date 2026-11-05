@@ -11,11 +11,12 @@ use glam::DVec2;
 
 use crate::geom::{Contour, Polyline};
 
-/// OrcaSlicer's `SCALED_EPSILON`, in mm.
-const EPS: f64 = 1e-4;
-/// How far a line's end may be from the edge and still count as on it. Our clipper's integers
-/// are coarser than Orca's nanometres.
-const ON_EDGE: f64 = 2e-4;
+/// OrcaSlicer's `SCALED_EPSILON`.
+const EPS: f64 = 100.0;
+/// How far a line's end may be from the edge and still count as on it.
+const ON_EDGE: f64 = 200.0;
+/// Orca's units per millimetre.
+const NM: f64 = 1.0e6;
 const NONE: usize = usize::MAX;
 
 /// `std::sort` as libstdc++ does it, so that equal keys land the same way.
@@ -213,7 +214,7 @@ impl Buckets {
     }
 
     fn new(contours: &[Contour], cell: f64) -> Buckets {
-        let mut out = Buckets { cell: cell.max(1e-3), cells: HashMap::new() };
+        let mut out = Buckets { cell: cell.max(1000.0), cells: HashMap::new() };
         for (c, contour) in contours.iter().enumerate() {
             let n = contour.len();
             for i in 0..n {
@@ -391,7 +392,7 @@ impl Graph {
             if l >= length_to_take {
                 let t = (length_to_take - taken) / (l - taken);
                 if let (Some(a), Some(b)) = (contour.get(before), contour.get(i)) {
-                    line.push(a.lerp(*b, t));
+                    line.push(point_lerp(*a, *b, t));
                 }
                 return;
             }
@@ -438,7 +439,7 @@ impl Graph {
             return;
         }
         let Some(at) = self.position(start) else { return };
-        let add_at_start = line.first().is_some_and(|p| p.distance(at) < 1e-6);
+        let add_at_start = line.first().is_some_and(|p| p.distance(at) < 0.5);
         if add_at_start {
             line.reverse();
         }
@@ -563,7 +564,7 @@ fn clipped(line: &[DVec2], clip: f64) -> Option<(LinePoint, LinePoint)> {
         let l = w[0].distance(w[1]);
         if l > left {
             let t = left / l;
-            start = Some((i, t, w[0].lerp(w[1], t)));
+            start = Some((i, t, point_lerp(w[0], w[1], t)));
             break;
         }
         left -= l;
@@ -574,7 +575,7 @@ fn clipped(line: &[DVec2], clip: f64) -> Option<(LinePoint, LinePoint)> {
         let l = w[0].distance(w[1]);
         if l > left {
             let t = left / l;
-            end = Some((i, 1.0 - t, w[1].lerp(w[0], t)));
+            end = Some((i, 1.0 - t, point_lerp(w[1], w[0], t)));
             break;
         }
         left -= l;
@@ -584,7 +585,7 @@ fn clipped(line: &[DVec2], clip: f64) -> Option<(LinePoint, LinePoint)> {
 
 /// `create_boundary_infill_graph`.
 fn graph(infill: &[Polyline], boundary: &[Contour], spacing: f64) -> Graph {
-    let buckets = Buckets::new(boundary, 2.0);
+    let buckets = Buckets::new(boundary, 2.0e6);
     let mut hits: Vec<(usize, usize, f64, usize)> = Vec::with_capacity(infill.len() * 2);
     let mut near = Vec::new();
     for (l, line) in infill.iter().enumerate() {
@@ -622,7 +623,7 @@ fn graph(infill: &[Polyline], boundary: &[Contour], spacing: f64) -> Graph {
         let mut dst: Contour = Vec::with_capacity(source.len());
         let mut list: Vec<usize> = Vec::new();
         let (mut first, mut prev) = (NONE, NONE);
-        let same = |a: Option<&DVec2>, b: DVec2| a.is_some_and(|p| p.distance(b) < 1e-6);
+        let same = |a: Option<&DVec2>, b: DVec2| a.is_some_and(|p| p.distance(b) < 0.5);
         for (i, ipt) in source.iter().enumerate() {
             if !same(dst.last(), *ipt) {
                 dst.push(*ipt);
@@ -698,7 +699,7 @@ fn graph(infill: &[Polyline], boundary: &[Contour], spacing: f64) -> Graph {
             *d = list;
         }
     }
-    let grid = Buckets::new(&out.boundary, (0.8 * spacing).max(2.0));
+    let grid = Buckets::new(&out.boundary, (0.8 * spacing).max(2.0e6));
     for line in infill {
         let Some(((s0, t0, p0), (s1, t1, p1))) = clipped(line, 1.7 * spacing) else { continue };
         if !(s0 < s1 || (s0 == s1 && t0 < t1)) {
@@ -713,8 +714,31 @@ fn graph(infill: &[Polyline], boundary: &[Contour], spacing: f64) -> Graph {
     out
 }
 
+/// Orca's `lerp` between `Point`s, which truncates to the integer grid.
+fn point_lerp(a: DVec2, b: DVec2, t: f64) -> DVec2 {
+    (a * (1.0 - t) + b * t).trunc()
+}
+
 /// Joins `infill`, in this order, along the contours of `boundary`, which its ends touch.
 pub fn connect_infill(
+    infill: Vec<Polyline>,
+    boundary: &[Contour],
+    spacing: f64,
+    anchor: f64,
+    anchor_max: f64,
+) -> Vec<Polyline> {
+    // Orca's distances are between integers, so equal arcs are exactly equal and their ties
+    // fall to its sort: the work is done in its nanometres.
+    let up = |l: &Vec<DVec2>| l.iter().map(|p| (*p * NM).round()).collect::<Vec<_>>();
+    let lines: Vec<Polyline> = infill.iter().map(up).collect();
+    let boundary: Vec<Contour> = boundary.iter().map(up).collect();
+    connect_scaled(lines, &boundary, spacing / 1.0e-6, anchor / 1.0e-6, anchor_max / 1.0e-6)
+        .into_iter()
+        .map(|l| l.into_iter().map(|p| p / NM).collect())
+        .collect()
+}
+
+fn connect_scaled(
     mut infill: Vec<Polyline>,
     boundary: &[Contour],
     spacing: f64,
@@ -749,7 +773,7 @@ pub fn connect_infill(
         }
     }
     std_sort(&mut arcs, &|a, b| a.1 < b.1);
-    let same = |a: Option<&DVec2>, b: Option<DVec2>| matches!((a, b), (Some(x), Some(y)) if x.distance(y) < 1e-6);
+    let same = |a: Option<&DVec2>, b: Option<DVec2>| matches!((a, b), (Some(x), Some(y)) if x.distance(y) < 0.5);
     for (cp1, length) in arcs {
         let cp2 = g.cp(cp1).next;
         if g.cp(cp1).consumed || g.cp(cp2).consumed {

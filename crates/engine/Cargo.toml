@@ -12,8 +12,8 @@ workspace = true
 [dependencies]
 CosmicSlicer-config = { workspace = true }
 CosmicSlicer-model = { workspace = true }
+boostvoronoi = { workspace = true }
 glam = { workspace = true }
-i_overlay = { workspace = true }
 log = { workspace = true }
 png = { workspace = true }
 rayon = { workspace = true }

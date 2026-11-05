@@ -1,0 +1,20 @@
+when:
+  event: [manual]
+  branch: main
+
+matrix:
+  platform:
+    - linux/amd64
+  RUST: [stable]
+
+steps:
+  test:
+    image: rust
+    environment:
+      CARGO_TERM_COLOR: always
+    commands:
+      - rustup default $RUST
+      - rustup update
+      - cargo install cargo-msrv
+      - cargo msrv list --output-format json
+      - cargo msrv find --output-format json

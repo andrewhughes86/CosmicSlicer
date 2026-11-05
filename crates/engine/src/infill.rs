@@ -12,6 +12,7 @@ use std::f64::consts::{FRAC_PI_2, FRAC_PI_3, PI, TAU};
 
 use glam::DVec2;
 
+use crate::clipper::{ClipType, Path, Paths, Pt};
 use crate::geom::{self, Contour, Join, Polyline, Shape};
 
 /// A fill line: open, or a loop for concentric patterns.
@@ -146,6 +147,8 @@ pub struct Params {
     pub fit_solid: bool,
     /// A bridge: its lines link along the edge however far apart they end.
     pub bridge: bool,
+    /// The bare lines, not joined up (what bridges above anchor on).
+    pub bare: bool,
     /// Where the patterns' grid is fixed: OrcaSlicer fills in the object's own coordinates,
     /// centred on it, so lines sit the same way wherever the object is on the plate.
     pub origin: DVec2,
@@ -169,6 +172,7 @@ impl Params {
             height: 0.0,
             fit_solid: false,
             bridge: false,
+            bare: false,
             inset: false,
         }
     }
@@ -496,8 +500,7 @@ pub fn split_narrow_solid(area: &[Shape], spacing: f64, angle: f64, line_pattern
         let kept = filter_vibrating_lines(&sections);
         normal_areas.extend(trace_sections(&kept, spacing).into_iter().map(|c| turned_shape(&vec![c], back)));
     }
-    let normal = geom::offset(&geom::union(&normal_areas), 1e-5, Join::Miter);
-    let mut normal = geom::offset(&normal, -1e-5, Join::Miter);
+    let mut normal = geom::union(&normal_areas);
     let mut narrow = geom::boolean(area, &normal, geom::Op::Difference);
     // Areas under a line wide that touch the normal infill join it.
     let mut joined = Vec::new();
@@ -773,10 +776,10 @@ fn monotonic(area: &[Shape], spacing: f64, a: f64, phase: f64, width: f64, link:
     let mut out: Vec<Line> = regions(pieces, a, spacing, phase)
         .into_iter()
         .flat_map(|mut r| {
-            if !start_flipped(&r) {
-                if let Some(first) = r.first_mut() {
-                    first.reverse();
-                }
+            if !start_flipped(&r)
+                && let Some(first) = r.first_mut()
+            {
+                first.reverse();
             }
             join_zigzag(r, &around, spacing * 1.9, link)
         })
@@ -939,100 +942,153 @@ fn cross_zag(area: &[Shape], a: f64, w: f64, d: f64, p: &Params) -> Vec<Line> {
 /// further apart. The grid is fixed four lines at a time from the object's origin.
 fn cross_hatch(area: &[Shape], p: &Params, s: f64) -> Vec<Line> {
     let density = p.density.min(1.0);
-    let ls = if density < 0.999 { s * 1.08 } else { s };
-    let repeat_ratio = if density < 0.3 { (1.0 - (-5.0 * density).exp()).clamp(0.2, 1.0) } else { 1.0 };
-    let (trans, repeat) = (ls * 0.4, ls * repeat_ratio);
-    let z = p.z + repeat / 2.0 + trans;
-    let period = trans + repeat;
-    let trans_z = z.rem_euclid(period) - repeat;
-    // Along the frame's x axis (1) or across it (-1); the second half of a transition turns.
-    let direction = if z.rem_euclid(period * 2.0) - period <= 1e-6 { -1 } else { 1 };
-    let progress = if trans_z < 0.0 { 0.0 } else { (trans_z % trans) / trans };
-    let rows_along = if trans_z >= 0.0 && progress >= 0.5 { -direction } else { direction };
-    let lines = framed(area, p.angle, |lo, hi| {
-        let module = ls * 4.0;
-        let base = DVec2::new((lo.x / module).floor() * module, (lo.y / module).floor() * module);
-        let size = hi - base;
-        if !(size.x / ls < 1.0e5 && size.y / ls < 1.0e5) {
-            return Vec::new();
-        }
-        let lines = if trans_z < 0.0 {
-            hatch_repeat(direction, ls, size)
-        } else if progress < 0.5 {
-            hatch_transform((progress + 0.1) * 2.0, rows_along, ls, size)
-        } else {
-            hatch_transform((1.1 - progress) * 2.0, rows_along, ls, size)
-        };
-        lines.into_iter().map(|l| l.into_iter().map(|q| q + base).collect()).collect()
-    });
-    // Bits shorter than most of a line go (OrcaSlicer's).
-    let lines: Vec<Polyline> = lines.into_iter().filter(|l| geom::length(l) >= 0.8 * s * density).collect();
-    if p.anchor_max >= 0.05 {
-        let boundary: Vec<Contour> = area.iter().flatten().cloned().collect();
-        // Equal arcs between line ends fall to the order lines arrive in, which in OrcaSlicer is
-        // what Clipper returns. This order, top row first in the pattern's frame, matches it
-        // best on symmetric parts; other parts have no such ties.
-        let (sin, cos) = p.angle.sin_cos();
-        let in_frame = |q: Option<&DVec2>| q.map_or(DVec2::ZERO, |q| turn(*q, (-sin, cos)));
-        let mut lines = lines;
-        for l in &mut lines {
-            let (a, b) = (in_frame(l.first()), in_frame(l.last()));
-            if (a.x, a.y) < (b.x, b.y) {
-                l.reverse();
-            }
-        }
-        let middle = |l: &Polyline| (in_frame(l.first()) + in_frame(l.last())) / 2.0;
-        lines.sort_by(|a, b| {
-            let (x, y) = (middle(a), middle(b));
-            y.y.total_cmp(&x.y).then(x.x.total_cmp(&y.x))
-        });
-        return crate::connect::connect_infill(lines, &boundary, s * density, p.anchor, p.anchor_max)
-            .into_iter()
-            .map(Line::open)
-            .collect();
-    }
-    let row_angle = if rows_along > 0 { p.angle } else { p.angle + FRAC_PI_2 };
-    join_rows(lines, row_angle, ls, 0.0, area, ls * 1.9, 0.0)
+    area.iter().flat_map(|shape| cross_hatch_one(shape, p, s * density, density)).collect()
 }
 
-/// Cross hatch's straight layers: lines `grid` apart over a `size` box from the origin, along
-/// x (`direction` 1) or y.
-fn hatch_repeat(direction: i32, grid: f64, size: DVec2) -> Vec<Polyline> {
-    let (w, h) = if direction < 0 { (size.y, size.x) } else { (size.x, size.y) };
-    let n = (h / grid) as usize + 1;
+/// `FillCrossHatch::_fill_surface_single`, in Orca's integers: the region turned into the
+/// pattern's frame, the pattern over its bounds, clipped by Clipper (whose order the connecting
+/// sees) and turned back.
+fn cross_hatch_one(shape: &Shape, p: &Params, spacing: f64, density: f64) -> Vec<Line> {
+    let rotate = |q: Pt, angle: f64| {
+        let (sin, cos) = angle.sin_cos();
+        let (x, y) = (q.x as f64, q.y as f64);
+        Pt::new((cos * x - sin * y).round() as i64, (cos * y + sin * x).round() as i64)
+    };
+    let angle = f64::from(p.angle as f32);
+    let turning = angle.abs() >= 1.0e-4;
+    let turned: Paths = geom::paths_of(shape)
+        .into_iter()
+        .map(|c| if turning { c.into_iter().map(|q| rotate(q, -angle)).collect() } else { c })
+        .collect();
+    let Some(contour) = turned.first() else { return Vec::new() };
+    let lo = Pt::new(contour.iter().map(|q| q.x).min().unwrap_or(0), contour.iter().map(|q| q.y).min().unwrap_or(0));
+    let hi = Pt::new(contour.iter().map(|q| q.x).max().unwrap_or(0), contour.iter().map(|q| q.y).max().unwrap_or(0));
+
+    let thin = density as f32;
+    let spacing = f64::from(spacing as f32);
+    let mut grid = (spacing / 1.0e-6 / f64::from(thin)) as i64;
+    if thin < 0.999 {
+        grid = (grid as f64 * 1.08) as i64;
+    }
+    if grid <= 0 {
+        return Vec::new();
+    }
+    let module = grid * 4;
+    let lo = Pt::new(lo.x.min(lo.x.div_euclid(module) * module), lo.y.min(lo.y.div_euclid(module) * module));
+    let size = (hi.x - lo.x, hi.y - lo.y);
+    // A pattern of a hundred thousand rows is no pattern.
+    if size.0 / grid > 100_000 || size.1 / grid > 100_000 {
+        return Vec::new();
+    }
+
+    let repeat_ratio = if thin < 0.3 { (1.0 - f64::from((-5.0 * thin).exp())).clamp(0.2, 1.0) } else { 1.0 };
+    let mut lines = hatch_layers(p.z / 1.0e-6, repeat_ratio, grid as f64, size.0 as f64, size.1 as f64);
+    for line in &mut lines {
+        for q in line.iter_mut() {
+            *q = Pt::new(q.x + lo.x, q.y + lo.y);
+        }
+    }
+    let least = 0.8 * spacing / 1.0e-6;
+    let nm_length = |l: &Path| {
+        l.windows(2)
+            .map(|w| match w {
+                [a, b] => ((b.x - a.x) as f64).hypot((b.y - a.y) as f64),
+                _ => 0.0,
+            })
+            .sum::<f64>()
+    };
+    let lines: Paths = geom::clip_open(&lines, &turned, ClipType::Intersection)
+        .into_iter()
+        .filter(|l| nm_length(l) >= least)
+        .collect();
+
+    let back = |l: &Polyline| -> Polyline {
+        if turning {
+            geom::from_nm(&geom::to_nm(l).into_iter().map(|q| rotate(q, angle)).collect::<Path>())
+        } else {
+            l.clone()
+        }
+    };
+    let lines: Vec<Polyline> = lines.iter().map(|l| geom::from_nm(l)).collect();
+    if p.anchor_max >= 0.05 {
+        let boundary: Vec<Contour> = turned.iter().map(|c| geom::from_nm(c)).collect();
+        return crate::connect::connect_infill(lines, &boundary, spacing, p.anchor, p.anchor_max)
+            .iter()
+            .map(|l| Line::open(back(l)))
+            .collect();
+    }
+    lines.iter().map(|l| Line::open(back(l))).collect()
+}
+
+/// `generate_infill_layers`: straight lines, or the wave that turns them through 90 degrees.
+fn hatch_layers(z: f64, repeat_ratio: f64, grid: f64, width: f64, height: f64) -> Paths {
+    let trans = grid * 0.4;
+    let repeat = grid * repeat_ratio;
+    let z = z + repeat / 2.0 + trans;
+    let period = trans + repeat;
+    let trans_z = z - (z / period).floor() * period - repeat;
+    let phase = (z % (period * 2.0) - (period - 1.0)) as i32;
+    let direction = if phase <= 0 { -1 } else { 1 };
+    if trans_z < 0.0 {
+        return hatch_repeat(direction, grid, width, height);
+    }
+    let progress = (trans_z % trans) / trans;
+    if progress < 0.5 {
+        hatch_transform((progress + 0.1) * 2.0, direction, grid, width, height)
+    } else {
+        hatch_transform((1.1 - progress) * 2.0, -direction, grid, width, height)
+    }
+}
+
+fn nm(x: f64) -> i64 {
+    x.round() as i64
+}
+
+/// `generate_repeat_pattern`.
+fn hatch_repeat(direction: i32, grid: f64, width: f64, height: f64) -> Paths {
+    let (w, h) = if direction < 0 { (height, width) } else { (width, height) };
+    let n = (h / grid) as i64 + 1;
     (0..n)
         .map(|i| {
-            let line = vec![DVec2::new(0.0, grid * i as f64), DVec2::new(w, grid * i as f64)];
-            if direction < 0 { line.into_iter().map(|q| DVec2::new(q.y, q.x)).collect() } else { line }
+            let y = nm(grid * i as f64);
+            let line = vec![Pt::new(0, y), Pt::new(nm(w), y)];
+            if direction < 0 { line.into_iter().map(|q| Pt::new(q.y, q.x)).collect() } else { line }
         })
         .collect()
 }
 
-/// Cross hatch's transition layers: rows of a four-point wave whose bends grow with
-/// `progress`, odd and even rows half a cycle apart.
-fn hatch_transform(progress: f64, direction: i32, grid: f64, size: DVec2) -> Vec<Polyline> {
-    let period = grid * 2.0;
-    let offset = progress / 8.0 * period;
+/// `generate_transform_pattern`: rows of a four-point wave whose bends grow with `progress`,
+/// odd and even rows half a cycle apart.
+fn hatch_transform(progress: f64, direction: i32, grid: f64, width: f64, height: f64) -> Paths {
+    let grid = grid * 2.0;
+    let (w, h) = if direction < 0 { (height, width) } else { (width, height) };
+    let off = progress * 1.0 / 8.0 * grid;
     let cycle = [
-        DVec2::new(0.25 * period - offset, offset),
-        DVec2::new(0.25 * period + offset, offset),
-        DVec2::new(0.75 * period - offset, -offset),
-        DVec2::new(0.75 * period + offset, -offset),
+        Pt::new(nm(0.25 * grid - off), nm(off)),
+        Pt::new(nm(0.25 * grid + off), nm(off)),
+        Pt::new(nm(0.75 * grid - off), nm(-off)),
+        Pt::new(nm(0.75 * grid + off), nm(-off)),
     ];
-    let (w, h) = if direction < 0 { (size.y, size.x) } else { (size.x, size.y) };
-    let cycles = (w / period) as usize + 2;
-    let row: Polyline =
-        (0..cycles).flat_map(|i| cycle.iter().map(move |q| *q + DVec2::new(i as f64 * period, 0.0))).collect();
-    let rows = (h / period) as usize + 2;
-    let mut out: Vec<Polyline> =
-        (0..rows).map(|i| row.iter().map(|q| *q + DVec2::new(0.0, period * i as f64)).collect()).collect();
-    out.extend(
-        (0..rows).map(|i| row.iter().map(|q| *q + DVec2::new(-0.5 * period, (i as f64 + 0.5) * period)).collect()),
-    );
+    let cycles = (w / grid + 2.0) as i64;
+    let mut odd: Path = Vec::with_capacity(cycles.max(0) as usize * 4);
+    for i in 0..cycles {
+        let shift = nm(i as f64 * grid);
+        odd.extend(cycle.iter().map(|q| Pt::new(q.x + shift, q.y)));
+    }
+    let rows = (h / grid + 2.0) as i64;
+    let mut out: Paths = Vec::with_capacity(rows.max(0) as usize * 2);
+    for i in 0..rows {
+        let shift = nm(grid * i as f64);
+        out.push(odd.iter().map(|q| Pt::new(q.x, q.y + shift)).collect());
+    }
+    for i in 0..rows {
+        let (sx, sy) = (nm(-0.5 * grid), nm((i as f64 + 0.5) * grid));
+        out.push(odd.iter().map(|q| Pt::new(q.x + sx, q.y + sy)).collect());
+    }
     if direction < 0 {
-        for l in &mut out {
-            for q in l.iter_mut() {
-                *q = DVec2::new(q.y, q.x);
+        for line in &mut out {
+            for q in line.iter_mut() {
+                *q = Pt::new(q.y, q.x);
             }
         }
     }
@@ -1781,7 +1837,7 @@ mod tests {
                 let got = total(&lines);
                 sum += got;
                 assert!((got - expected).abs() / expected < 0.45, "{pattern} at {z}: {got} vs {expected}");
-                assert!(lines.iter().flat_map(|l| &l.points).all(|p| p.x >= -1e-6 && p.x <= 50.0 + 1e-6), "{pattern}");
+                assert!(lines.iter().flat_map(|l| &l.points).all(|p| p.x >= -2e-6 && p.x <= 50.0 + 2e-6), "{pattern}");
             }
             let mean = sum / heights.len() as f64;
             assert!((mean - expected).abs() / expected < 0.25, "{pattern}: {mean} vs {expected}");

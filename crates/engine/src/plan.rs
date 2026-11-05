@@ -633,7 +633,7 @@ pub fn object(
                 .iter()
                 .map(|island| {
                     let around =
-                        (i > 0).then(|| ()).and(slices.get(i + 1)).zip(i.checked_sub(1).and_then(|k| slices.get(k)));
+                        (i > 0).then_some(()).and(slices.get(i + 1)).zip(i.checked_sub(1).and_then(|k| slices.get(k)));
                     let around = around.map(|(u, l)| (u.as_slice(), l.as_slice()));
                     let walled =
                         walls::walls(island, s, layer.height, first, i + 1 == slices.len(), loops, 1.0, around);
@@ -678,6 +678,7 @@ pub fn object(
             p.origin = origin;
             p.inset = true;
             p.height = s.layer_height;
+            p.bare = true;
             p.turn_by_layer = s.infill.sparse_template.is_empty();
             infill::fill_with(&area, infill::kind_of(&s.sparse_pattern), &p).into_iter().map(|l| l.points).collect()
         };

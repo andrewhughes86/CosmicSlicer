@@ -549,7 +549,7 @@ impl Occluder {
 
 /// Lines of a layer's outline, for signed distances: negative inside.
 #[derive(Default)]
-struct Outline {
+pub(crate) struct Outline {
     lines: Vec<[DVec2; 2]>,
     tree: Tree,
 }
@@ -567,6 +567,38 @@ impl Outline {
         }
         let boxes: Vec<Bounds> = lines.iter().map(|[a, b]| Bounds::of(&[a.extend(0.0), b.extend(0.0)])).collect();
         Outline { tree: Tree::new(&boxes), lines }
+    }
+
+    /// A tree over loose lines.
+    pub(crate) fn of_lines(lines: Vec<[DVec2; 2]>) -> Outline {
+        let boxes: Vec<Bounds> = lines.iter().map(|[a, b]| Bounds::of(&[a.extend(0.0), b.extend(0.0)])).collect();
+        Outline { tree: Tree::new(&boxes), lines }
+    }
+
+    /// The line nearest `p`.
+    pub(crate) fn nearest(&self, p: DVec2) -> Option<[DVec2; 2]> {
+        let mut best = (f64::INFINITY, None);
+        let mut stack = vec![0u32];
+        while let Some(at) = stack.pop() {
+            let Some(n) = self.tree.nodes.get(at as usize) else { continue };
+            if n.bounds.distance_sq(p) >= best.0 {
+                continue;
+            }
+            if n.count == 0 {
+                stack.push(n.at);
+                stack.push(at + 1);
+                continue;
+            }
+            for item in self.tree.leaf(n) {
+                if let Some(l) = self.lines.get(*item as usize) {
+                    let d = foot(l[0], l[1], p).distance_squared(p);
+                    if d < best.0 {
+                        best = (d, Some(*l));
+                    }
+                }
+            }
+        }
+        best.1
     }
 
     fn distance_sq(&self, p: DVec2) -> f64 {
@@ -592,7 +624,7 @@ impl Outline {
     }
 
     /// Counts crossings of a line from `p` towards +X.
-    fn inside(&self, p: DVec2) -> bool {
+    pub(crate) fn inside(&self, p: DVec2) -> bool {
         let mut crossings = 0u32;
         let mut stack = vec![0u32];
         while let Some(at) = stack.pop() {

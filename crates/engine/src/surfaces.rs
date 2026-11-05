@@ -9,6 +9,7 @@ use glam::DVec2;
 use rayon::prelude::*;
 
 use crate::geom::{self, Join, Op, Polyline, Shape};
+use crate::seam::Outline;
 use crate::settings::{Settings, VerticalShell};
 
 /// A layer as it comes out of wall generation.
@@ -37,7 +38,12 @@ fn opening(shapes: &[Shape], by: f64) -> Vec<Shape> {
     geom::offset(&geom::offset(shapes, -by, Join::Miter), by, Join::Miter)
 }
 
+/// Closing. Orca's closings by `SCALED_EPSILON` only weld what touches: a union does that, and
+/// offsets that small send the offsetter into minutes of work.
 fn closing(shapes: &[Shape], by: f64) -> Vec<Shape> {
+    if by < 1e-3 {
+        return geom::union(shapes);
+    }
     geom::offset(&geom::offset(shapes, by, Join::Miter), -by, Join::Miter)
 }
 
@@ -433,8 +439,7 @@ fn floating_edges(shape: &Shape, anchors: &[Shape]) -> Vec<[DVec2; 2]> {
             r
         })
         .collect();
-    let near = geom::offset(anchors, 1e-4, Join::Miter);
-    let lines = if near.is_empty() { rings } else { geom::clip_lines_outside(&rings, &near) };
+    let lines = if anchors.is_empty() { rings } else { geom::clip_lines_outside(&rings, anchors) };
     lines.iter().flat_map(|l| l.windows(2).map(|w| [w[0], w[1]])).collect()
 }
 
@@ -507,7 +512,7 @@ fn external(f: Fill, s: &Settings, first: bool, h: f64) -> Typed {
         out_bridges.push((merged, bridges.get(head).map_or(0.0, |b| b.angle)));
     }
 
-    let mut grow = |src: Vec<Shape>, shells: &mut Vec<Shape>, sparse: &mut Vec<Shape>| -> Vec<Shape> {
+    let grow = |src: Vec<Shape>, shells: &mut Vec<Shape>, sparse: &mut Vec<Shape>| -> Vec<Shape> {
         if src.is_empty() {
             return src;
         }
@@ -551,17 +556,11 @@ fn lines_of(shapes: &[Shape]) -> Vec<[DVec2; 2]> {
         .collect()
 }
 
-fn distance_sq(p: DVec2, [a, b]: [DVec2; 2]) -> f64 {
-    let d = b - a;
-    let l = d.length_squared();
-    let t = if l > 0.0 { ((p - a).dot(d) / l).clamp(0.0, 1.0) } else { 0.0 };
-    (a + d * t).distance_squared(p)
-}
-
 /// The way a bridge runs: square to most of the anchor lines near its outline, by a vote over
 /// points 2 mm apart in windows of ±18°.
 fn determine_bridging_angle(area: &[Shape], anchors: &[[DVec2; 2]]) -> f64 {
     use std::f64::consts::PI;
+    let tree = Outline::of_lines(anchors.to_vec());
     let mut counted: Vec<(f64, i32)> = Vec::new();
     for c in area.iter().flatten() {
         let mut acc = 0.0;
@@ -578,10 +577,7 @@ fn determine_bridging_angle(area: &[Shape], anchors: &[[DVec2; 2]]) -> f64 {
             let step = dist / count.max(1) as f64;
             for i in 0..count {
                 let q = start + v * (i as f64 * step);
-                let Some(line) = anchors.iter().min_by(|x, y| distance_sq(q, **x).total_cmp(&distance_sq(q, **y)))
-                else {
-                    continue;
-                };
+                let Some(line) = tree.nearest(q) else { continue };
                 let d = line[1] - line[0];
                 let mut angle = d.y.atan2(d.x);
                 if angle < 0.0 {
@@ -629,6 +625,21 @@ fn determine_bridging_angle(area: &[Shape], anchors: &[[DVec2; 2]]) -> f64 {
     if best.0 == 0.0 { 0.001 } else { best.0 }
 }
 
+/// Lines sorted into the upright rows they cross, so a row need not look at all of them.
+fn by_row(lines: &[[DVec2; 2]], x0: f64, spacing: f64, rows: usize) -> Vec<Vec<[DVec2; 2]>> {
+    let mut out: Vec<Vec<[DVec2; 2]>> = vec![Vec::new(); rows];
+    let row = |x: f64| (x - x0) / spacing - 0.5;
+    for line @ [a, b] in lines {
+        let (lo, hi) = (a.x.min(b.x), a.x.max(b.x));
+        let first = row(lo).floor().max(0.0) as usize;
+        let last = (row(hi).ceil().max(0.0) as usize).min(rows.saturating_sub(1));
+        for list in out.iter_mut().take(last + 1).skip(first) {
+            list.push(*line);
+        }
+    }
+    out
+}
+
 /// Crossings of the upright line at `x` with `lines`, by height.
 fn crossings(lines: &[[DVec2; 2]], x: f64) -> Vec<f64> {
     let mut ys: Vec<f64> = lines
@@ -653,6 +664,8 @@ fn anchored_polygon(area: &[Shape], anchors: &[[DVec2; 2]], width: f64, spacing:
     let rows = (((hi.x - lo.x) + spacing - 1e-6) / spacing).floor().clamp(0.0, 100_000.0) as usize;
     let limit = 36.0 * spacing * spacing;
     let half = DVec2::new(spacing / 2.0, 0.0);
+    let outline = Outline::of_lines(walls.clone());
+    let (wall_rows, anchor_rows) = (by_row(&walls, lo.x, spacing, rows), by_row(&anchors, lo.x, spacing, rows));
     struct Traced {
         lows: Vec<DVec2>,
         highs: Vec<DVec2>,
@@ -671,13 +684,13 @@ fn anchored_polygon(area: &[Shape], anchors: &[[DVec2; 2]], width: f64, spacing:
     let mut open: Vec<Traced> = Vec::new();
     for row in 0..rows {
         let x = lo.x + (row as f64 + 0.5) * spacing;
-        let ys = crossings(&walls, x);
+        let ys = crossings(wall_rows.get(row).map_or(&[][..], Vec::as_slice), x);
         let mut sections: Vec<(f64, f64)> = ys
             .windows(2)
-            .filter(|w| geom::contains(&turned, DVec2::new(x, (w[0] + w[1]) / 2.0)))
+            .filter(|w| outline.inside(DVec2::new(x, (w[0] + w[1]) / 2.0)))
             .map(|w| (w[0], w[1]))
             .collect();
-        let marks = crossings(&anchors, x);
+        let marks = crossings(anchor_rows.get(row).map_or(&[][..], Vec::as_slice), x);
         for sec in &mut sections {
             let below = marks.partition_point(|y| *y < sec.0);
             if below > 0

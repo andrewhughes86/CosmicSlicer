@@ -13,6 +13,7 @@
 
 pub mod arcs;
 pub mod calib;
+pub mod clipper;
 pub mod connect;
 pub mod fuzzy;
 pub mod gcode;
