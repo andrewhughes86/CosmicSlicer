@@ -483,13 +483,13 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
     let mut object_marks: Vec<Marks> = Vec::new();
     for (oi, (p, o)) in placed.iter().zip(&job.objects).enumerate() {
         progress.set(0.05 + 0.25 * oi as f64 / objects, "Slicing mesh");
-        let mut slices = slicing::slice(p, &layers, &cancelled);
+        let mut slices = slicing::slice(p, &layers, s.slice_closing, s.slice_resolution, &cancelled);
         // The other volumes: parts join the object, negative volumes cut it.
         let vslices: Vec<Vec<Vec<Shape>>> = volumes
             .get(oi)
             .map_or(&[][..], Vec::as_slice)
             .iter()
-            .map(|vp| slicing::slice(vp, &layers, &cancelled))
+            .map(|vp| slicing::slice(vp, &layers, s.slice_closing, s.slice_resolution, &cancelled))
             .collect();
         for kind in [VolumeKind::Part, VolumeKind::Negative] {
             for (_, vs) in o.volumes.iter().zip(&vslices).filter(|(v, _)| v.kind == kind) {
@@ -1099,7 +1099,7 @@ fn support_marks(o: &JobObject, placed: &Placed, layers: &[LayerZ], cancelled: &
     let n = layers.len();
     let (mut enforce, mut block) = (vec![Vec::new(); n], vec![Vec::new(); n]);
     for v in &o.support_volumes {
-        let slices = slicing::slice(&Placed::new(&v.mesh, &v.matrix), layers, cancelled);
+        let slices = slicing::slice(&Placed::new(&v.mesh, &v.matrix), layers, 0.049, 0.0025, cancelled);
         let dst = if v.kind == SupportPaint::Enforce { &mut enforce } else { &mut block };
         for (d, sh) in dst.iter_mut().zip(slices) {
             d.extend(sh);

@@ -1207,7 +1207,7 @@ mod tests {
         let s = Settings::read(Schema::get(), &Config::default());
         let placed = slicing::Placed::new(&primitives::cube(20.0), &Mat4::from_translation(Vec3::new(10.0, 10.0, 0.0)));
         let layers = slicing::layer_heights(placed.top(), s.first_layer_height, s.layer_height);
-        let slices = slicing::slice(&placed, &layers, &never);
+        let slices = slicing::slice(&placed, &layers, 0.049, 0.0025, &never);
         let plan = object(&slices, &layers, &s, &[], &never);
         let roles =
             |i: usize| -> Vec<Role> { plan[i].iter().flat_map(|isl| isl.fills.iter().map(|p| p.role)).collect() };
@@ -1237,7 +1237,7 @@ mod tests {
         let s = Settings::read(Schema::get(), &Config::default());
         let placed = slicing::Placed::new(&primitives::cube(20.0), &Mat4::from_translation(Vec3::new(10.0, 10.0, 0.0)));
         let layers = slicing::layer_heights(placed.top(), s.first_layer_height, s.layer_height);
-        let slices = slicing::slice(&placed, &layers, &never);
+        let slices = slicing::slice(&placed, &layers, 0.049, 0.0025, &never);
         let plan = object(&slices, &layers, &s, &[], &never);
         let has = |i: usize, r: Role| plan[i].iter().flat_map(|isl| isl.fills.iter()).any(|p| p.role == r);
         // The first solid layer under the top skin sits on sparse infill.

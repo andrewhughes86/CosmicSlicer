@@ -8,11 +8,15 @@
 
 use std::collections::HashMap;
 
-use glam::{DVec2, DVec3, Mat4};
+use glam::{DMat4, DVec2, DVec3, Mat4, Vec3};
 use rayon::prelude::*;
 
-use crate::geom::{self, Contour, Shape};
+use crate::clipper::{Path, Pt};
+use crate::geom::{self, Contour, Join, Shape};
 use CosmicSlicer_model::Mesh;
+
+/// Millimetres per unit of Orca's integers.
+const NM_MM: f64 = 1.0e-6;
 
 /// The heights layers are printed at.
 #[derive(Clone, Debug, PartialEq)]
@@ -81,16 +85,36 @@ pub fn layer_heights_by(top: f64, first: f64, lo: f64, hi: f64, height_at: &dyn 
 pub struct Placed {
     pub vertices: Vec<DVec3>,
     pub triangles: Vec<[u32; 3]>,
+    /// What OrcaSlicer slices: floats around the object's centre, XY in nanometres.
+    pub local: Vec<Vec3>,
+    /// The object's centre in nanometres (`PrintObject::m_center_offset`), which puts slices
+    /// back on the bed.
+    pub shift: (i64, i64),
 }
 
 impl Placed {
     pub fn new(mesh: &Mesh, matrix: &Mat4) -> Placed {
         let m = matrix.as_dmat4();
         let mirrored = m.determinant() < 0.0;
-        let vertices = mesh.vertices.iter().map(|v| m.transform_point3(v.as_dvec3())).collect();
+        let vertices: Vec<DVec3> = mesh.vertices.iter().map(|v| m.transform_point3(v.as_dvec3())).collect();
+        let (lo, hi) = vertices
+            .iter()
+            .filter(|v| v.is_finite())
+            .fold((DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY)), |(lo, hi), v| {
+                (lo.min(v.truncate()), hi.max(v.truncate()))
+            });
+        let centre = if lo.is_finite() && hi.is_finite() { (lo + hi) / 2.0 } else { DVec2::ZERO };
+        let shift = ((centre.x / NM_MM).round() as i64, (centre.y / NM_MM).round() as i64);
+        let to_local = DMat4::from_scale(DVec3::new(1.0 / NM_MM, 1.0 / NM_MM, 1.0))
+            * DMat4::from_translation(DVec3::new(shift.0 as f64 * NM_MM, shift.1 as f64 * NM_MM, 0.0)).inverse()
+            * m;
+        let trafo = to_local.as_mat4();
+        let (x, y, z, w) = (trafo.x_axis, trafo.y_axis, trafo.z_axis, trafo.w_axis);
+        // `Transform3f` times a vertex, in floats.
+        let local = mesh.vertices.iter().map(|v| (x * v.x + y * v.y + z * v.z + w).truncate()).collect();
         // A mirrored placement turns the triangles inside out; turn them back.
         let triangles = mesh.triangles.iter().map(|t| if mirrored { [t[0], t[2], t[1]] } else { *t }).collect();
-        Placed { vertices, triangles }
+        Placed { vertices, triangles, local, shift }
     }
 
     pub fn top(&self) -> f64 {
@@ -98,25 +122,34 @@ impl Placed {
     }
 }
 
-/// The slices of `mesh` at every layer: one set of shapes per layer.
-pub fn slice(mesh: &Placed, layers: &[LayerZ], cancelled: &(dyn Fn() -> bool + Sync)) -> Vec<Vec<Shape>> {
-    let zs: Vec<f64> = layers.iter().map(LayerZ::slice_z).collect();
+/// The slices of `mesh` at every layer: one set of shapes per layer. `closing` is the "slice
+/// gap closing radius".
+pub fn slice(
+    mesh: &Placed,
+    layers: &[LayerZ],
+    closing: f64,
+    resolution: f64,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Vec<Vec<Shape>> {
+    let zs: Vec<f32> = layers.iter().map(|l| l.slice_z() as f32).collect();
     // Triangles by the layers they span, so each layer only looks at its own.
     let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); zs.len()];
     for (ti, t) in mesh.triangles.iter().enumerate() {
-        let Some(corners) = corners(mesh, t) else { continue };
-        let lo = corners.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
-        let hi = corners.iter().map(|p| p.z).fold(f64::NEG_INFINITY, f64::max);
-        // With room for the plane to step off a vertex (`clear_of_vertices`).
-        let first = zs.partition_point(|z| *z < lo - MAX_NUDGE);
-        let last = zs.partition_point(|z| *z <= hi + MAX_NUDGE);
+        let Some(p) = local_corners(mesh, t) else { continue };
+        let lo = p[0].z.min(p[1].z.min(p[2].z));
+        let hi = p[0].z.max(p[1].z.max(p[2].z));
+        if lo == hi {
+            continue;
+        }
+        let first = zs.partition_point(|z| *z < lo);
+        let last = zs.partition_point(|z| *z <= hi);
         for b in buckets.iter_mut().take(last).skip(first) {
             b.push(ti as u32);
         }
     }
     zs.par_iter()
         .zip(buckets.par_iter())
-        .map(|(z, tris)| if cancelled() { Vec::new() } else { slice_layer(mesh, tris, *z) })
+        .map(|(z, tris)| if cancelled() { Vec::new() } else { slice_layer(mesh, tris, *z, closing, resolution) })
         .collect()
 }
 
@@ -198,95 +231,148 @@ fn corners(mesh: &Placed, t: &[u32; 3]) -> Option<[DVec3; 3]> {
     Some([v(t[0])?, v(t[1])?, v(t[2])?])
 }
 
-/// The point where the plane at `z` crosses edge `a`–`b`.
-fn cross(a: DVec3, b: DVec3, z: f64) -> DVec2 {
-    let t = ((z - a.z) / (b.z - a.z)).clamp(0.0, 1.0);
-    let p = a + (b - a) * t;
-    DVec2::new(p.x, p.y)
+fn local_corners(mesh: &Placed, t: &[u32; 3]) -> Option<[Vec3; 3]> {
+    let v = |i: u32| mesh.local.get(i as usize).copied().filter(|p| p.is_finite() && p.abs().max_element() < 1.0e15);
+    Some([v(t[0])?, v(t[1])?, v(t[2])?])
 }
 
-type EdgeKey = (u32, u32);
-
-fn key(a: u32, b: u32) -> EdgeKey {
-    if a < b { (a, b) } else { (b, a) }
+/// Where a line's end lies: on a mesh vertex, or on an edge, by its two vertices.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Node {
+    Vertex(u32),
+    Edge(u32, u32),
 }
 
-/// One layer: crossing segments, chained into loops, then filled.
-/// The furthest a layer's plane moves off a vertex.
-const MAX_NUDGE: f64 = 3.0e-4;
+fn edge_node(a: u32, b: u32) -> Node {
+    if a < b { Node::Edge(a, b) } else { Node::Edge(b, a) }
+}
 
-/// `z` moved a hair off every vertex of `tris` when one lies on it: a vertex on the plane
-/// collapses its triangles' crossings to a point, which breaks the loops apart there.
-fn clear_of_vertices(mesh: &Placed, tris: &[u32], z: f64) -> f64 {
-    const NEAR: f64 = 1.0e-7;
-    let hits = |zz: f64| {
-        tris.iter()
-            .filter_map(|t| mesh.triangles.get(*t as usize).and_then(|t| corners(mesh, t)))
-            .any(|c| c.iter().any(|q| (q.z - zz).abs() < NEAR))
-    };
-    if !hits(z) {
-        return z;
+struct Line {
+    a: Pt,
+    b: Pt,
+    from: Node,
+    to: Node,
+}
+
+/// `slice_facet`: the line a triangle leaves at height `z`, the solid on its left. `v` holds the
+/// vertices of `ids`, and `lowest` is which of them is lowest.
+fn slice_facet(z: f32, v: &[Vec3; 3], ids: &[u32; 3], lowest: usize) -> Option<Line> {
+    let mut points: [(Pt, Node); 3] = [(Pt::default(), Node::Vertex(0)); 3];
+    let mut count = 0;
+    let mut on_layer: Option<usize> = None;
+    let at = |p: Vec3| Pt::new(p.x as i64, p.y as i64);
+    for j in 0..3 {
+        let (k, l) = ((lowest + j) % 3, (lowest + j + 1) % 3);
+        let (mut a, mut b, mut a_id, mut b_id) = (v[k], v[l], ids[k], ids[l]);
+        if a.z == z && b.z == z {
+            // An edge in the plane is the line of the triangle under it.
+            if !(v[0].z < z || v[1].z < z || v[2].z < z) {
+                return None;
+            }
+            return Some(Line { a: at(b), b: at(a), from: Node::Vertex(b_id), to: Node::Vertex(a_id) });
+        }
+        let same =
+            |on: Option<usize>, points: &[(Pt, Node); 3], id: u32| on.is_some_and(|i| points[i].1 == Node::Vertex(id));
+        if a.z == z {
+            if !same(on_layer, &points, a_id) {
+                on_layer = Some(count);
+                points[count] = (at(a), Node::Vertex(a_id));
+                count += 1;
+            }
+        } else if b.z == z {
+            if !same(on_layer, &points, b_id) {
+                on_layer = Some(count);
+                points[count] = (at(b), Node::Vertex(b_id));
+                count += 1;
+            }
+        } else if (a.z < z && b.z > z) || (b.z < z && a.z > z) {
+            // In the same order from both sides of the edge.
+            if a_id > b_id {
+                std::mem::swap(&mut a_id, &mut b_id);
+                std::mem::swap(&mut a, &mut b);
+            }
+            let t = (f64::from(z) - f64::from(b.z)) / (f64::from(a.z) - f64::from(b.z));
+            if t <= 0.0 {
+                if !same(on_layer, &points, a_id) {
+                    on_layer = Some(count);
+                    points[count] = (at(a), Node::Vertex(a_id));
+                    count += 1;
+                }
+            } else if t >= 1.0 {
+                if !same(on_layer, &points, b_id) {
+                    on_layer = Some(count);
+                    points[count] = (at(b), Node::Vertex(b_id));
+                    count += 1;
+                }
+            } else {
+                let cross =
+                    |pa: f32, pb: f32| (f64::from(pb) + (f64::from(pa) - f64::from(pb)) * t + 0.5).floor() as i64;
+                points[count] = (Pt::new(cross(a.x, b.x), cross(a.y, b.y)), edge_node(a_id, b_id));
+                count += 1;
+            }
+        }
+        if count > 2 {
+            return None;
+        }
     }
-    // Down first: a top face lying on the plane still counts for the layer (as OrcaSlicer
-    // slices it).
-    [-1.0e-5, 1.0e-5, -3.0e-5, 3.0e-5, -1.0e-4, 1.0e-4, -MAX_NUDGE, MAX_NUDGE]
-        .into_iter()
-        .map(|d| z + d)
-        .find(|zz| !hits(*zz))
-        .unwrap_or(z)
+    (count == 2).then(|| Line { a: points[1].0, b: points[0].0, from: points[1].1, to: points[0].1 })
 }
 
-fn slice_layer(mesh: &Placed, tris: &[u32], z: f64) -> Vec<Shape> {
-    let z = clear_of_vertices(mesh, tris, z);
-    // Each segment runs from the edge it enters by to the edge it leaves by, oriented so the
-    // solid is on its left (outer loops counter-clockwise).
-    let mut next: HashMap<EdgeKey, (EdgeKey, DVec2)> = HashMap::with_capacity(tris.len());
-    let mut points: HashMap<EdgeKey, DVec2> = HashMap::with_capacity(tris.len());
+/// One layer: the triangles' lines chained into loops, gaps closed, simplified (`slice_mesh_ex`).
+fn slice_layer(mesh: &Placed, tris: &[u32], z: f32, closing: f64, resolution: f64) -> Vec<Shape> {
+    let mut lines: Vec<Line> = Vec::with_capacity(tris.len());
     for &ti in tris {
         let Some(t) = mesh.triangles.get(ti as usize) else { continue };
-        let Some(p) = corners(mesh, t) else { continue };
-        // A vertex exactly on the plane counts as above it.
-        let above = p.map(|q| q.z >= z);
-        let n_above = above.iter().filter(|a| **a).count();
-        if n_above == 0 || n_above == 3 {
-            continue;
-        }
-        // The lone vertex on its side, and the two edges to it.
-        let lone = (0..3).find(|&i| above[i] == (n_above == 1)).unwrap_or(0);
-        let (i1, i2) = ((lone + 1) % 3, (lone + 2) % 3);
-        let (ka, kb) = (key(t[lone], t[i1]), key(t[lone], t[i2]));
-        let pa = cross(p[lone], p[i1], z);
-        let pb = cross(p[lone], p[i2], z);
-        // With the lone vertex above, going from its edge to i1 towards its edge to i2 keeps
-        // the inside on the left for a counter-clockwise triangle; below, the other way.
-        let (from, to, pf, pt) = if n_above == 1 { (ka, kb, pa, pb) } else { (kb, ka, pb, pa) };
-        if pf.distance_squared(pt) < 1.0e-18 {
-            continue;
-        }
-        points.insert(from, pf);
-        points.insert(to, pt);
-        next.insert(from, (to, pt));
+        let Some(v) = local_corners(mesh, t) else { continue };
+        let lo = v[0].z.min(v[1].z.min(v[2].z));
+        let lowest = if v[1].z == lo {
+            1
+        } else if v[2].z == lo {
+            2
+        } else {
+            0
+        };
+        lines.extend(slice_facet(z, &v, t, lowest));
     }
-    let mut loops: Vec<Contour> = Vec::new();
-    let mut open: Vec<Vec<DVec2>> = Vec::new();
-    let mut starts: Vec<EdgeKey> = next.keys().copied().collect();
-    starts.sort_unstable();
-    for start in starts {
-        if !next.contains_key(&start) {
+    let mut by_start: HashMap<Node, Vec<u32>> = HashMap::with_capacity(lines.len());
+    for (i, l) in lines.iter().enumerate().rev() {
+        by_start.entry(l.from).or_default().push(i as u32);
+    }
+    let mut used = vec![false; lines.len()];
+    let (mut loops, mut open): (Vec<Path>, Vec<Path>) = (Vec::new(), Vec::new());
+    for start in 0..lines.len() {
+        if used.get(start).copied().unwrap_or(true) {
             continue;
         }
-        let mut chain = vec![points.get(&start).copied().unwrap_or_default()];
         let mut at = start;
+        let mut chain: Path = Vec::new();
         let mut closed = false;
-        while let Some((to, p)) = next.remove(&at) {
-            if to == start {
+        while let Some(line) = lines.get(at) {
+            if let Some(u) = used.get_mut(at) {
+                *u = true;
+            }
+            chain.push(line.a);
+            if lines.get(start).is_some_and(|s| s.from == line.to) {
                 closed = true;
                 break;
             }
-            chain.push(p);
-            at = to;
-            if chain.len() > 10_000_000 {
+            let Some(list) = by_start.get_mut(&line.to) else {
+                chain.push(line.b);
                 break;
+            };
+            let mut next = None;
+            while let Some(i) = list.pop() {
+                if !used.get(i as usize).copied().unwrap_or(true) {
+                    next = Some(i as usize);
+                    break;
+                }
+            }
+            match next {
+                Some(i) => at = i,
+                None => {
+                    chain.push(line.b);
+                    break;
+                }
             }
         }
         if closed {
@@ -295,17 +381,32 @@ fn slice_layer(mesh: &Placed, tris: &[u32], z: f64) -> Vec<Shape> {
             open.push(chain);
         }
     }
-    loops.extend(close_gaps(open, 1.0));
-    let loops: Vec<Contour> = loops.into_iter().map(|l| geom::simplify_loop(&l, 0.0125)).collect();
-    geom::union_loops(&loops)
+    loops.extend(close_gaps(open, 1_000_000.0));
+    for l in &mut loops {
+        for p in l.iter_mut() {
+            *p = Pt::new(p.x + mesh.shift.0, p.y + mesh.shift.1);
+        }
+    }
+    let solid = geom::union_paths(&loops);
+    let closed = if closing > 0.0 {
+        let radius = closing / 1.0e-6;
+        geom::offset2_nm(&solid, radius as f32, -radius as f32, Join::Miter)
+    } else {
+        solid
+    };
+    if resolution <= 0.0 {
+        return closed;
+    }
+    closed.iter().flat_map(|shape| geom::union_paths(&geom::simplify_p(shape, resolution / 1.0e-6))).collect()
 }
 
 /// Joins open chains end to start where the gap is under `max_gap`, closing what it can.
-fn close_gaps(mut open: Vec<Vec<DVec2>>, max_gap: f64) -> Vec<Contour> {
+fn close_gaps(mut open: Vec<Path>, max_gap: f64) -> Vec<Path> {
+    let gap = |a: Pt, b: Pt| ((a.x - b.x) as f64).hypot((a.y - b.y) as f64);
     let mut out = Vec::new();
     while let Some(mut chain) = open.pop() {
         while let (Some(&first), Some(&last)) = (chain.first(), chain.last()) {
-            if chain.len() >= 3 && first.distance(last) < max_gap {
+            if chain.len() >= 3 && gap(first, last) < max_gap {
                 out.push(chain);
                 break;
             }
@@ -313,7 +414,7 @@ fn close_gaps(mut open: Vec<Vec<DVec2>>, max_gap: f64) -> Vec<Contour> {
             let best = open
                 .iter()
                 .enumerate()
-                .filter_map(|(i, c)| c.first().map(|p| (i, p.distance(last))))
+                .filter_map(|(i, c)| c.first().map(|p| (i, gap(*p, last))))
                 .min_by(|a, b| a.1.total_cmp(&b.1));
             match best {
                 Some((i, d)) if d < max_gap => {
@@ -343,7 +444,7 @@ mod tests {
         let placed = Placed::new(&mesh, &Mat4::from_translation(Vec3::new(10.0, 10.0, 0.0)));
         let layers = layer_heights(placed.top(), 0.2, 0.2);
         assert_eq!(layers.len(), 100);
-        let slices = slice(&placed, &layers, &never);
+        let slices = slice(&placed, &layers, 0.049, 0.0025, &never);
         // Chained in the mesh's own winding, the outline runs counter-clockwise.
         assert!(
             slices.iter().all(|s| s.first().and_then(|sh| sh.first()).is_some_and(|c| geom::signed_area2(c) > 0.0))
@@ -378,13 +479,9 @@ mod tests {
         }
         let mesh = Mesh { vertices, triangles };
         let placed = Placed::new(&mesh, &glam::Mat4::IDENTITY);
-        // The plane steps off the ledge's vertices (Benchy's hull at 6.5 mm lost the layer).
-        let all: Vec<u32> = (0..placed.triangles.len() as u32).collect();
-        let z = clear_of_vertices(&placed, &all, 0.5);
-        assert!(z != 0.5 && (z - 0.5).abs() < 1e-3, "{z}");
-        assert_eq!(clear_of_vertices(&placed, &all, 0.3), 0.3);
+        // Lines ending on the ledge's vertices chain through them (Benchy's hull at 6.5 mm).
         let layers = layer_heights(placed.top(), 0.2, 0.2);
-        let out = slice(&placed, &layers, &|| false);
+        let out = slice(&placed, &layers, 0.049, 0.0025, &|| false);
         for (l, s) in layers.iter().zip(&out) {
             let a = geom::area(s);
             assert_eq!(s.len(), 1, "z {}: {a}", l.print_z);
@@ -404,7 +501,8 @@ mod tests {
         let mesh = primitives::torus(15.0, 5.0, 64, 24);
         let placed = Placed::new(&mesh, &Mat4::IDENTITY);
         let layers = layer_heights(placed.top(), 0.2, 0.2);
-        let middle = slice(&placed, &layers, &never).into_iter().nth(layers.len() / 2).unwrap_or_default();
+        let middle =
+            slice(&placed, &layers, 0.049, 0.0025, &never).into_iter().nth(layers.len() / 2).unwrap_or_default();
         assert_eq!(middle.len(), 1);
         assert_eq!(middle[0].len(), 2, "outer and hole");
         let a = geom::area(&middle);
@@ -417,7 +515,7 @@ mod tests {
         let mesh = primitives::cylinder(10.0, 10.0, 64);
         let placed = Placed::new(&mesh, &Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0)));
         let layers = layer_heights(placed.top(), 0.2, 0.2);
-        let s = slice(&placed, &layers, &never);
+        let s = slice(&placed, &layers, 0.049, 0.0025, &never);
         assert!(s.iter().all(|l| geom::area(l) > 300.0));
     }
 

@@ -51,6 +51,10 @@ pub struct Settings {
     pub seam: String,
     pub outer_first: bool,
     pub spiral: bool,
+    /// "Slice gap closing radius", mm.
+    pub slice_closing: f64,
+    /// How far slices are simplified, mm.
+    pub slice_resolution: f64,
     /// How far simplified paths may stray, mm.
     pub resolution: f64,
     pub bridge_flow: f64,
@@ -1213,6 +1217,8 @@ impl Settings {
             seam: r.text("seam_position"),
             outer_first: r.text("wall_sequence").starts_with("outer"),
             spiral: r.flag("spiral_mode"),
+            slice_closing: r.range("slice_closing_radius", 0.049, 0.0, 2.0),
+            slice_resolution: if r.range("resolution", 0.012, 0.0, 1.0) <= 0.001 { 0.0 } else { 0.0025 },
             resolution: r.range("resolution", 0.012, 0.0, 1.0),
             bridge_flow: r.range("bridge_flow", 1.0, 0.1, 2.0),
             only_one_wall_top: r.flag("only_one_wall_top"),
