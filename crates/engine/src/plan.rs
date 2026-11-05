@@ -17,13 +17,17 @@ use crate::geom::{self, Join, Op, Polyline, Shape};
 use crate::infill::{self, Kind, Params};
 use crate::settings::{self, FuzzyWhere, GapFill, IroningKind, Settings, VerticalShell, bead_area};
 use crate::slicing::LayerZ;
+use crate::surfaces;
 use crate::toolpath::{Island, Path, Role};
 use crate::{fuzzy, lightning, overhang, walls};
 
 /// What OrcaSlicer calls the regions of a layer's fill.
+#[derive(Default)]
 struct Regions {
     top: Vec<Shape>,
     bottom: Vec<Shape>,
+    /// Bridges whose angle is known, on layers `prepare`d by [`surfaces`].
+    bridges: Vec<(Vec<Shape>, f64)>,
     solid: Vec<Shape>,
     sparse: Vec<Shape>,
 }
@@ -83,7 +87,7 @@ fn classify(area: &[Shape], slices: &[Vec<Shape>], i: usize, s: &Settings, w: f6
     let solid = geom::boolean(&geom::boolean(&solid_all, &top, Op::Difference), &bottom, Op::Difference);
     let solid = geom::without_slivers(solid, sliver);
     if s.wall_loops == 0 {
-        return Regions { top, bottom, solid, sparse };
+        return Regions { top, bottom, solid, sparse, bridges: Vec::new() };
     }
     // OrcaSlicer's external surface expansion: top and bottom surfaces reach out under the
     // walls' thickness (×√2) into the solid infill round them, and a wall's spacing into
@@ -109,7 +113,7 @@ fn classify(area: &[Shape], slices: &[Vec<Shape>], i: usize, s: &Settings, w: f6
     };
     let bottom = grow(bottom);
     let top = grow(geom::boolean(&top, &bottom, Op::Difference));
-    Regions { top, bottom, solid, sparse }
+    Regions { top, bottom, solid, sparse, bridges: Vec::new() }
 }
 
 /// OrcaSlicer's clean-up of the solid shell on a layer ("ensure vertical shell thickness"):
@@ -283,10 +287,13 @@ fn with_gap_fill(region: Vec<Shape>, s: &Settings, w: f64, wanted: bool, speed: 
 
 /// A bridge's width and flow: thick bridges are round threads the nozzle's width.
 fn bridge_bead(s: &Settings, thick: bool, w: f64, h: f64, flow: f64) -> (f64, f64) {
+    let set = s.bridges.width;
     if thick {
-        let d = s.nozzle;
+        let d = if set > 0.0 { set } else { s.nozzle };
         let round = std::f64::consts::PI * (d / 2.0).powi(2);
         (d, flow * round / bead_area(d, h).max(1e-6))
+    } else if set > 0.0 {
+        (set, flow)
     } else {
         (w, flow)
     }
@@ -294,8 +301,8 @@ fn bridge_bead(s: &Settings, thick: bool, w: f64, h: f64, flow: f64) -> (f64, f6
 
 /// How far apart bridge lines go (OrcaSlicer's): round threads their diameter and 0.05 mm,
 /// flat ones as solid infill does.
-fn bridge_spacing(thick: bool, w: f64, solid_w: f64, h: f64) -> f64 {
-    if thick { w + 0.05 } else { Settings::spacing(solid_w, h) }
+fn bridge_spacing(thick: bool, w: f64, h: f64) -> f64 {
+    if thick { w + 0.05 } else { Settings::spacing(w, h) }
 }
 
 /// An internal bridge grown as OrcaSlicer anchors it: each of its lines (along `angle`,
@@ -597,7 +604,9 @@ pub fn object(
         s.density = 0.0;
     }
     let s = &s;
-    let shells = vertical_shells(slices, layers, s);
+    // OrcaSlicer's own region pipeline where one set of settings covers each layer.
+    let whole = !s.spiral && regions.iter().all(|r| r.pieces.is_empty() && r.base.is_none());
+    let shells = if whole { vec![Vec::new(); slices.len()] } else { vertical_shells(slices, layers, s) };
     // First pass: walls and fill regions of every island.
     let walled: Vec<Vec<Walled>> = (0..slices.len())
         .into_par_iter()
@@ -617,14 +626,19 @@ pub fn object(
             slice
                 .iter()
                 .map(|island| {
-                    let walled = walls::walls(island, s, layer.height, first, i + 1 == slices.len(), loops, 1.0);
+                    let around =
+                        (i > 0).then(|| ()).and(slices.get(i + 1)).zip(i.checked_sub(1).and_then(|k| slices.get(k)));
+                    let around = around.map(|(u, l)| (u.as_slice(), l.as_slice()));
+                    let walled =
+                        walls::walls(island, s, layer.height, first, i + 1 == slices.len(), loops, 1.0, around);
                     let solid_w = if first { s.widths.first_layer } else { s.widths.solid };
                     let pieces = split_fill(&walled.infill_area, pieces, solid_w)
                         .into_iter()
                         .map(|(area, settings)| {
                             let rs = settings.as_deref().unwrap_or(s);
                             let w = if first { rs.widths.first_layer } else { rs.widths.solid };
-                            let regions = classify(&area, slices, i, rs, w, shell);
+                            let regions =
+                                if whole { Regions::default() } else { classify(&area, slices, i, rs, w, shell) };
                             Piece { regions, area, settings }
                         })
                         .collect();
@@ -633,6 +647,42 @@ pub fn object(
                 .collect()
         })
         .collect();
+    let mut walled = walled;
+    if whole {
+        let input: Vec<surfaces::Input> = (0..walled.len())
+            .map(|i| surfaces::Input {
+                slices: slices.get(i).cloned().unwrap_or_default(),
+                fill: walled
+                    .get(i)
+                    .map(|l| l.iter().flat_map(|w| w.walled.infill_area.iter().cloned()).collect())
+                    .unwrap_or_default(),
+                height: layers.get(i).map_or(s.layer_height, |l| l.height),
+            })
+            .collect();
+        let typed = surfaces::prepare(&input, s);
+        walled.par_iter_mut().zip(typed.into_par_iter()).for_each(|(layer, t)| {
+            let many = layer.iter().flat_map(|w| &w.pieces).count() > 1;
+            for piece in layer.iter_mut().flat_map(|w| &mut w.pieces) {
+                let clip = |x: &[Shape]| -> Vec<Shape> {
+                    if many {
+                        geom::boolean(x, &geom::offset(&piece.area, 0.5, Join::Miter), Op::Intersect)
+                    } else {
+                        x.to_vec()
+                    }
+                };
+                let bridges: Vec<(Vec<Shape>, f64)> =
+                    t.bridges.iter().map(|(b, a)| (clip(b), *a)).filter(|(b, _)| !b.is_empty()).collect();
+                let regions = Regions {
+                    top: clip(&t.top),
+                    bottom: clip(&t.bottom),
+                    bridges,
+                    solid: clip(&t.solid),
+                    sparse: clip(&t.sparse),
+                };
+                piece.regions = regions;
+            }
+        });
+    }
     // Each layer's sparse infill, which solid infill over it has to bridge.
     let sparse: Vec<Vec<Shape>> = walled
         .iter()
@@ -867,6 +917,24 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
         let b = &s.bridges;
         let (w, flow) = bridge_bead(s, b.thick, solid_w, h, s.bridge_flow);
         let anchors = at.below.map_or(&[][..], Vec::as_slice);
+        for (area, angle) in &r.bridges {
+            for part in area {
+                let part = std::slice::from_ref(part);
+                let angle = b.angle.map_or(*angle, f64::to_radians);
+                let mut p = Params::new(bridge_spacing(b.thick, w, h), b.density, angle, i, z);
+                p.origin = at.origin;
+                p.inset = true;
+                p.bridge = true;
+                p.turn_by_layer = false;
+                out.extend(paths_of(
+                    infill::fill_with(part, Kind::Rectilinear { alternate: false }, &p),
+                    Role::Bridge,
+                    w,
+                    s.speeds.bridge,
+                    flow,
+                ));
+            }
+        }
         for part in &r.bottom {
             let part = std::slice::from_ref(part);
             if inf.extra_overhang_perimeters
@@ -876,7 +944,7 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
                 continue;
             }
             let angle = b.angle.map_or_else(|| bridge_angle(part, anchors, w), f64::to_radians);
-            let mut p = Params::new(bridge_spacing(b.thick, w, solid_w, h), b.density, angle, i, z);
+            let mut p = Params::new(bridge_spacing(b.thick, w, h), b.density, angle, i, z);
             p.origin = at.origin;
             p.inset = true;
             p.bridge = true;
@@ -922,7 +990,7 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
         // Bridges reach along their lines to the infill below (OrcaSlicer's anchoring), over
         // the solid and sparse infill round them.
         let reach_into = geom::union(&[r.solid.clone(), r.sparse.clone()].concat());
-        let spacing = bridge_spacing(b.thick_internal, w, solid_w, h);
+        let spacing = bridge_spacing(b.thick_internal, w, h);
         let mut bridged: Vec<(Vec<Shape>, f64)> = Vec::new();
         for part in &internal {
             let part = std::slice::from_ref(part);
@@ -981,7 +1049,7 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
     out.extend(gaps);
     match sparse_left {
         Some(sparse) => {
-            let left = Regions { top: Vec::new(), bottom: Vec::new(), solid: Vec::new(), sparse };
+            let left = Regions { sparse, ..Regions::default() };
             sparse_fill(out, &left, s, at, sparse_angle, infill_speed);
         }
         None => sparse_fill(out, r, s, at, sparse_angle, infill_speed),

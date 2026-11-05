@@ -31,6 +31,7 @@ pub mod settings;
 pub mod skirt;
 pub mod slicing;
 pub mod support;
+pub mod surfaces;
 pub mod thumbnail;
 pub mod toolpath;
 pub mod travel;

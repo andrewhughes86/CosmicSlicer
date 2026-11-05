@@ -158,6 +158,15 @@ pub fn union_loops(loops: &[Contour]) -> Vec<Shape> {
 
 /// The parts of `lines` that lie inside `shapes`.
 pub fn clip_lines(lines: &[Polyline], shapes: &[Shape]) -> Vec<Polyline> {
+    clip(lines, shapes, false)
+}
+
+/// The parts of `lines` outside `shapes`.
+pub fn clip_lines_outside(lines: &[Polyline], shapes: &[Shape]) -> Vec<Polyline> {
+    clip(lines, shapes, true)
+}
+
+fn clip(lines: &[Polyline], shapes: &[Shape], invert: bool) -> Vec<Polyline> {
     let paths: Vec<Vec<[f64; 2]>> = lines
         .iter()
         .filter(|l| l.len() >= 2 && l.iter().all(|p| p.is_finite()))
@@ -167,7 +176,7 @@ pub fn clip_lines(lines: &[Polyline], shapes: &[Shape]) -> Vec<Polyline> {
     if paths.is_empty() || raw.is_empty() {
         return Vec::new();
     }
-    let rule = ClipRule { invert: false, boundary_included: false };
+    let rule = ClipRule { invert, boundary_included: false };
     let out =
         catch_unwind(AssertUnwindSafe(|| paths.clip_by_as::<i32>(&raw, FillRule::NonZero, rule))).unwrap_or_default();
     out.into_iter()

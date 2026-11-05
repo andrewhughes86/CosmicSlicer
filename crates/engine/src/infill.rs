@@ -773,8 +773,10 @@ fn monotonic(area: &[Shape], spacing: f64, a: f64, phase: f64, width: f64, link:
     let mut out: Vec<Line> = regions(pieces, a, spacing, phase)
         .into_iter()
         .flat_map(|mut r| {
-            if let Some(first) = r.first_mut() {
-                first.reverse();
+            if !start_flipped(&r) {
+                if let Some(first) = r.first_mut() {
+                    first.reverse();
+                }
             }
             join_zigzag(r, &around, spacing * 1.9, link)
         })
@@ -785,14 +787,34 @@ fn monotonic(area: &[Shape], spacing: f64, a: f64, phase: f64, width: f64, link:
     out
 }
 
+/// Whether a monotonic region's rows, running along their direction, start at their near end.
+/// OrcaSlicer searches for the shortest order with a fixed seed; for one region that comes to
+/// starting from the far end, unless the near end makes the steps between rows shorter.
+fn start_flipped(rows: &[Polyline]) -> bool {
+    let steps = |far_first: bool| -> f64 {
+        rows.windows(2)
+            .enumerate()
+            .map(|(i, w)| {
+                // Row `i` ends at its far end when it started at the near one.
+                let ends_far = (i % 2 == 0) != far_first;
+                let end = if ends_far { w[0].last() } else { w[0].first() };
+                let start = if ends_far { w[1].last() } else { w[1].first() };
+                end.zip(start).map_or(0.0, |(a, b)| a.distance(*b))
+            })
+            .sum()
+    };
+    steps(true) > steps(false)
+}
+
 /// Monotonic lines: in order across the region, turn about, unlinked.
 fn monotonic_lines(area: &[Shape], spacing: f64, a: f64, phase: f64, width: f64) -> Vec<Line> {
     let pieces = rows(area, spacing, a, phase, width);
     regions(pieces, a, spacing, phase)
         .into_iter()
         .flat_map(|r| {
-            r.into_iter().enumerate().map(|(i, mut l)| {
-                if i % 2 == 0 {
+            let start = usize::from(!start_flipped(&r));
+            r.into_iter().enumerate().map(move |(i, mut l)| {
+                if (i + start) % 2 == 1 {
                     l.reverse();
                 }
                 Line { points: l, closed: false, ordered: true }

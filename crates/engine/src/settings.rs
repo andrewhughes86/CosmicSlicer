@@ -318,10 +318,14 @@ pub struct Walls {
     pub ccw: bool,
     pub precise_outer: bool,
     pub one_wall_first_layer: bool,
+    /// "Only one wall on top" leaves out top surfaces narrower than this, mm.
+    pub min_top_width: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct Bridges {
+    /// Line width, mm; 0 takes the solid infill's.
+    pub width: f64,
     /// Degrees; `None` finds the best direction.
     pub angle: Option<f64>,
     pub internal_angle: Option<f64>,
@@ -912,8 +916,10 @@ impl Settings {
             ccw: r.text("wall_direction") != "cw",
             precise_outer: r.flag("precise_outer_wall"),
             one_wall_first_layer: r.flag("only_one_wall_first_layer"),
+            min_top_width: r.mm_or_percent("min_width_top_surface", widths.inner).unwrap_or(0.0),
         };
         let bridges = Bridges {
+            width: r.mm_or_percent("bridge_line_width", nozzle).unwrap_or(0.0).clamp(0.0, 10.0),
             angle: r.angle_or_auto("bridge_angle"),
             internal_angle: r.angle_or_auto("internal_bridge_angle"),
             density: r.range("bridge_density", 100.0, 10.0, 100.0) / 100.0,
