@@ -389,6 +389,21 @@ fn f3(v: f64) -> String {
     plain(v, 3)
 }
 
+/// printf's `%g`, for the sizes a line width comes in: six significant digits, no trailing zeros.
+fn general(v: f64) -> String {
+    if !v.is_finite() || v == 0.0 {
+        return "0".into();
+    }
+    let scientific = format!("{v:.5e}");
+    let exponent = scientific.split('e').nth(1).and_then(|e| e.parse::<i32>().ok()).unwrap_or(0);
+    if !(-4..6).contains(&exponent) {
+        return scientific;
+    }
+    let fixed = format!("{v:.*}", (5 - exponent) as usize);
+    let trimmed = if fixed.contains('.') { fixed.trim_end_matches('0').trim_end_matches('.') } else { &fixed };
+    trimmed.to_owned()
+}
+
 fn f5(v: f64) -> String {
     plain(v, 5)
 }
@@ -1001,10 +1016,11 @@ impl<'a> Writer<'a> {
             let tag = if s.bbl { "; FEATURE: " } else { ";TYPE:" };
             self.line(format!("{tag}{}", role.name()));
         }
-        if (self.width - path.width).abs() > 1.0e-4 {
+        // Orca compares and prints the float its path holds.
+        if self.width as f32 != path.width as f32 {
             self.width = path.width;
             let tag = if s.bbl { "; LINE_WIDTH: " } else { ";WIDTH:" };
-            self.line(format!("{tag}{}", f3(path.width)));
+            self.line(format!("{tag}{}", general(f64::from(path.width as f32))));
         }
         let mut base = path.speed;
         if path.role == Role::OuterWall
@@ -2830,6 +2846,22 @@ fn slow_down_cap(moves: &[(f64, f64)], extra: f64, min: f64) -> Option<f64> {
         if added(mid) > extra { lo = mid } else { hi = mid }
     }
     Some(lo)
+}
+
+#[cfg(test)]
+mod general_tests {
+    use super::general;
+
+    #[test]
+    fn it_prints_as_printf_does() {
+        assert_eq!(general(0.45), "0.45");
+        assert_eq!(general(f64::from(0.419999f32)), "0.419999");
+        assert_eq!(general(f64::from(0.346559f32)), "0.346559");
+        assert_eq!(general(1.0), "1");
+        assert_eq!(general(0.0), "0");
+        assert_eq!(general(123.4567), "123.457");
+        assert_eq!(general(f64::NAN), "0");
+    }
 }
 
 #[cfg(test)]

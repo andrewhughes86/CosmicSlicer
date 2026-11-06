@@ -143,10 +143,16 @@ On the cube that is 54 % of lines identical. Each difference is a profile value,
 
 ## Seams still to pin down
 
-Cylinder seams now land on Orca's vertex. On Benchy 98 of 240 layers start within 1 mm of Orca's seam,
-and on bridge none do: its strings cross from the pillars into the deck, where Orca's stop. Picks on
-the pillars match Orca, so the cause is in alignment or in visibility values, which cannot be read out
-of Orca's G-code. Not yet explained.
+Measured on outer wall loops, exact and within 1 mm of Orca's start: cube20, cylinder, large and small
+100 %, thinwalls 97 and 97, overhangs 83 and 100, calicat 80 and 84, ksr 79 and 86, Benchy 67 and 89,
+Voron cube 38 and 86, Bunny 46 and 80, steps 50 and 50, OrcaCube 9 and 36, bridge 2 and 2.
+
+The steps and bridge misses are shapes symmetrical enough that only visibility noise tells corners
+apart: Orca takes the rear inner corners of bridge's pillars and we take the front ones. Read line for
+line against Orca and found equal: the sampling, the ray frame, the candidate heights, the seam string
+and the fit. The samples themselves look right: changing the order of the random draws or of the
+triangles takes the Voron cube from 86 % to under 80 %, and arrange's quarter turns do not explain
+steps. What is left cannot be read from Orca's G-code; it needs a build of Orca that prints its scores.
 
 ## Not traced yet
 

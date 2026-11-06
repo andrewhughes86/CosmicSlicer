@@ -429,7 +429,8 @@ pub fn solid_width(area: &[Shape], kind: Kind, p: &Params) -> f64 {
         area.iter().map(|sh| sh.iter().map(|c| c.iter().map(|q| *q - p.origin).collect()).collect()).collect();
     match (rectilinear_job(kind, p), moved.first()) {
         (Some(job), Some(shape)) if p.fit_solid => crate::rectilinear::spacing_of(&geom::paths_of(shape), &job)
-            .map_or(p.width, |fit| p.width + fit - job.spacing),
+            // `Flow::with_spacing`, in its floats.
+            .map_or(p.width, |fit| f64::from(p.width as f32 + (fit as f32 - job.spacing as f32))),
         _ => p.width,
     }
 }
