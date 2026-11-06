@@ -19,13 +19,13 @@ the X1C, MK4 and Voron table further down was taken before this stretch's work (
 | thinwalls | 86 % |
 | small | 75 % |
 | overhangs | 72 % |
-| bridge | 70 % |
+| bridge | 71 % |
 | calicat | 68 % |
-| steps | 67 % |
-| ksr_fdmtest_v4 | 62 % |
+| steps | 68 % |
+| ksr_fdmtest_v4 | 63 % |
 | large | 57 % |
-| 3DBenchy | 50 % |
-| OrcaCube_v2 | 46 % |
+| 3DBenchy | 53 % |
+| OrcaCube_v2 | 47 % |
 | Voron_Design_Cube_v7 | 47 % |
 | Stanford_Bunny | 7 % |
 
