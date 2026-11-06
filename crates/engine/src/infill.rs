@@ -14,6 +14,7 @@ use glam::DVec2;
 
 use crate::clipper::{ClipType, Path, Paths, Pt};
 use crate::geom::{self, Contour, Join, Polyline, Shape};
+use crate::rectilinear::Sweep;
 
 /// A fill line: open, or a loop for concentric patterns.
 #[derive(Clone, Debug, PartialEq)]
@@ -22,13 +23,13 @@ pub struct Line {
     pub closed: bool,
     /// Printed in the order given (monotonic patterns), not nearest first.
     pub ordered: bool,
-    /// Which shape of the filled area it came from, for the patterns that fill one at a time.
-    pub part: u32,
+    /// Keeps the direction it was drawn in, whichever end is nearer.
+    pub one_way: bool,
 }
 
 impl Line {
     fn open(points: Polyline) -> Line {
-        Line { points, closed: false, ordered: false, part: 0 }
+        Line { points, closed: false, ordered: false, one_way: false }
     }
 }
 
@@ -216,22 +217,21 @@ pub fn fill_with(area: &[Shape], kind: Kind, p: &Params) -> Vec<Line> {
     if let Some(job) = rectilinear_job(kind, p) {
         return area
             .iter()
-            .enumerate()
-            .flat_map(|(part, shape)| {
-                let lines = crate::rectilinear::fill(&geom::paths_of(shape), &job).unwrap_or_default().lines;
-                lines.into_iter().map(move |l| (part, l))
-            })
-            .map(|(part, l)| Line {
-                points: geom::from_nm(&l),
-                closed: false,
-                ordered: job.monotonic,
-                part: part as u32,
-            })
+            .flat_map(|shape| crate::rectilinear::fill(&geom::paths_of(shape), &job).unwrap_or_default().lines)
+            .map(|l| Line { points: geom::from_nm(&l), closed: false, ordered: job.monotonic, one_way: false })
             .filter(|l| l.points.len() >= 2)
             .collect();
     }
     let bead = if p.height > 0.0 && p.height.is_finite() { crate::settings::Settings::spacing(w, p.height) } else { w };
     let s = bead / d;
+    let spacing = if p.height > 0.0 && p.height.is_finite() {
+        f64::from(crate::walls::flow_spacing(w as f32, p.height as f32))
+    } else {
+        w
+    };
+    if let Some(sweeps) = sweeps_of(kind, p, spacing) {
+        return crossing(area, kind, p, spacing, &sweeps);
+    }
     // Loops already start half a line in.
     let shrunk;
     let area = if !p.inset || matches!(kind, Kind::Concentric | Kind::SpiralInset) {
@@ -305,6 +305,88 @@ pub fn fill_with(area: &[Shape], kind: Kind, p: &Params) -> Vec<Line> {
     }
     lines.retain(|l| l.points.len() >= 2);
     lines
+}
+
+/// The directions of the patterns Orca fills with `fill_surface_by_multilines`, for the sparse
+/// infill of an object. `spacing` is the flow's.
+fn sweeps_of(kind: Kind, p: &Params, spacing: f64) -> Option<Vec<Sweep>> {
+    if !p.inset {
+        return None;
+    }
+    let sweep = |angle: f32, shift: f32| Sweep { angle, shift };
+    let (third, sixth) = ((2.0 * PI / 3.0) as f32, FRAC_PI_3 as f32);
+    let quarter = FRAC_PI_2 as f32;
+    let density = p.density.min(1.0) as f32;
+    let spacing = f64::from(spacing as f32);
+    Some(match kind {
+        Kind::Grid => vec![sweep(0.0, 0.0), sweep(quarter, 0.0)],
+        Kind::Triangles => vec![sweep(0.0, 0.0), sweep(sixth, 0.0), sweep(third, 0.0)],
+        Kind::TriHexagon => {
+            vec![sweep(0.0, 0.0), sweep(sixth, 0.0), sweep(third, (1.5 * spacing / f64::from(density)) as f32)]
+        }
+        Kind::Cubic => {
+            let dx = (0.5f64.sqrt() * p.z) as f32;
+            vec![sweep(0.0, dx), sweep(sixth, -dx), sweep(third, dx)]
+        }
+        Kind::QuarterCubic => {
+            let scaled = spacing / 1.0e-6;
+            let line = scaled as i64;
+            let period = (scaled / f64::from(density)) as i64 * 4;
+            if period <= 0 {
+                return None;
+            }
+            let shift = |turn: f64| -> f32 {
+                let root = f64::from(std::f32::consts::FRAC_1_SQRT_2);
+                let s = (root * (p.z / 1.0e-6 + turn * period as f64 * 2.0)) as i64 % period;
+                let s = s.min(period - s).min(period / 2 - line / 2).max(line / 2);
+                (s as f64 * 1.0e-6) as f32
+            };
+            let (a, b) = (shift(0.0), shift(0.5));
+            vec![sweep(0.0, a), sweep(0.0, -a), sweep(quarter, b), sweep(quarter, -b)]
+        }
+        Kind::LateralLattice => {
+            let dx = |k: usize| (p.lattice.get(k).copied().unwrap_or(0.0).clamp(-1.4, 1.4).tan() * p.z) as f32;
+            vec![sweep(quarter, dx(0)), sweep(quarter, dx(1))]
+        }
+        _ => return None,
+    })
+}
+
+/// `fill_surface_by_multilines`: lines over each region in every direction, cut half a line
+/// inside it and joined along its edge by `connect_infill`.
+fn crossing(area: &[Shape], kind: Kind, p: &Params, spacing: f64, sweeps: &[Sweep]) -> Vec<Line> {
+    let density = p.density.min(1.0) as f32;
+    let spacing = f64::from(spacing as f32);
+    let angle = crate::rectilinear::direction(p.angle, false);
+    // Orca turns these lines round on odd layers, and a grid's stay that way when printed.
+    let reversed = matches!(kind, Kind::Grid | Kind::LateralLattice) && p.layer % 2 == 1;
+    let one_way = matches!(kind, Kind::Grid);
+    let mut out = Vec::new();
+    for shape in area {
+        let source = geom::paths_of(shape);
+        let Some(lines) = crate::rectilinear::crossing_lines(&source, spacing, density, angle, sweeps) else {
+            continue;
+        };
+        let contracted = geom::offset_nm(std::slice::from_ref(shape), -((0.5 * spacing / 1.0e-6) as f32), Join::Miter);
+        let edge: Paths =
+            if contracted.is_empty() { source } else { contracted.iter().flat_map(geom::paths_of).collect() };
+        let lines = geom::clip_open(&lines, &edge, ClipType::Intersection);
+        let lines: Vec<Polyline> = lines.iter().map(|l| geom::from_nm(l)).collect();
+        let joined = if p.anchor_max >= 0.05 {
+            let boundary: Vec<Contour> = edge.iter().map(|c| geom::from_nm(c)).collect();
+            crate::connect::connect_infill(lines, &boundary, spacing, p.anchor, p.anchor_max)
+        } else {
+            lines
+        };
+        out.extend(joined.into_iter().map(|mut points| {
+            if reversed {
+                points.reverse();
+            }
+            Line { one_way, ..Line::open(points) }
+        }));
+    }
+    out.retain(|l| l.points.len() >= 2);
+    out
 }
 
 /// What Orca's `fill_surface_by_lines` needs, for the object fills that go through it.
@@ -842,14 +924,7 @@ fn cross_zag(area: &[Shape], a: f64, w: f64, d: f64, p: &Params) -> Vec<Line> {
 /// further apart. The grid is fixed four lines at a time from the object's origin.
 fn cross_hatch(area: &[Shape], p: &Params, s: f64) -> Vec<Line> {
     let density = p.density.min(1.0);
-    area.iter()
-        .enumerate()
-        .flat_map(|(part, shape)| {
-            let mut lines = cross_hatch_one(shape, p, s * density, density);
-            lines.iter_mut().for_each(|l| l.part = part as u32);
-            lines
-        })
-        .collect()
+    area.iter().flat_map(|shape| cross_hatch_one(shape, p, s * density, density)).collect()
 }
 
 /// `FillCrossHatch::_fill_surface_single`, in Orca's integers: the region turned into the
@@ -1449,7 +1524,7 @@ impl<'a> Edges<'a> {
 fn concentric(area: &[Shape], spacing: f64) -> Vec<Line> {
     concentric_loops(area, spacing)
         .into_iter()
-        .map(|points| Line { points, closed: true, ordered: false, part: 0 })
+        .map(|points| Line { points, closed: true, ordered: false, one_way: false })
         .collect()
 }
 

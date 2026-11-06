@@ -195,20 +195,12 @@ fn internal_bridges(solid: &[Shape], sparse_below: &[Shape], s: &Settings, h: f6
 /// Paths from fill lines; lines that must keep their order share a new group.
 fn paths_of(lines: Vec<infill::Line>, role: Role, width: f64, speed: f64, flow: f64) -> Vec<Path> {
     let group = if lines.iter().any(|l| l.ordered) { Path::new_group() } else { 0 };
-    let mut collections: Vec<(u32, u32)> = Vec::new();
     lines
         .into_iter()
         .filter(|l| l.points.len() >= 2)
         .map(|l| {
-            let collection = match collections.iter().find(|c| c.0 == l.part) {
-                Some(c) => c.1,
-                None => {
-                    collections.push((l.part, Path::new_group()));
-                    collections.last().map_or(0, |c| c.1)
-                }
-            };
             let mut p = Path::new(role, l.points, l.closed, width, speed, flow);
-            p.collection = collection;
+            p.one_way = l.one_way;
             if l.ordered {
                 p.group = group;
             }

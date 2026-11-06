@@ -109,9 +109,8 @@ pub struct Path {
     /// Paths sharing a non-zero group print one after another in the order given (monotonic
     /// infill, overhang perimeters), not nearest first.
     pub group: u32,
-    /// Fill lines from one region share a non-zero collection (Orca's ExtrusionEntityCollection
-    /// of a surface): they are ordered among themselves, and the collections among each other.
-    pub collection: u32,
+    /// A fill line that prints the way it was drawn, whichever end is nearer (`can_reverse`).
+    pub one_way: bool,
     /// Which segments lie on a fitted arc: neighbours with the same `id` print as one arc. An
     /// arc keeps its points, so seams and wipes see them. Empty when nothing was fitted.
     pub bends: Vec<Option<Bend>>,
@@ -165,7 +164,7 @@ impl Path {
             flow,
             overhang: Vec::new(),
             group: 0,
-            collection: 0,
+            one_way: false,
             bends: Vec::new(),
             fitted: false,
         }

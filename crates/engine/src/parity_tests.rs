@@ -92,6 +92,10 @@ fn compare(case: &Path) -> Report {
     }
     let orca = view_gcode(orca_text.clone(), &cfg, &filaments_of(&cfg));
     let Some(mut job) = job_for(&models, &cfg, &orca.preview) else { return fail("model unreadable".into()) };
+    // `PARITY_LIBRARY`: our own presets, as the app slices them, instead of Orca's values.
+    if std::env::var_os("PARITY_LIBRARY").is_some() && !library_presets(&cfg, &mut job, &mut text) {
+        return fail("presets not in our library".into());
+    }
     let started = std::time::Instant::now();
     let mut ours = match slice(&job, &Progress::default()) {
         Ok(s) => s,
@@ -285,6 +289,27 @@ fn short(v: &str) -> String {
 
 /// Our job for `models` with Orca's settings, each placed where Orca printed it (model `k`
 /// with filament `k` when there are several).
+/// The job's settings from our library, by the names Orca wrote; false if one is missing.
+fn library_presets(cfg: &Config, job: &mut Job, text: &mut String) -> bool {
+    let found = |kind, id: &str| {
+        let name = cfg.values.get(id).cloned().unwrap_or_default();
+        userfiles::find_parent(kind, name.split(';').next().unwrap_or("").trim_matches('"')).map(|p| p.config)
+    };
+    let (Some(printer), Some(process), Some(filament)) = (
+        found(TabKind::Printer, "printer_settings_id"),
+        found(TabKind::Process, "print_settings_id"),
+        found(TabKind::Filament, "filament_settings_id"),
+    ) else {
+        return false;
+    };
+    job.printer = printer;
+    job.process = process;
+    job.filaments = vec![filament; job.filaments.len()];
+    CosmicSlicer_config::variants::for_nozzles(Schema::get(), &mut job.printer, &mut job.process, &mut job.filaments);
+    let _ = writeln!(text, "library presets, as the app slices them");
+    true
+}
+
 fn job_for(models: &[std::path::PathBuf], cfg: &Config, orca: &Preview) -> Option<Job> {
     let bed = cfg.values.get("curr_bed_type").map(String::as_str).unwrap_or("Textured PEI Plate");
     let bed_key = BEDS.iter().find(|b| b.0 == bed).map_or("textured_plate_temp", |b| b.1);

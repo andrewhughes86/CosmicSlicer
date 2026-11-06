@@ -162,6 +162,7 @@ fn area(poly: &[Pt]) -> f64 {
 
 /// `ExPolygonWithOffset`: the outer loops (lines reach them) and the inner ones (lines link
 /// along them).
+#[derive(Clone)]
 struct Offsetted {
     /// The turned region, contour first.
     source: Vec<Path>,
@@ -200,6 +201,17 @@ impl Offsetted {
         let n_outer = outer.len();
         outer.append(&mut inner);
         Offsetted { source, contours: outer, outer: n_outer }
+    }
+
+    /// A copy turned whole, without offsetting again.
+    fn turned(&self, angle: f32) -> Offsetted {
+        let mut out = self.clone();
+        if angle != 0.0 {
+            for c in out.source.iter_mut().chain(&mut out.contours) {
+                rotate(c, f64::from(angle));
+            }
+        }
+        out
     }
 
     fn contour(&self, i: usize) -> Option<&Path> {
@@ -1819,6 +1831,89 @@ pub fn fill(shape: &[Path], job: &Job) -> Option<Filled> {
     Some(Filled { lines, spacing })
 }
 
+/// One direction of a pattern of crossing lines: Orca's `SweepParams`.
+#[derive(Clone, Copy, Debug)]
+pub struct Sweep {
+    pub angle: f32,
+    pub shift: f32,
+}
+
+/// `make_fill_lines`: straight lines over the turned region, each kept when it clears the
+/// region's sides, turned back.
+fn make_fill_lines(
+    o: &Offsetted,
+    angle: f32,
+    margin: i64,
+    spacing: i64,
+    shift: i64,
+    out: &mut Vec<Path>,
+) -> Option<()> {
+    let (mut lo, hi) = o.bounds()?;
+    let (x_min, x_max) = (lo.x + margin, hi.x - margin);
+    let shift = shift % spacing;
+    let refpt = -(if shift >= 0 { shift } else { spacing + shift });
+    lo.x = lo.x.min(refpt + align_to_grid(lo.x - refpt, spacing));
+    let n_lines = (hi.x - lo.x + spacing - 1) / spacing;
+    if !(0..=MAX_LINES).contains(&n_lines) {
+        return None;
+    }
+    for line in slice(o, n_lines as usize, lo.x, spacing)? {
+        if line.pos < x_min {
+            continue;
+        }
+        if line.pos > x_max {
+            break;
+        }
+        let mut i = 0;
+        while let Some(low) = line.hits.get(i) {
+            i += 1;
+            if low.kind != Type::OuterLow {
+                continue;
+            }
+            let Some(high) = line.hits.get(i).filter(|h| h.kind == Type::OuterHigh) else { continue };
+            let mut l = vec![Pt::new(line.pos, low.pos()), Pt::new(line.pos, high.pos())];
+            if angle != 0.0 {
+                rotate(&mut l, f64::from(angle));
+            }
+            out.push(l);
+            i += 1;
+        }
+    }
+    Some(())
+}
+
+/// The uncut lines of `fill_surface_by_multilines` for one expolygon: `spacing` and `density`
+/// as Orca's `Fill` has them, `angle` from `direction`. None is `InfillFailedException`.
+pub fn crossing_lines(shape: &[Path], spacing: f64, density: f32, angle: f32, sweeps: &[Sweep]) -> Option<Vec<Path>> {
+    if !(spacing > 0.0 && spacing.is_finite() && density > 0.0 && angle.is_finite()) || sweeps.is_empty() {
+        return None;
+    }
+    let density = density / sweeps.len() as f32;
+    let scaled = spacing / SCALING;
+    let base = Offsetted::new(shape, 0.0, ((0.5 * spacing / SCALING) as f32) as i64, 0);
+    if base.contours.is_empty() {
+        return Some(Vec::new());
+    }
+    let line_spacing = (scaled / f64::from(density)) as i64;
+    if line_spacing <= 0 {
+        return None;
+    }
+    let mut lines = Vec::new();
+    for sweep in sweeps {
+        let turned = angle + sweep.angle;
+        let shift = (f64::from(sweep.shift) / SCALING) as i64;
+        make_fill_lines(
+            &base.turned(-turned),
+            turned,
+            scaled as i64 + SCALED_EPSILON,
+            line_spacing,
+            shift,
+            &mut lines,
+        )?;
+    }
+    Some(lines)
+}
+
 /// The spacing `fill` would settle on, without filling: what the flow's width follows.
 pub fn spacing_of(shape: &[Path], job: &Job) -> Option<f64> {
     let line_spacing = scaled_spacing(job);
@@ -1834,6 +1929,31 @@ pub fn spacing_of(shape: &[Path], job: &Job) -> Option<f64> {
     }
     let (lo, hi) = contour.iter().fold((i64::MAX, i64::MIN), |(lo, hi), p| (lo.min(p.x), hi.max(p.x)));
     (lo <= hi).then(|| adjust_solid_spacing(hi - lo, line_spacing) as f64 * SCALING)
+}
+
+#[cfg(test)]
+mod crossing_tests {
+    use super::*;
+
+    #[test]
+    fn a_grid_crosses_and_stays_in_bounds() {
+        let side = 20_000_000;
+        let square = vec![Pt::new(0, 0), Pt::new(side, 0), Pt::new(side, side), Pt::new(0, side)];
+        let sweeps = [Sweep { angle: 0.0, shift: 0.0 }, Sweep { angle: std::f32::consts::FRAC_PI_2, shift: 0.0 }];
+        let lines = crossing_lines(&[square], 0.45, 0.2, direction(0.0, false), &sweeps).unwrap_or_default();
+        assert!(lines.len() >= 8, "{} lines", lines.len());
+        let reach = side + 300_000;
+        assert!(lines.iter().flatten().all(|p| p.x >= -300_000 && p.x <= reach && p.y >= -300_000 && p.y <= reach));
+    }
+
+    #[test]
+    fn nonsense_fails_quietly() {
+        let square = vec![Pt::new(0, 0), Pt::new(1000, 0), Pt::new(1000, 1000)];
+        assert!(
+            crossing_lines(std::slice::from_ref(&square), 0.0, 0.2, 0.0, &[Sweep { angle: 0.0, shift: 0.0 }]).is_none()
+        );
+        assert!(crossing_lines(&[square], 0.45, 0.2, f32::NAN, &[Sweep { angle: 0.0, shift: 0.0 }]).is_none());
+    }
 }
 
 #[cfg(test)]

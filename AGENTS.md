@@ -33,7 +33,7 @@ OrcaSlicer's crashes are the reason this exists.
   `assets/profiles/orca_profiles.bin` by `tools/pack_orca_profiles.py`; vendors unpacked on
   first use; `inherits` then `include` then own values), `expr` (the custom G-code macro
   language and `compatible_printers_condition`), `userfiles` (user presets as OrcaSlicer-style
-  JSON diffs). Custom G-code that cannot be evaluated fails the slice — never pass template text
+  JSON diffs), `variants` (a profile's per-hot-end values cut to one per nozzle before slicing). Custom G-code that cannot be evaluated fails the slice — never pass template text
   to a printer. The engine test `every_library_printer_renders_its_gcode` renders every
   printer's templates; keep it at zero failures when changing either.
 - The engine's G-code is a program of `gcode::Op`s first: `motion::plan` times it as the

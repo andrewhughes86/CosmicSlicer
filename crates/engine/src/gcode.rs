@@ -1232,15 +1232,14 @@ impl<'a> Writer<'a> {
     /// groups print whole, in their order, from wherever the first of them is reached.
     /// Orca's `extrude_infill`: the regions chained, then the lines within each unless they keep
     /// their order; ironing last.
+    /// `extrude_infill`: a sortable fill goes in with its paths loose (`Region::append`), so
+    /// all of them are chained together; lines that keep their order go as one piece.
     fn print_fills(&mut self, paths: Vec<Path>, object: usize) {
         let (ironing, fills): (Vec<Path>, Vec<Path>) = paths.into_iter().partition(|p| p.role == Role::Ironing);
         for paths in [fills, ironing] {
             let mut sets: Vec<Vec<Path>> = Vec::new();
             for p in paths {
-                match sets
-                    .iter_mut()
-                    .find(|s| p.collection != 0 && s.first().is_some_and(|f| f.collection == p.collection))
-                {
+                match sets.iter_mut().find(|s| p.group != 0 && s.first().is_some_and(|f| f.group == p.group)) {
                     Some(set) => set.push(p),
                     None => sets.push(vec![p]),
                 }
@@ -1254,26 +1253,11 @@ impl<'a> Writer<'a> {
                     )
                 })
                 .collect();
-            let turns: Vec<bool> = sets.iter().map(|s| s.iter().all(|p| p.group == 0)).collect();
+            let turns: Vec<bool> = sets.iter().map(|s| s.iter().all(|p| p.group == 0 && !p.one_way)).collect();
             let mut sets: Vec<Option<Vec<Path>>> = sets.into_iter().map(Some).collect();
             for (i, reversed) in crate::chain::chain(&ends, &turns, nm_point(self.pos.truncate())) {
-                let Some(mut set) = sets.get_mut(i).and_then(Option::take) else { continue };
-                if reversed && !set.iter().all(|p| p.closed) {
-                    set.reverse();
-                    set.iter_mut().for_each(Path::reverse);
-                }
-                if set.iter().any(|p| p.group != 0) {
-                    for mut p in set {
-                        self.place_seam(&mut p, Some(object), None);
-                        self.extrude(&p);
-                    }
-                    continue;
-                }
-                let ends: Vec<_> = set.iter().map(|p| (end_point(p, true), end_point(p, false))).collect();
-                let order = crate::chain::chain(&ends, &vec![true; set.len()], nm_point(self.pos.truncate()));
-                let mut set: Vec<Option<Path>> = set.into_iter().map(Some).collect();
-                for (j, reversed) in order {
-                    let Some(mut p) = set.get_mut(j).and_then(Option::take) else { continue };
+                let Some(set) = sets.get_mut(i).and_then(Option::take) else { continue };
+                for mut p in set {
                     if reversed && !p.closed {
                         p.reverse();
                     }

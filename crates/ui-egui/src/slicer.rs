@@ -111,9 +111,12 @@ pub fn job(session: &Session, plate: usize) -> Job {
                 .collect()
         })
         .unwrap_or_default();
+    let mut printer = p.effective(TabKind::Printer, 0);
+    let mut filaments: Vec<_> = filaments;
+    CosmicSlicer_config::variants::for_nozzles(session.schema, &mut printer, &mut process, &mut filaments);
     Job {
         calib: session.calib.clone(),
-        printer: p.effective(TabKind::Printer, 0),
+        printer,
         process,
         filaments,
         bed_key,

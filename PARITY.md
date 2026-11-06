@@ -15,18 +15,18 @@ the X1C, MK4 and Voron table further down was taken before this stretch's work (
 | Model | Identical lines |
 |---|---|
 | cube20 | 94 % |
-| cylinder | 92 % |
+| cylinder | 91 % |
 | thinwalls | 86 % |
 | small | 75 % |
 | overhangs | 72 % |
 | bridge | 70 % |
 | calicat | 68 % |
-| steps | 66 % |
+| steps | 67 % |
 | ksr_fdmtest_v4 | 62 % |
 | large | 57 % |
 | 3DBenchy | 50 % |
 | OrcaCube_v2 | 46 % |
-| Voron_Design_Cube_v7 | 44 % |
+| Voron_Design_Cube_v7 | 47 % |
 | Stanford_Bunny | 7 % |
 
 What the X2D does that the X1C does not: two nozzles put it on Orca's "traditional timelapse" path
@@ -71,7 +71,7 @@ Identical lines by model:
 | large | 59 % | 54 % | 39 % |
 | 3DBenchy | 46 % | 11 % | 11 % |
 | OrcaCube_v2 | 44 % | 13 % | 14 % |
-| Voron_Design_Cube_v7 | 44 % | 15 % | 19 % |
+| Voron_Design_Cube_v7 | 47 % | 15 % | 19 % |
 | overhangs | 40 % | 27 % | 31 % |
 | Stanford_Bunny | 14 % | 4 % | 5 % |
 
@@ -98,8 +98,14 @@ lines by row, starting seam polygons at the rear) matched one test model and bro
   its seed. Orca's `link_max_length` is `3 * f->spacing` taken before `f->spacing` is set, so it is
   always 0 and links are unlimited.
 - `chain`: `chain_segments_greedy_constrained_reversals` with `KDTreeIndirect` and
-  `MutablePriorityQueue`. Fills are chained as Orca's collections are: regions, then the lines in a
-  region unless they keep their order.
+  `MutablePriorityQueue`. `Region::append` lets a sortable fill's paths loose, so all of a region's
+  fills chain together; only fills that keep their order stay one piece. Grid lines never reverse
+  (`can_reverse`, set in `Fill.cpp`): `FillGrid` turns them round on odd layers instead.
+- `rectilinear::crossing_lines` with `infill::crossing`: `fill_surface_by_multilines` and
+  `make_fill_lines`, for grid, triangles, tri-hexagon, cubic, quarter cubic and lateral lattice.
+  Checked against Orca on the cube: 100 % of each pattern's sparse lines, same volume.
+- `config::variants`: `update_values_to_printer_extruders`, one value per nozzle from the variants a
+  profile lists.
 
 Mesh slicing (`slicing.rs`: float vertices, `slice_facet`, closing, simplification), Clipper and its
 wrappers (`clipper.rs`, `geom.rs`), classic walls and gap fill in Orca's integers (`walls.rs`),
@@ -107,6 +113,14 @@ simplifying and arc fitting before seams (`toolpath::simplify`), seam placement 
 line joining (`connect.rs`), cross hatch (`infill.rs`), arc fitting (`arcs.rs`), number and move
 format, layer change order, lifts, wipes, object labels, line widths, narrow solid detection,
 monotonic lines, line ends, file header, footer, start and end order, machine limits.
+
+## The app's presets and Orca's differ
+
+These numbers take their settings from Orca's G-code. `PARITY_LIBRARY=1` slices with our own library
+instead, as the app does. Our pack came from newer Orca source (Bambu profiles 02.08) than Orca 2.4.2
+ships (02.01), so on the X2D the app differs from an Orca 2.4.2 slice by the profile itself: `grid` not
+`crosshatch`, newer start, layer change and timelapse G-code, and a few process and filament values.
+On the cube that is 54 % of lines identical. Each difference is a profile value, not the slicer.
 
 ## Differences that cannot go away
 
@@ -123,7 +137,6 @@ monotonic lines, line ends, file header, footer, start and end order, machine li
 |---|---|---|
 | MK4 and Voron walls, 30 to 34 % | Their profiles use Arachne. Ours uses the medial axis for the same job, so widths and vertices differ. | Port Arachne, a large job. |
 | Arcs on curved walls | Orca fits arcs on the loop as generated, then splits at the seam. We fit after the seam, starting elsewhere, so breaks fall on other vertices. | Fit before placing the seam and carry arcs through `Path::rotate`. |
-| Rectilinear spacing | `infill.rs` still works out solid lines in millimetres, not on Orca's rotated integers: they drift 0.01 mm across a region. Internal solid, top and bottom surfaces. Fitting and simplifying run from that start. | Reproduce Clipper's start vertex, or port its output order. |
 | M73 progress lines | Orca places them from its own time estimate after slicing. Ours sit at layer starts. Every layer has some. | Port the post-processor's placement. |
 | Cooled speed, a few units off (F4641 vs F4644 on the cube) | Decided by total layer time, so it settles only when the toolpath does. Includes Orca's parser quirk, ported. | Follows from the rows above. |
 | Time and filament totals | Orca's estimator also counts heating and loading; `filament used` includes the start purge. | Port `GCodeProcessor` accounting. |
