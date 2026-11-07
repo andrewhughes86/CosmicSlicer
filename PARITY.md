@@ -18,16 +18,16 @@ the X1C, MK4 and Voron table further down was taken before this stretch's work (
 | cylinder | 92 % |
 | thinwalls | 87 % |
 | small | 91 % |
-| overhangs | 77 % |
+| overhangs | 80 % |
 | bridge | 71 % |
-| calicat | 70 % |
+| calicat | 72 % |
 | steps | 71 % |
-| ksr_fdmtest_v4 | 65 % |
+| ksr_fdmtest_v4 | 66 % |
 | large | 58 % |
-| 3DBenchy | 57 % |
-| OrcaCube_v2 | 51 % |
-| Voron_Design_Cube_v7 | 51 % |
-| Stanford_Bunny | 8 % |
+| 3DBenchy | 60 % |
+| OrcaCube_v2 | 54 % |
+| Voron_Design_Cube_v7 | 55 % |
+| Stanford_Bunny | 9 % |
 
 What the X2D does that the X1C does not: two nozzles put it on Orca's "traditional timelapse" path
 (the retract, lift, end of object label and picture come at the end of a layer, or before leaving
@@ -110,6 +110,9 @@ lines by row, starting seam polygons at the rear) matched one test model and bro
   CGAL planarity test of the Voronoi repair. `FillConcentricInternal` leaves `min_length_factor`
   and `is_top_or_bottom_layer` uninitialised in Orca; we use 0.5 and false. `small`'s narrow solid
   infill now matches Orca's to 100 %.
+- `gcode::overhang_speeds` with `overhang::Boundary`: `ExtrusionQualityEstimator` (points'
+  signed distances past the layer below, its added points, speed sections) and `_extrude`'s
+  variable-speed writing. The distance search stops at 20 mm; curled-edge slowdown is not ported.
 - `config::variants`: `update_values_to_printer_extruders`, one value per nozzle from the variants a
   profile lists.
 
@@ -142,7 +145,6 @@ On the cube that is 54 % of lines identical. Each difference is a profile value,
 | Difference | Cause | What it would take |
 |---|---|---|
 | MK4 and Voron walls, 30 to 34 % | Their profiles use Arachne walls. Arachne is ported (`arachne`) but walls do not use it yet. | Build walls from `arachne::wall_toolpaths` as `PerimeterGenerator::process_arachne` does. |
-| Walls with overhang speeds | Orca's `ExtrusionProcessor` splits a slowed wall where its overlap with the layer below changes and writes it all in lines; we split at our own per-segment marks. Walls whose speed varies at all are lines in both. | Port `ExtrusionProcessor::estimate_extrusion_quality`. |
 | M73 progress lines | Orca places them from its own time estimate after slicing. Ours sit at layer starts. Every layer has some. | Port the post-processor's placement. |
 | Cooled speed, a few units off (F4641 vs F4644 on the cube) | Decided by total layer time, so it settles only when the toolpath does. Includes Orca's parser quirk, ported. | Follows from the rows above. |
 | Time and filament totals | Orca's estimator also counts heating and loading; `filament used` includes the start purge. | Port `GCodeProcessor` accounting. |

@@ -19,6 +19,110 @@ pub struct Below {
     width: f64,
 }
 
+/// The layer below's outline as Orca's `ExtrusionQualityEstimator` holds it
+/// (`prev_layer_boundaries`): every edge, for signed distances (negative inside) and crossings.
+#[derive(Debug, Default)]
+pub struct Boundary {
+    shapes: Vec<Shape>,
+    edges: Vec<(DVec2, DVec2)>,
+    cells: std::collections::HashMap<(i64, i64), Vec<u32>>,
+}
+
+/// Grid cell of a [`Boundary`], mm.
+const BOUNDARY_CELL: f64 = 1.0;
+/// Rings searched for the nearest edge; past that the distance is this far.
+const BOUNDARY_RINGS: i64 = 20;
+
+impl Boundary {
+    pub fn new(below: &[Shape]) -> Boundary {
+        let mut b = Boundary { shapes: below.to_vec(), ..Boundary::default() };
+        for c in below.iter().flatten() {
+            let n = c.len();
+            for i in 0..n {
+                let (Some(&a), Some(&e)) = (c.get(i), c.get((i + 1) % n)) else { continue };
+                let id = b.edges.len() as u32;
+                b.edges.push((a, e));
+                let (lo, hi) = (a.min(e), a.max(e));
+                let (x0, y0) = ((lo.x / BOUNDARY_CELL).floor() as i64, (lo.y / BOUNDARY_CELL).floor() as i64);
+                let (x1, y1) = ((hi.x / BOUNDARY_CELL).floor() as i64, (hi.y / BOUNDARY_CELL).floor() as i64);
+                if (x1 - x0 + 1).saturating_mul(y1 - y0 + 1) > 1_000_000 {
+                    continue;
+                }
+                for x in x0..=x1 {
+                    for y in y0..=y1 {
+                        b.cells.entry((x, y)).or_default().push(id);
+                    }
+                }
+            }
+        }
+        b
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.edges.is_empty()
+    }
+
+    /// `distance_from_lines_extra<true>`: to the nearest edge, negative inside.
+    pub fn signed(&self, p: DVec2) -> f64 {
+        let (cx, cy) = ((p.x / BOUNDARY_CELL).floor() as i64, (p.y / BOUNDARY_CELL).floor() as i64);
+        let mut best = f64::INFINITY;
+        for r in 0..=BOUNDARY_RINGS {
+            // Everything in ring r is at least (r - 1) cells away.
+            if best <= (r - 1).max(0) as f64 * BOUNDARY_CELL {
+                break;
+            }
+            for x in cx - r..=cx + r {
+                for y in cy - r..=cy + r {
+                    if (x - cx).abs() != r && (y - cy).abs() != r {
+                        continue;
+                    }
+                    for &id in self.cells.get(&(x, y)).map_or(&[][..], Vec::as_slice) {
+                        if let Some(&(a, b)) = self.edges.get(id as usize) {
+                            best = best.min(geom::point_segment_distance(p, a, b));
+                        }
+                    }
+                }
+            }
+        }
+        let best = best.min(BOUNDARY_RINGS as f64 * BOUNDARY_CELL);
+        if geom::contains(&self.shapes, p) { -best } else { best }
+    }
+
+    /// `intersections_with_line<true>`: where `a`–`b` crosses the outline, nearest `a` first.
+    pub fn crossings(&self, a: DVec2, b: DVec2) -> Vec<DVec2> {
+        let (lo, hi) = (a.min(b), a.max(b));
+        let (x0, y0) = ((lo.x / BOUNDARY_CELL).floor() as i64, (lo.y / BOUNDARY_CELL).floor() as i64);
+        let (x1, y1) = ((hi.x / BOUNDARY_CELL).floor() as i64, (hi.y / BOUNDARY_CELL).floor() as i64);
+        let mut ids: Vec<u32> = Vec::new();
+        if (x1 - x0 + 1).saturating_mul(y1 - y0 + 1) <= 1_000_000 {
+            for x in x0..=x1 {
+                for y in y0..=y1 {
+                    ids.extend(self.cells.get(&(x, y)).map_or(&[][..], Vec::as_slice));
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let d = b - a;
+        let mut out: Vec<(f64, DVec2)> = Vec::new();
+        for id in ids {
+            let Some(&(p, q)) = self.edges.get(id as usize) else { continue };
+            let e = q - p;
+            let den = d.perp_dot(e);
+            if den.abs() < 1e-18 {
+                continue;
+            }
+            let t = (p - a).perp_dot(e) / den;
+            let u = (p - a).perp_dot(d) / den;
+            if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) {
+                out.push((t, a + d * t));
+            }
+        }
+        out.sort_by(|x, y| x.0.total_cmp(&y.0));
+        out.into_iter().map(|(_, p)| p).collect()
+    }
+}
+
 /// Hanging shares (percent of the line) are kept in 5 % steps.
 const STEP: f64 = 5.0;
 
@@ -165,6 +269,33 @@ pub fn make_printable(slices: &mut [Vec<Shape>], heights: &[f64], angle: f64) {
                 *slot = merged;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    fn square() -> Vec<Shape> {
+        vec![vec![vec![DVec2::new(0.0, 0.0), DVec2::new(10.0, 0.0), DVec2::new(10.0, 10.0), DVec2::new(0.0, 10.0)]]]
+    }
+
+    #[test]
+    fn distances_are_negative_inside() {
+        let b = Boundary::new(&square());
+        assert!((b.signed(DVec2::new(5.0, 2.0)) + 2.0).abs() < 1e-9);
+        assert!((b.signed(DVec2::new(5.0, -3.0)) - 3.0).abs() < 1e-9);
+        // Far away is capped, but keeps its side.
+        assert!(b.signed(DVec2::new(500.0, 5.0)) > 0.0);
+    }
+
+    #[test]
+    fn crossings_come_nearest_first() {
+        let b = Boundary::new(&square());
+        let c = b.crossings(DVec2::new(-5.0, 5.0), DVec2::new(15.0, 5.0));
+        assert_eq!(c.len(), 2);
+        assert!((c[0].x - 0.0).abs() < 1e-9 && (c[1].x - 10.0).abs() < 1e-9);
+        assert!(Boundary::new(&[]).crossings(DVec2::ZERO, DVec2::ONE).is_empty());
     }
 }
 

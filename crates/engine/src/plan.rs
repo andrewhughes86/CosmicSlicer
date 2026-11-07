@@ -885,6 +885,11 @@ pub fn object(
                 }
                 _ => None,
             };
+            // Orca's `prev_layer_boundaries`: the whole layer below, for overhang speeds.
+            let boundary = match below {
+                Some(below) if s.walls.overhang_speed => Some(Arc::new(overhang::Boundary::new(below))),
+                _ => None,
+            };
             let fuzz = s.fuzzy.on != FuzzyWhere::None && (i > 0 || s.fuzzy.first_layer);
             let lr = regions.get(i);
             let painted_fuzz = lr.map_or(&[][..], |r| r.fuzzy.as_slice());
@@ -913,6 +918,7 @@ pub fn object(
                         seam_block: lr.map(|r| r.seam_block.clone()).unwrap_or_default(),
                         extruder: None,
                         pressure_advance: None,
+                        below: boundary.clone(),
                     };
                     let around = Around { no_overlap: &w.walled.inner_edge, ..around.clone() };
                     for p in &w.pieces {

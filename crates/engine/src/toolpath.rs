@@ -384,6 +384,8 @@ pub struct Island {
     pub extruder: Option<usize>,
     /// Pressure advance to set before printing it (the calibration tests).
     pub pressure_advance: Option<f64>,
+    /// The layer below's outline, for the walls' overhang speeds.
+    pub below: Option<std::sync::Arc<crate::overhang::Boundary>>,
 }
 
 /// Everything printed on one layer.

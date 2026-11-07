@@ -374,6 +374,8 @@ struct Writer<'a> {
     /// The speed it was printed at, for role-based wipes.
     last_speed: f64,
     warnings: Vec<String>,
+    /// The layer below the island being printed, for its walls' overhang speeds.
+    below: Option<std::sync::Arc<crate::overhang::Boundary>>,
 }
 
 /// Layers whose travel regions are made at once.
@@ -862,6 +864,7 @@ impl<'a> Writer<'a> {
             dz: 0.0,
             flow: 1.0,
             scarf: false,
+            speed: 0.0,
         };
         let mut steps: Vec<Step> = (1..n).filter_map(|k| path.points.get(k).map(|&p| plain(p, k - 1))).collect();
         let Some(start) = path.start() else { return steps };
@@ -940,7 +943,10 @@ impl<'a> Writer<'a> {
             return;
         }
         let scarf = self.wants_scarf(path);
-        let steps = self.steps(path, scarf);
+        let mut steps = self.steps(path, scarf);
+        if !scarf {
+            self.overhang_speeds(path, start, &mut steps);
+        }
         let z = self.pos.z;
         // A scarf starts low: down to its first height before extruding.
         if let Some(first) = steps.first().filter(|st| st.dz < 0.0) {
@@ -954,9 +960,9 @@ impl<'a> Writer<'a> {
         let mut i = 0;
         while i < steps.len() {
             let Some(first) = steps.get(i) else { break };
-            let key = (first.hang, first.scarf);
+            let key = (first.hang, first.scarf, first.speed.to_bits());
             let j = (i..steps.len())
-                .find(|&j| steps.get(j).is_some_and(|st| (st.hang, st.scarf) != key))
+                .find(|&j| steps.get(j).is_some_and(|st| (st.hang, st.scarf, st.speed.to_bits()) != key))
                 .unwrap_or(steps.len());
             if let Some(run) = steps.get(i..j) {
                 all.extend(run.iter().map(|st| st.to));
@@ -1001,6 +1007,119 @@ impl<'a> Writer<'a> {
         self.mv(target.extend(z), 0.0, speed, MoveKind::Travel);
     }
 
+    /// `ExtrusionQualityEstimator::estimate_extrusion_quality` and `GCode::_extrude`'s use of
+    /// it: each point's distance past the layer below (with points added where the wall crosses
+    /// that edge and near it), each move's speed from the overhang speed sections, and when any
+    /// differs from the wall's own the wall is printed point by point at those speeds. When none
+    /// does, the wall keeps its own speed throughout.
+    fn overhang_speeds(&self, path: &Path, start: DVec2, steps: &mut Vec<Step>) {
+        let s = self.s();
+        let Some(below) = self.below.as_deref() else { return };
+        if !path.role.is_wall() || !s.walls.overhang_speed || self.layer == 0 || below.is_empty() || steps.is_empty() {
+            return;
+        }
+        let Some(fil) = self.filament() else { return };
+        let width = path.width as f32;
+        let area = bead_area(path.width, self.height) * path.flow;
+        let volumetric = |v: f64| if area > 0.0 { v.min(fil.max_volumetric / (area * fil.flow_ratio)) } else { v };
+        let mut reference = if path.role == Role::OuterWall { s.speeds.outer } else { s.speeds.inner };
+        if reference <= 0.0 {
+            reference = volumetric(f64::MAX);
+        }
+        let reference = volumetric(reference) as f32;
+        let original = volumetric(path.speed) as f32;
+        // Overlaps 90, 75, 50, 25, 13 and 0 %: the wall speed, each overhang speed (0 for none),
+        // and the bridge speed.
+        let pct = |v: f64| if v < 0.5 { 100.0 } else { v * 100.0 / f64::from(reference) };
+        let speeds = [
+            100.0,
+            pct(s.walls.overhang_speeds[0].of(f64::from(reference))),
+            pct(s.walls.overhang_speeds[1].of(f64::from(reference))),
+            pct(s.walls.overhang_speeds[2].of(f64::from(reference))),
+            pct(s.walls.overhang_speeds[3].of(f64::from(reference))),
+            s.speeds.bridge * 100.0 / f64::from(reference),
+        ];
+        let mut sections: Vec<(f32, f32)> = [90.0f64, 75.0, 50.0, 25.0, 13.0, 0.0]
+            .iter()
+            .zip(speeds)
+            .map(|(o, v)| ((f64::from(width) * (1.0 - o / 100.0)) as f32, (f64::from(reference) * v / 100.0) as f32))
+            .collect();
+        sections.sort_by(|a, b| a.0.total_cmp(&b.0).then(b.1.total_cmp(&a.1)));
+        let mut last = (f32::INFINITY, 0.0f32);
+        for sec in &mut sections {
+            if sec.0 == last.0 {
+                sec.1 = last.1;
+            } else {
+                last = *sec;
+            }
+        }
+        let min_distance =
+            sections.iter().filter(|sec| sec.1 <= original).map(|sec| sec.0).fold(f32::INFINITY, f32::min);
+        let min_distance = if min_distance.is_finite() { min_distance } else { -1.0 };
+
+        let mut input: Vec<DVec2> = vec![start];
+        input.extend(steps.iter().map(|st| st.to));
+        let points = overhang_points(below, &input, width, min_distance);
+        let (Some(first), Some(last)) = (sections.first().copied(), sections.last().copied()) else { return };
+        let calc = |d: f32| -> f32 {
+            let v = if d <= first.0 {
+                original
+            } else if d >= last.0 {
+                last.1
+            } else {
+                let mut k = 0;
+                while sections.get(k + 1).is_some_and(|n| d > n.0) {
+                    k += 1;
+                }
+                let (Some(a), Some(b)) = (sections.get(k), sections.get(k + 1)) else { return original };
+                let t = ((d - a.0) / (b.0 - a.0)).clamp(0.0, 1.0);
+                (1.0 - t) * a.1 + t * b.1
+            };
+            v.round()
+        };
+        let processed: Vec<(DVec2, f32, f32)> = (0..points.len())
+            .map(|i| {
+                let (p, d) = points.get(i).copied().unwrap_or((start, 0.0));
+                let (_, dn) = points.get(i + 1).or(points.get(i)).copied().unwrap_or((start, 0.0));
+                let speed = calc(d).min(calc(dn)).min(original);
+                let overlap = (1.0 - d / width).min(1.0 - dn / width);
+                (p, speed, overlap)
+            })
+            .collect();
+        let varies = processed.iter().any(|q| (f64::from(q.1) - f64::from(original)).abs() > 1.0);
+        if !varies {
+            for st in steps.iter_mut() {
+                st.hang = 0;
+                st.speed = -1.0;
+            }
+            return;
+        }
+        // `_extrude`'s feed: a move at the speed of the point it leaves, changed only past a
+        // millimetre a second, and back to the wall's own within one of it.
+        let mut out = Vec::with_capacity(processed.len());
+        let mut set = processed.first().map_or(original, |q| q.1);
+        for i in 1..processed.len() {
+            let (Some(prev), Some(here)) = (processed.get(i - 1), processed.get(i)) else { continue };
+            let new = prev.1;
+            if (set - new).abs() > 1.0 {
+                set = new;
+            } else if (original - new).abs() <= 1.0 {
+                set = original;
+            }
+            let hang = ((1.0 - here.2.min(prev.2)) * 100.0).clamp(0.0, 255.0).round() as u8;
+            out.push(Step {
+                to: here.0,
+                bend: None,
+                hang,
+                dz: 0.0,
+                flow: 1.0,
+                scarf: false,
+                speed: f64::from(set.max(1.0)),
+            });
+        }
+        *steps = out;
+    }
+
     /// Prints a run of `path`'s steps that hang alike (and scarf or not).
     fn run(&mut self, path: &Path, run: &[Step], z: f64) {
         let Some(fil) = self.filament() else { return };
@@ -1029,7 +1148,9 @@ impl<'a> Writer<'a> {
             base = v;
         }
         let mut flow = path.flow;
-        if deg > 0 && s.walls.overhang_speed && self.layer > 0 {
+        if first.speed > 0.0 {
+            base = first.speed;
+        } else if first.speed == 0.0 && deg > 0 && s.walls.overhang_speed && self.layer > 0 {
             base = overhang_speed(f64::from(hang) / 100.0, base, &s.walls.overhang_speeds, s.speeds.bridge);
         }
         if over_air {
@@ -1073,19 +1194,8 @@ impl<'a> Writer<'a> {
         let speed = speed.max(1.0);
         let e_per_mm = area / fil.area() * fil.flow_ratio;
         self.last_speed = speed;
-        // Orca's overhang speeds: a wall whose speed varies anywhere along it (by over a millimetre
-        // a second) goes out point by point, all of it in lines (`variable_speed`).
-        let varies = path.role.is_wall()
-            && s.walls.overhang_speed
-            && self.layer > 0
-            && (0..path.overhang.len()).any(|i| {
-                let h = path.hang_at(i);
-                crate::toolpath::degree_of(h) > 0
-                    && (overhang_speed(f64::from(h) / 100.0, path.speed, &s.walls.overhang_speeds, s.speeds.bridge)
-                        - path.speed)
-                        .abs()
-                        > 1.0
-            });
+        // A wall whose overhang speed varies goes out point by point, in lines.
+        let varies = first.speed > 0.0;
         let fit = !varies
             && !first.scarf
             && run.iter().all(|st| st.dz == 0.0)
@@ -1503,6 +1613,7 @@ impl<'a> Writer<'a> {
     }
 
     fn island(&mut self, island: &Island, object: usize) {
+        self.below = island.below.clone();
         if let Some(k) = island.pressure_advance {
             let line = crate::calib::pressure_advance(self.s().motion.flavor, k, self.extruder);
             self.line(line);
@@ -1694,6 +1805,71 @@ impl<'a> Writer<'a> {
     }
 }
 
+/// `estimate_points_properties<true, true, true, true>` without curvature: `input`'s points,
+/// each with its signed distance past `below` plus half the line, and the points Orca adds.
+fn overhang_points(
+    below: &crate::overhang::Boundary,
+    input: &[DVec2],
+    width: f32,
+    min_distance: f32,
+) -> Vec<(DVec2, f32)> {
+    const EPSILON: f32 = 1.0e-4;
+    let offset = 0.5 * width;
+    let min_spacing = f64::from(width) * 0.25;
+    let dist = |p: DVec2| (below.signed(p) + f64::from(offset)) as f32;
+    let mut points: Vec<(DVec2, f32)> = Vec::with_capacity(input.len() * 2);
+    let Some(&first) = input.first() else { return points };
+    points.push((first, dist(first)));
+    for &next in input.iter().skip(1) {
+        let d = dist(next);
+        if let Some(&(prev, pd)) = points.last()
+            && (pd > offset + EPSILON) != (d > offset + EPSILON)
+        {
+            for c in below.crossings(prev, next) {
+                if c.distance(prev) > min_spacing && next.distance(c) > min_spacing {
+                    points.push((c, offset));
+                }
+            }
+        }
+        points.push((next, d));
+    }
+    let mut out: Vec<(DVec2, f32)> = Vec::with_capacity(points.len() * 2);
+    let Some(&head) = points.first() else { return out };
+    out.push(head);
+    for pair in points.windows(2) {
+        let (curr, next) = (pair[0], pair[1]);
+        let near = |d: f32| d > -offset && d < offset + 2.0;
+        if near(curr.1) || near(next.1) {
+            let len = curr.0.distance(next.0);
+            let far = |d: f32| d.abs() > min_distance;
+            if (min_distance > 0.0 && (far(curr.1) || far(next.1)) && len >= 2.0) || (min_distance <= 0.0 && len > 4.0)
+            {
+                let a0 = (f64::from(curr.1 + 3.0 * offset) / len).clamp(0.0, 1.0);
+                let a1 = (f64::from(1.0f32) - f64::from(next.1 + 3.0 * offset) / len).clamp(0.0, 1.0);
+                let (t0, t1) = (a0.min(a1), a0.max(a1));
+                let mut add = |t: f64| {
+                    let p = curr.0 + (next.0 - curr.0) * t;
+                    let raw = below.signed(p);
+                    if (raw.abs() > f64::from(min_distance) || min_distance <= 0.0)
+                        && p.distance(curr.0) > min_spacing
+                        && next.0.distance(p) > min_spacing
+                    {
+                        out.push((p, (raw + f64::from(offset)) as f32));
+                    }
+                };
+                if t0 < 1.0 {
+                    add(t0);
+                }
+                if t1 > 0.0 {
+                    add(t1);
+                }
+            }
+        }
+        out.push(next);
+    }
+    out
+}
+
 /// One move of a path as printed: to `to`, `dz` below the layer, at `flow` of the full bead.
 #[derive(Clone, Copy, Debug)]
 struct Step {
@@ -1705,6 +1881,9 @@ struct Step {
     dz: f64,
     flow: f64,
     scarf: bool,
+    /// Orca's processed overhang speed for this move, mm/s; 0 to work it out from `hang`, below
+    /// 0 to keep the path's own.
+    speed: f64,
 }
 
 /// A wall's speed where `share` of its line hangs past the layer below (OrcaSlicer's dynamic
@@ -2047,6 +2226,7 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
         xy_known: false,
         last_path: Vec::new(),
         last_speed: 0.0,
+        below: None,
         warnings: Vec::new(),
     };
     let first_fil = cx.filaments.get(w.extruder).cloned();
@@ -2940,7 +3120,7 @@ mod tests {
     #[test]
     fn loops_stop_short_by_the_seam_gap() {
         let p = l_shape();
-        let plain = |to: DVec2| Step { to, bend: None, hang: 0, dz: 0.0, flow: 1.0, scarf: false };
+        let plain = |to: DVec2| Step { to, bend: None, hang: 0, dz: 0.0, flow: 1.0, scarf: false, speed: 0.0 };
         let mut steps: Vec<Step> = p.points.iter().skip(1).chain(p.points.first()).map(|q| plain(*q)).collect();
         trim_end(DVec2::ZERO, &mut steps, 0.04);
         assert_eq!(steps.len(), 6);
@@ -2953,7 +3133,7 @@ mod tests {
 
     #[test]
     fn steps_split_at_distances() {
-        let plain = |to: DVec2| Step { to, bend: None, hang: 0, dz: 0.0, flow: 1.0, scarf: false };
+        let plain = |to: DVec2| Step { to, bend: None, hang: 0, dz: 0.0, flow: 1.0, scarf: false, speed: 0.0 };
         let steps = vec![plain(DVec2::new(10.0, 0.0)), plain(DVec2::new(10.0, 10.0))];
         let split = split_steps(DVec2::ZERO, &steps, &[2.5, 5.0, 10.0, 12.0]);
         let ds: Vec<f64> = split.iter().map(|(_, d)| *d).collect();
