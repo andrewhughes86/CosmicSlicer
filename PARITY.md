@@ -16,13 +16,13 @@ the X1C, MK4 and Voron table further down was taken before this stretch's work (
 |---|---|
 | cube20 | 95 % |
 | cylinder | 92 % |
-| thinwalls | 87 % |
+| thinwalls | 90 % |
 | small | 91 % |
-| overhangs | 80 % |
+| overhangs | 81 % |
 | bridge | 71 % |
 | calicat | 72 % |
 | steps | 71 % |
-| ksr_fdmtest_v4 | 66 % |
+| ksr_fdmtest_v4 | 67 % |
 | large | 58 % |
 | 3DBenchy | 60 % |
 | OrcaCube_v2 | 54 % |
@@ -175,6 +175,15 @@ These differ and the cause is not established.
   below. Benchy's second-layer bridges over the first layer's gaps still run across (we find no
   floating edges there and use principal components; Orca finds some and runs them along).
 - Gap infill 0 %, prime tower 0 %.
+- Internal solid infill is the weakest feature (calicat 31 %, Benchy 55 %, steps 58 %): region edges
+  come out a few hundredths of a millimetre off Orca's, so lines end elsewhere and fitted widths
+  differ. `split_narrow_solid` follows Orca's rules but in millimetres; an integer port is next.
+- Internal bridges: on `large`'s layer at 2.2 mm one corner of the anchored polygon extends the
+  other way, and the zigzag then links the other way round; `anchored_polygon` is in millimetres too.
+- Islands: printed in `lslices` order now. Where our outlines' first points differ from Orca's the
+  chain starts on another island (ksr: 241 of 447 layers).
+- Object label ids: Orca's command line numbers objects from its object counter (14 for one object,
+  45 and 56 for two); the app's ids come from the project. Not imitated.
 - Benchy internal solid and top surfaces under 1 %, where the cube reaches 96 and 100 %.
 - `calicat` and the Bunny come out one or two layers short of Orca.
 - Multi-colour flushing: Orca purges 64 to 82 mm per change, ours 45.6.
