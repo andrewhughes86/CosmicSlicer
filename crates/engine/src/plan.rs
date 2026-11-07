@@ -818,7 +818,7 @@ pub fn object(
             p.turn_by_layer = s.infill.sparse_template.is_empty();
             infill::fill_with(&area, infill::kind_of(&s.sparse_pattern), &p).into_iter().map(|l| l.points).collect()
         };
-        let typed = surfaces::prepare(&input, s, &lines_below);
+        let typed = surfaces::prepare(&input, s, origin, &lines_below);
         walled.par_iter_mut().zip(typed.into_par_iter()).for_each(|(layer, t)| {
             let many = layer.iter().flat_map(|w| &w.pieces).count() > 1;
             for piece in layer.iter_mut().flat_map(|w| &mut w.pieces) {

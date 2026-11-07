@@ -74,8 +74,8 @@ OrcaSlicer's crashes are the reason this exists.
   `parity_tests` compares them (time, filament, features, retractions, toolpath maps and
   layer pictures in `<dir>/<model>@<set>/`). `tools/parity_diff.py <case> [--layer N] [--feature F]`
   compares the two files line by line; `PARITY.md` lists every known difference and why. `clipper`, `slicing`, `seam`,
-  `connect`, `arcs`, `rectilinear`, `chain` and `timelapse` are ports of Orca's SeamPlacer, connect_infill, ArcFitter, FillRectilinear, ShortestPath and TimelapsePosPicker down to libstdc++'s
-  random numbers and sort, so keep them so. Orca's behaviour is the reference: when they
+  `connect`, `arcs`, `rectilinear`, `chain`, `expansion` and `timelapse` are ports of Orca's SeamPlacer, connect_infill, ArcFitter, FillRectilinear, ShortestPath, RegionExpansion and TimelapsePosPicker down to libstdc++'s
+  random numbers, sort and `unordered_map` order (`connect::std_unordered_order`), so keep them so. Orca's behaviour is the reference: when they
   differ, read Orca's source for the rule rather than guessing, and never imitate a tie-break: its
   ties turn on nanometres, so port the arithmetic (`PARITY.md`).
 - `crates/ui-egui` — the UI. `project.rs` maps the session to and from 3MF projects (presets by name, edits kept);

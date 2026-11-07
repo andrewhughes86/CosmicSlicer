@@ -8,6 +8,7 @@
 use glam::DVec2;
 use rayon::prelude::*;
 
+use crate::expansion::{self, ExPoly, Params};
 use crate::geom::{self, Join, Op, Polyline, Shape};
 use crate::seam::Outline;
 use crate::settings::{Settings, VerticalShell};
@@ -327,101 +328,97 @@ fn horizontal_shells(fills: &mut [Fill], layers: &[Input], s: &Settings) {
     }
 }
 
-/// How a surface grows into a zone: `RegionExpansionParameters::build`.
-#[derive(Clone, Copy)]
-struct Wave {
-    tiny: f64,
-    step: f64,
-    steps: usize,
+/// `compute_moments_of_area_of_triangle`, in Orca's floats: area, first moments, second
+/// moments and the covariance moment, none divided by the area.
+fn triangle_moments(a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> (f32, [f32; 2], [f32; 2], f32) {
+    let jac = ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])).abs();
+    let second = |k: usize| {
+        let (a, b, c) = (a[k], b[k], c[k]);
+        jac * (a * a + b * b + b * c + c * c + a * (b + c)) / 12.0
+    };
+    let cov = jac
+        * (1.0 / 24.0)
+        * (a[1] * (b[0] + c[0])
+            + a[0] * (2.0 * a[1] + b[1] + c[1])
+            + b[1] * c[0]
+            + b[0] * c[1]
+            + 2.0 * b[0] * b[1]
+            + 2.0 * c[0] * c[1]);
+    let first = |k: usize| jac * (a[k] + b[k] + c[k]) / 6.0;
+    (jac * 0.5, [first(0), first(1)], [second(0), second(1)], cov)
 }
 
-impl Wave {
-    fn new(full: f64) -> Wave {
-        const STEP: f64 = 0.1;
-        const MAX_STEPS: usize = 5;
-        let mut tiny = (0.25 * full).min(0.05);
-        let mut steps = (((full - tiny) / STEP).ceil() as usize).clamp(1, MAX_STEPS);
-        let mut step = (full - tiny) / steps as f64;
-        if steps > 1 && 0.25 * step < tiny {
-            steps = (((full - tiny) / (4.0 * tiny)).floor() as usize).max(1);
-            step = (full - tiny) / steps as f64;
-        }
-        if 0.25 * step < tiny || steps == 1 {
-            tiny = 0.2 * full;
-            step = 0.8 * full;
-        }
-        Wave { tiny, step, steps }
-    }
-
-    /// `src` growing into `zone` from where they touch.
-    fn into(self, src: &[Shape], zone: &[Shape]) -> Vec<Shape> {
-        if src.is_empty() || zone.is_empty() {
-            return Vec::new();
-        }
-        let seed = geom::offset(src, self.tiny, Join::Miter);
-        let mut front = both(&seed, zone);
-        if front.is_empty() {
-            return front;
-        }
-        // The first step takes the seed along the edge it touches.
-        front = both(&geom::offset(&front, self.step, Join::Round), zone);
-        for _ in 1..self.steps {
-            if front.is_empty() {
-                break;
+/// `compute_principal_components`' second vector (the one with the smaller eigenvalue), in
+/// Orca's floats over each polygon's fan from its first point; zero when there is no area.
+fn second_principal(polys: &[crate::clipper::Path]) -> [f32; 2] {
+    let (mut centroid, mut second, mut cov, mut area) = ([0f32; 2], [0f32; 2], 0f32, 0f32);
+    let at = |p: &crate::clipper::Pt| [(p.x as f64 * 1e-6) as f32, (p.y as f64 * 1e-6) as f32];
+    for poly in polys {
+        let Some(p0) = poly.first().map(at) else { continue };
+        for i in 2..poly.len() {
+            let (Some(p1), Some(p2)) = (poly.get(i - 1).map(at), poly.get(i).map(at)) else { continue };
+            let (u, v) = ([p1[0] - p0[0], p1[1] - p0[1]], [p2[0] - p1[0], p2[1] - p1[1]]);
+            let sign: f32 = if u[0] * v[1] - u[1] * v[0] > 0.0 { 1.0 } else { -1.0 };
+            let (ta, first, sec, tc) = triangle_moments(p0, p1, p2);
+            area += sign * ta;
+            for k in 0..2 {
+                centroid[k] += sign * first[k];
+                second[k] += sign * sec[k];
             }
-            front = both(&geom::offset(&front, self.step, Join::Round), zone);
+            cov += sign * tc;
         }
-        front
     }
+    if area <= 0.0 {
+        return [0.0; 2];
+    }
+    let c = [centroid[0] / area, centroid[1] / area];
+    let var = [second[0] / area - c[0] * c[0], second[1] / area - c[1] * c[1]];
+    let covariance = f64::from(cov / area - c[0] * c[1]);
+    if covariance.abs() < 1e-4 {
+        return if var[1] > var[0] { [var[0], 0.0] } else { [0.0, var[1]] };
+    }
+    let d = f64::from((var[0] - var[1]) * (var[0] - var[1])) + 4.0 * covariance * covariance;
+    let ea = (0.5 * (f64::from(var[0] + var[1]) + d.sqrt())) as f32;
+    let eb = (0.5 * (f64::from(var[0] + var[1]) - d.sqrt())) as f32;
+    let vector = |e: f32| [(f64::from(e - var[1]) / covariance) as f32, 1.0];
+    if ea > eb { vector(eb) } else { vector(ea) }
 }
 
-/// The principal axes' shorter direction, `compute_principal_components`' second.
-fn short_axis(area: &[Shape]) -> Option<DVec2> {
-    let (mut a, mut cx, mut cy, mut xx, mut yy, mut xy) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-    for c in area.iter().flatten() {
-        let n = c.len();
-        for i in 0..n {
-            let (Some(&p), Some(&q)) = (c.get(i), c.get((i + 1) % n)) else { continue };
-            let k = p.perp_dot(q);
-            a += k;
-            cx += (p.x + q.x) * k;
-            cy += (p.y + q.y) * k;
-            xx += (p.x * p.x + p.x * q.x + q.x * q.x) * k;
-            yy += (p.y * p.y + p.y * q.y + q.y * q.y) * k;
-            xy += (2.0 * p.x * p.y + p.x * q.y + q.x * p.y + 2.0 * q.x * q.y) * k;
-        }
-    }
-    if a <= 0.0 {
+/// The principal axes' shorter direction, as `detect_bridging_direction` takes it.
+fn short_axis(polys: &[crate::clipper::Path]) -> Option<DVec2> {
+    let [x, y] = second_principal(polys);
+    if x == 0.0 && y == 0.0 {
         return None;
     }
-    let area = a / 2.0;
-    let (mx, my) = (cx / (6.0 * area), cy / (6.0 * area));
-    let (vx, vy, cov) = (xx / (12.0 * area) - mx * mx, yy / (12.0 * area) - my * my, xy / (24.0 * area) - mx * my);
-    if cov.abs() < 1e-4 {
-        return Some(if vy > vx { DVec2::X } else { DVec2::Y });
-    }
-    let theta = 0.5 * (2.0 * cov).atan2(vx - vy);
-    Some(DVec2::new(-theta.sin(), theta.cos()))
+    let n = (x * x + y * y).sqrt();
+    Some(DVec2::new(f64::from(x / n), f64::from(y / n)))
 }
 
 /// `detect_bridging_direction`: the way across that leaves the least edge hanging.
-fn bridging_direction(floating: &[[DVec2; 2]], area: &[Shape]) -> DVec2 {
+fn bridging_direction(floating: &[[DVec2; 2]], area: &[crate::clipper::Path]) -> DVec2 {
     if floating.is_empty() {
         return short_axis(area).unwrap_or(DVec2::X);
     }
-    let mut directions: Vec<(i64, DVec2)> = Vec::new();
-    for [a, b] in floating {
-        let d = *b - *a;
-        let normal = DVec2::new(d.y, -d.x).normalize_or_zero();
-        let key = (normal.y.atan2(normal.x) * 1000.0).ceil() as i64;
-        if !directions.iter().any(|(k, _)| *k == key) {
-            directions.push((key, normal));
+    // In Orca's units, as `Line`s of points.
+    let nm = |p: DVec2| DVec2::new((p.x * 1e6).round(), (p.y * 1e6).round());
+    let lines: Vec<DVec2> = floating.iter().map(|[a, b]| nm(*b) - nm(*a)).collect();
+    // `std::unordered_map<double, Vec2d>` by quantised angle, first normal kept.
+    let (mut keys, mut normals): (Vec<f64>, Vec<DVec2>) = (Vec::new(), Vec::new());
+    for d in &lines {
+        let normal = DVec2::new(d.y, -d.x);
+        let n2 = normal.length_squared();
+        let normal = if n2 > 0.0 { normal / n2.sqrt() } else { normal };
+        let key = (normal.y.atan2(normal.x) * 1000.0).ceil();
+        if !keys.contains(&key) {
+            keys.push(key);
+            normals.push(normal);
         }
     }
-    directions.sort_by_key(|d| d.0);
+    let hashes: Vec<u64> = keys.iter().map(|k| crate::connect::std_hash_f64(*k)).collect();
     let mut best = (f64::MAX, DVec2::ONE);
-    for (_, dir) in directions {
-        let cost: f64 = floating.iter().map(|[a, b]| (*b - *a).dot(dir).abs()).sum();
+    for k in crate::connect::std_unordered_order(&hashes) {
+        let Some(&dir) = normals.get(k) else { continue };
+        let cost = lines.iter().fold(0.0, |acc, l| acc + l.dot(dir).abs());
         if cost < best.0 {
             best = (cost, DVec2::new(dir.y, -dir.x));
         }
@@ -429,102 +426,215 @@ fn bridging_direction(floating: &[[DVec2; 2]], area: &[Shape]) -> DVec2 {
     best.1
 }
 
-/// The edges of `shapes` away from `anchors`: `diff_pl(to_polylines(overhang), anchors)`.
-fn floating_edges_of(shapes: &[Shape], anchors: &[Shape]) -> Vec<[DVec2; 2]> {
-    let rings: Vec<Polyline> = shapes
-        .iter()
-        .flatten()
-        .map(|c| {
-            let mut r = c.clone();
-            r.extend(c.first().copied());
-            r
-        })
-        .collect();
-    let lines = if anchors.is_empty() { rings } else { geom::clip_lines_outside(&rings, anchors) };
-    lines.iter().flat_map(|l| l.windows(2).map(|w| [w[0], w[1]])).collect()
+/// An `ExpansionZone`: fill a surface may grow into, and how far.
+struct Zone {
+    expolys: Vec<ExPoly>,
+    params: Params,
+    expanded_into: bool,
+}
+
+fn trim_zones(zones: &mut [Zone], by: &[Shape]) {
+    for z in zones.iter_mut().filter(|z| z.expanded_into) {
+        z.expolys = geom::shapes_nm(&diff(&geom::shapes_mm(&z.expolys), by));
+    }
+}
+
+/// `expand_bridges_detect_orientations`: bridges grow into the zones in waves; those whose
+/// waves meet in a zone print as one, at the angle the first of them finds against the zones
+/// it touches.
+fn expand_bridges(bridges: Vec<ExPoly>, zones: &mut [Zone], closing: f32, origin: DVec2) -> Vec<(Vec<Shape>, f64)> {
+    if bridges.is_empty() {
+        return Vec::new();
+    }
+    let n = bridges.len();
+    // `expand_expolygons`.
+    let (mut anchors, mut expansions) = (Vec::new(), Vec::new());
+    let mut processed = 0u32;
+    for z in zones.iter_mut() {
+        let mut seeds = expansion::wave_seeds(&bridges, &z.expolys, z.params.tiny);
+        let mut grown = expansion::propagate_waves_ex(&seeds, &z.expolys, &z.params);
+        seeds.iter_mut().for_each(|s| s.boundary += processed);
+        grown.iter_mut().for_each(|e| e.boundary += processed);
+        z.expanded_into = !grown.is_empty();
+        anchors.extend(seeds);
+        expansions.extend(grown);
+        processed += z.expolys.len() as u32;
+    }
+    // `get_grouped_bridges`.
+    let mut group: Vec<u32> = (0..n as u32).collect();
+    fn root(group: &[u32], mut id: u32) -> u32 {
+        for _ in 0..group.len() + 1 {
+            match group.get(id as usize) {
+                Some(&g) if g != id => id = g,
+                _ => break,
+            }
+        }
+        id
+    }
+    let contour_box = |e: &expansion::ExpansionEx| geom::bounds(&geom::shapes_mm(std::slice::from_ref(&e.expoly)));
+    let mut i = 0;
+    while let Some(first) = expansions.get(i) {
+        let end = (i + 1..expansions.len())
+            .find(|&j| expansions.get(j).is_some_and(|e| e.boundary != first.boundary))
+            .unwrap_or(expansions.len());
+        let run = expansions.get(i..end).unwrap_or(&[]);
+        let boxes: Vec<_> = run.iter().map(contour_box).collect();
+        for (a, ea) in run.iter().enumerate() {
+            for (c, ec) in run.iter().enumerate().skip(a + 1) {
+                let near = match (boxes.get(a).copied().flatten(), boxes.get(c).copied().flatten()) {
+                    (Some((alo, ahi)), Some((clo, chi))) => {
+                        alo.x <= chi.x && clo.x <= ahi.x && alo.y <= chi.y && clo.y <= ahi.y
+                    }
+                    _ => false,
+                };
+                let touch = || {
+                    let (Some(ca), Some(cc)) = (ea.expoly.first(), ec.expoly.first()) else { return false };
+                    !geom::intersect_paths(std::slice::from_ref(ca), std::slice::from_ref(cc)).is_empty()
+                };
+                if ea.src != ec.src && near && touch() {
+                    let (id, id2) = (root(&group, ea.src), root(&group, ec.src));
+                    if id < id2 {
+                        if let Some(g) = group.get_mut(id2 as usize) {
+                            *g = id;
+                        }
+                    } else if let Some(g) = group.get_mut(id as usize) {
+                        *g = id2;
+                    }
+                }
+            }
+        }
+        i = end;
+    }
+    // `detect_bridge_directions`: each bridge's edges away from the zones it touches.
+    crate::connect::std_sort(&mut anchors, &|l: &expansion::Seed, r: &expansion::Seed| {
+        l.src < r.src || (l.src == r.src && l.boundary < r.boundary)
+    });
+    let (ox, oy) = ((origin.x * 1e6).round() as i64, (origin.y * 1e6).round() as i64);
+    let mm = |p: &crate::clipper::Pt| DVec2::new(p.x as f64 / 1e6, p.y as f64 / 1e6);
+    let mut angles = vec![0.0f64; n];
+    let mut k = 0;
+    for (id, bridge) in bridges.iter().enumerate() {
+        let mut areas: Vec<crate::clipper::Path> = Vec::new();
+        let mut last: i64 = -1;
+        while let Some(a) = anchors.get(k).filter(|a| a.src as usize == id) {
+            if last != i64::from(a.boundary) {
+                last = i64::from(a.boundary);
+                let mut start = 0usize;
+                for z in zones.iter() {
+                    let end = start + z.expolys.len();
+                    if (a.boundary as usize) < end {
+                        areas.extend(z.expolys.get(a.boundary as usize - start).cloned().unwrap_or_default());
+                        break;
+                    }
+                    start = end;
+                }
+            }
+            k += 1;
+        }
+        let rings: Vec<crate::clipper::Path> = bridge
+            .iter()
+            .map(|c| {
+                let mut r = c.clone();
+                r.extend(c.first().copied());
+                r
+            })
+            .collect();
+        let clip = geom::offset_polygons(&areas, 100.0);
+        let pieces = geom::clip_open(&rings, &clip, crate::clipper::ClipType::Difference);
+        let lines: Vec<[DVec2; 2]> = pieces.iter().flat_map(|p| p.windows(2).map(|w| [mm(&w[0]), mm(&w[1])])).collect();
+        // Orca's slices sit round the object's origin, which its floats' rounding sees.
+        let centred: Vec<crate::clipper::Path> =
+            bridge.iter().map(|p| p.iter().map(|q| crate::clipper::Pt::new(q.x - ox, q.y - oy)).collect()).collect();
+        let dir = bridging_direction(&lines, &centred);
+        if let Some(a) = angles.get_mut(id) {
+            *a = std::f64::consts::PI + dir.y.atan2(dir.x);
+        }
+    }
+    // `merge_bridges`.
+    crate::connect::std_sort(&mut expansions, &|l: &expansion::ExpansionEx, r: &expansion::ExpansionEx| {
+        l.src < r.src || (l.src == r.src && l.boundary < r.boundary)
+    });
+    let mut out: Vec<(Vec<Shape>, f64)> = Vec::new();
+    for id in 0..n as u32 {
+        if root(&group, id) != id {
+            continue;
+        }
+        let mut acc: Vec<crate::clipper::Path> = Vec::new();
+        for other in id..n as u32 {
+            if root(&group, other) != id {
+                continue;
+            }
+            acc.extend(bridges.get(other as usize).cloned().unwrap_or_default());
+            for e in expansions.iter().filter(|e| e.src == other) {
+                acc.extend(e.expoly.iter().cloned());
+            }
+        }
+        let merged = geom::closing_polygons(&acc, closing);
+        if !merged.is_empty() {
+            out.push((merged, angles.get(id as usize).copied().unwrap_or(0.0)));
+        }
+    }
+    let all: Vec<Shape> = out.iter().flat_map(|(b, _)| b.iter().cloned()).collect();
+    trim_zones(zones, &all);
+    out
+}
+
+/// `expand_merge_surfaces`: each surface with the waves it sends into the zones.
+fn expand_merge(src: Vec<ExPoly>, zones: &mut [Zone], closing: f32) -> Vec<Shape> {
+    if src.is_empty() {
+        return Vec::new();
+    }
+    let mut expansions = Vec::new();
+    let mut processed = 0u32;
+    for z in zones.iter_mut() {
+        let seeds = expansion::wave_seeds(&src, &z.expolys, z.params.tiny);
+        let mut grown = expansion::propagate_waves(&seeds, &z.expolys, &z.params);
+        z.expanded_into = !grown.is_empty();
+        grown.iter_mut().for_each(|e| e.boundary += processed);
+        processed += z.expolys.len() as u32;
+        expansions.extend(grown);
+    }
+    let merged = expansion::merge_expansions(src, expansions);
+    // `closing_ex` of expolygons.
+    let expanded = geom::offset2_nm(&geom::shapes_mm(&merged), closing, -closing, Join::Miter);
+    trim_zones(zones, &expanded);
+    expanded
 }
 
 /// `process_external_surfaces`: bridges, bottoms and tops grow into the fill round them.
-fn external(f: Fill, s: &Settings, first: bool, h: f64, below: &[Shape]) -> Typed {
+fn external(f: Fill, s: &Settings, first: bool, h: f64, origin: DVec2) -> Typed {
     let (outer, inner, solid_w) = widths(s, first);
-    let (so, si) = (Settings::spacing(outer, h), Settings::spacing(inner, h));
-    let (shell, least) =
-        if s.wall_loops > 0 { (0.5 * outer + so + si * (s.wall_loops - 1) as f64, si) } else { (1e-4, 1e-4) };
-    let expansion = (shell as f32 * std::f32::consts::SQRT_2) as f64;
-    let close_by = 0.55 * 0.65 * 1.05 * Settings::spacing(solid_w, h);
-    let into_solid = Wave::new(expansion);
-    let into_sparse = Wave::new(least);
-    let Fill { top, bottom, bridge, internal, solid, .. } = f;
-    let (mut shells, mut sparse, mut top) = (geom::union(&solid), geom::union(&internal), geom::union(&top));
-
-    // Bridges: each grows into the fill; those that meet print as one.
-    struct Grown {
-        source: Shape,
-        grown: Vec<Shape>,
-    }
-    let mut bridges: Vec<Grown> = Vec::new();
-    for b in geom::union(&bridge) {
-        let one = std::slice::from_ref(&b);
-        let (a, c, d) = (into_solid.into(one, &shells), into_sparse.into(one, &sparse), into_solid.into(one, &top));
-        let mut grown = vec![b.clone()];
-        grown.extend(a);
-        grown.extend(c);
-        grown.extend(d);
-        bridges.push(Grown { source: b, grown: geom::union(&grown) });
-    }
-    let mut group: Vec<usize> = (0..bridges.len()).collect();
-    for i in 0..bridges.len() {
-        for j in i + 1..bridges.len() {
-            let (Some(a), Some(b)) = (bridges.get(i), bridges.get(j)) else { continue };
-            if !both(&a.grown, &b.grown).is_empty() {
-                let (x, y) = (group.get(i).copied().unwrap_or(i), group.get(j).copied().unwrap_or(j));
-                let (keep, gone) = (x.min(y), x.max(y));
-                group.iter_mut().filter(|g| **g == gone).for_each(|g| *g = keep);
-            }
-        }
-    }
-    let mut out_bridges: Vec<(Vec<Shape>, f64)> = Vec::new();
-    for head in 0..bridges.len() {
-        if group.get(head) != Some(&head) {
-            continue;
-        }
-        let mut acc: Vec<Shape> = Vec::new();
-        let mut initial: Vec<Shape> = Vec::new();
-        for (g, b) in group.iter().zip(&bridges) {
-            if *g == head {
-                initial.push(b.source.clone());
-                acc.push(b.source.clone());
-                acc.extend_from_slice(&b.grown);
-            }
-        }
-        // `detect_bridging_direction(initial, lower_layer->lslices)`, over the group together.
-        let overhang = geom::boolean(&initial, below, Op::Difference);
-        let anchors = geom::offset(below, 1.0e-4, Join::Miter);
-        let floating = floating_edges_of(&overhang, &anchors);
-        let dir = bridging_direction(&floating, &overhang);
-        let angle = std::f64::consts::PI + dir.y.atan2(dir.x);
-        let merged = closing(&geom::union(&acc), close_by);
-        shells = diff(&shells, &merged);
-        sparse = diff(&sparse, &merged);
-        top = diff(&top, &merged);
-        out_bridges.push((merged, angle));
-    }
-
-    let grow = |src: Vec<Shape>, shells: &mut Vec<Shape>, sparse: &mut Vec<Shape>| -> Vec<Shape> {
-        if src.is_empty() {
-            return src;
-        }
-        let (a, b) = (into_solid.into(&src, shells), into_sparse.into(&src, sparse));
-        let mut acc = src;
-        acc.extend(a);
-        acc.extend(b);
-        let merged = closing(&geom::union(&acc), close_by);
-        *shells = diff(shells, &merged);
-        *sparse = diff(sparse, &merged);
-        merged
+    // `Flow::scaled_width` and `scaled_spacing`: the floats' millimetres, truncated.
+    let scaled = |v: f32| (f64::from(v) / 1e-6) as i64;
+    let h32 = h as f32;
+    let (shell_width, expansion_min): (f32, f32) = if s.wall_loops > 0 {
+        let ext_spacing = scaled(crate::walls::flow_spacing(outer as f32, h32));
+        let spacing = scaled(crate::walls::flow_spacing(inner as f32, h32));
+        let mut w = 0.5f32 * scaled(outer as f32) as f32 + ext_spacing as f32;
+        w += (spacing * (s.wall_loops as i64 - 1)) as f32;
+        (w, spacing as f32)
+    } else {
+        (100.0, 100.0)
     };
-    let bottom = grow(geom::union(&bottom), &mut shells, &mut sparse);
-    let top = grow(top, &mut shells, &mut sparse);
+    let expansion = (f64::from(shell_width) * std::f64::consts::SQRT_2) as f32;
+    let step = (0.1f64 / 1e-6) as f32;
+    let closing = 0.55f32 * 0.65f32 * 1.05f32 * scaled(crate::walls::flow_spacing(solid_w as f32, h32)) as f32;
+    let into_solid = Params::build(expansion, step, 5);
+    let into_sparse = Params::build(expansion_min, step, 5);
+    let Fill { top, bottom, bridge, internal, solid, .. } = f;
+    let zone = |shapes: &[Shape], params: Params| Zone {
+        expolys: geom::shapes_nm(&geom::union(shapes)),
+        params,
+        expanded_into: false,
+    };
+    let mut zones = vec![zone(&solid, into_solid), zone(&internal, into_sparse), zone(&top, into_solid)];
+    let bridges = expand_bridges(geom::shapes_nm(&geom::union(&bridge)), &mut zones, closing, origin);
+    // What is left of the top zone is the top surfaces now, which grow next.
+    let top_now = zones.pop().map(|z| z.expolys).unwrap_or_default();
+    let bottom = expand_merge(geom::shapes_nm(&geom::union(&bottom)), &mut zones, closing);
+    let top = expand_merge(top_now, &mut zones, closing);
+    let mut shells = zones.first().map(|z| geom::shapes_mm(&z.expolys)).unwrap_or_default();
+    let mut sparse = zones.get(1).map(|z| geom::shapes_mm(&z.expolys)).unwrap_or_default();
     if s.density > 0.0 && s.infill.min_sparse_area > 0.0 {
         let (small, big): (Vec<Shape>, Vec<Shape>) =
             sparse.into_iter().partition(|p| geom::shape_area(p) <= s.infill.min_sparse_area);
@@ -533,7 +643,7 @@ fn external(f: Fill, s: &Settings, first: bool, h: f64, below: &[Shape]) -> Type
             shells = all(shells, &small);
         }
     }
-    Typed { top, bottom, bridges: out_bridges, internal_bridges: Vec::new(), solid: shells, sparse }
+    Typed { top, bottom, bridges, internal_bridges: Vec::new(), solid: shells, sparse }
 }
 
 // ---- Bridges over sparse infill --------------------------------------------------------------
@@ -975,6 +1085,7 @@ fn bridge_over_infill(
 pub fn prepare(
     layers: &[Input],
     s: &Settings,
+    origin: DVec2,
     lines_below: &(dyn Fn(usize, &[Shape]) -> Vec<Polyline> + Sync),
 ) -> Vec<Typed> {
     let typed = detect(layers, s);
@@ -1020,10 +1131,7 @@ pub fn prepare(
         .into_par_iter()
         .zip(layers.par_iter())
         .enumerate()
-        .map(|(i, (f, l))| {
-            let below = i.checked_sub(1).and_then(|b| layers.get(b)).map_or(&[][..], |b| b.slices.as_slice());
-            external(f, s, i == 0, l.height, below)
-        })
+        .map(|(i, (f, l))| external(f, s, i == 0, l.height, origin))
         .collect();
     if s.density > 0.0 && s.density < 0.999 {
         bridge_over_infill(&mut typed, layers, s, lines_below);
@@ -1036,25 +1144,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn waves_follow_orcas_steps() {
-        let w = Wave::new(0.9);
-        assert!((w.tiny + w.step * w.steps as f64 - 0.9).abs() < 1e-9);
-        assert!(w.steps > 1 && w.steps <= 5);
-    }
-
-    #[test]
     fn a_span_runs_across_the_gap() {
         // Held along the left and right: only top and bottom edges hang.
         let shape: Shape = vec![vec![DVec2::ZERO, DVec2::new(10.0, 0.0), DVec2::new(10.0, 4.0), DVec2::new(0.0, 4.0)]];
         let edges = [[DVec2::ZERO, DVec2::new(10.0, 0.0)], [DVec2::new(10.0, 4.0), DVec2::new(0.0, 4.0)]];
-        let d = bridging_direction(&edges, std::slice::from_ref(&shape));
+        let d = bridging_direction(&edges, &geom::paths_of(&shape));
         assert!(d.y.abs() < 1e-9 && d.x.abs() > 0.99, "{d:?}");
     }
 
     #[test]
     fn with_no_loose_edge_a_bridge_takes_the_short_way() {
         let shape: Shape = vec![vec![DVec2::ZERO, DVec2::new(10.0, 0.0), DVec2::new(10.0, 4.0), DVec2::new(0.0, 4.0)]];
-        let d = bridging_direction(&[], std::slice::from_ref(&shape));
+        let d = bridging_direction(&[], &geom::paths_of(&shape));
         assert!(d.x.abs() < 1e-6 && d.y.abs() > 0.99, "{d:?}");
     }
 }

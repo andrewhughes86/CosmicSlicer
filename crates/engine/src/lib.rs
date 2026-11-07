@@ -17,6 +17,7 @@ pub mod calib;
 pub mod chain;
 pub mod clipper;
 pub mod connect;
+pub mod expansion;
 pub mod fuzzy;
 pub mod gcode;
 pub mod gcodeview;

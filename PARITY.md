@@ -173,9 +173,18 @@ steps. What is left cannot be read from Orca's G-code; it needs a build of Orca 
 
 These differ and the cause is not established.
 
-- Bridges: each group's direction is now Orca's `detect_bridging_direction` against the layer
-  below. Benchy's second-layer bridges over the first layer's gaps still run across (we find no
-  floating edges there and use principal components; Orca finds some and runs them along).
+- Bridges: grown, grouped and turned as Orca 2.4.2 really does it, `expand_bridges_detect_orientations`
+  on `RegionExpansion` (`expansion.rs`). The code beside it that tests against the layer below is
+  compiled out. Each bridge finds its own direction from its edges away from the zones its waves
+  reach (this layer's solid, sparse and top fill); a group takes its first bridge's. Ties between
+  directions go as libstdc++'s `unordered_map` walks them, and principal components are Orca's
+  floats round the object's origin (ksr bridges 53 -> 97 %, OrcaCube 61 -> 86 %). Left:
+  - Benchy's lettering on layer 2 runs at 50 degrees, Orca's at 95: the first letter's few
+    floating edges are a corner where our solid zone misses its outline by more than 100 nm.
+  - calicat's layer-16 bridge: Orca's lines carry extra vertices where the surface it fills was
+    pieced together (y 129.95, 130.75 and an arc), and its fitted width comes out 0.02 % smaller,
+    so its region is a few microns wider. How Orca's fill stage assembles that surface is not
+    found yet.
 - Gap infill 0 %, prime tower 0 %.
 - Internal solid infill is the weakest feature (calicat 31 %, Benchy 55 %, steps 58 %): region edges
   come out a few hundredths of a millimetre off Orca's, so lines end elsewhere and fitted widths

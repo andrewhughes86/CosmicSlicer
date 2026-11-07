@@ -19,6 +19,135 @@ const ON_EDGE: f64 = 200.0;
 const NM: f64 = 1.0e6;
 const NONE: usize = usize::MAX;
 
+/// libstdc++'s `std::hash<double>`: `_Hash_bytes` of the value's bytes, and 0 for ±0.
+pub fn std_hash_f64(v: f64) -> u64 {
+    if v == 0.0 {
+        return 0;
+    }
+    const MUL: u64 = (0xc6a4a793u64 << 32) + 0x5bd1e995;
+    let shift_mix = |v: u64| v ^ (v >> 47);
+    let mut hash = 0xc70f6907u64 ^ 8u64.wrapping_mul(MUL);
+    let data = shift_mix(v.to_bits().wrapping_mul(MUL)).wrapping_mul(MUL);
+    hash ^= data;
+    hash = hash.wrapping_mul(MUL);
+    hash = shift_mix(hash).wrapping_mul(MUL);
+    shift_mix(hash)
+}
+
+/// The order libstdc++'s `std::unordered_map` / `unordered_set` (unique keys, the default
+/// load factor) walks its elements, given each distinct key's hash in insertion order: an
+/// index into `hashes` per element. Keys already present must be left out by the caller, as
+/// `emplace` leaves them.
+pub fn std_unordered_order(hashes: &[u64]) -> Vec<usize> {
+    // `_Prime_rehash_policy`'s bucket counts from the first insertion on.
+    const BUCKETS: [u64; 12] = [13, 29, 59, 127, 257, 541, 1109, 2357, 5087, 10273, 20753, 42043];
+    let n = hashes.len();
+    if n > 40_000 {
+        return (0..n).collect();
+    }
+    let head = n;
+    let mut next: Vec<Option<usize>> = vec![None; n + 1];
+    let mut buckets: Vec<Option<usize>> = Vec::new();
+    let mut level = 0usize;
+    let hash = |i: usize| hashes.get(i).copied().unwrap_or(0);
+    for k in 0..n {
+        let want = if buckets.is_empty() {
+            Some(0)
+        } else if k + 1 > buckets.len() {
+            Some(level + 1)
+        } else {
+            None
+        };
+        if let Some(l) = want {
+            level = l;
+            let count = BUCKETS.get(level).copied().unwrap_or(42043);
+            // `_M_rehash_aux` for unique keys.
+            let mut fresh: Vec<Option<usize>> = vec![None; count as usize];
+            let mut p = next.get(head).copied().flatten();
+            if let Some(h) = next.get_mut(head) {
+                *h = None;
+            }
+            let mut first_bucket = 0usize;
+            while let Some(x) = p {
+                let after = next.get(x).copied().flatten();
+                let b = (hash(x) % count) as usize;
+                match fresh.get(b).copied().flatten() {
+                    None => {
+                        let old = next.get(head).copied().flatten();
+                        if let Some(nx) = next.get_mut(x) {
+                            *nx = old;
+                        }
+                        if let Some(h) = next.get_mut(head) {
+                            *h = Some(x);
+                        }
+                        if let Some(f) = fresh.get_mut(b) {
+                            *f = Some(head);
+                        }
+                        if old.is_some()
+                            && let Some(f) = fresh.get_mut(first_bucket)
+                        {
+                            *f = Some(x);
+                        }
+                        first_bucket = b;
+                    }
+                    Some(prev) => {
+                        let old = next.get(prev).copied().flatten();
+                        if let Some(nx) = next.get_mut(x) {
+                            *nx = old;
+                        }
+                        if let Some(pv) = next.get_mut(prev) {
+                            *pv = Some(x);
+                        }
+                    }
+                }
+                p = after;
+            }
+            buckets = fresh;
+        }
+        let count = buckets.len() as u64;
+        let b = (hash(k) % count.max(1)) as usize;
+        // `_M_insert_bucket_begin`.
+        match buckets.get(b).copied().flatten() {
+            Some(prev) => {
+                let old = next.get(prev).copied().flatten();
+                if let Some(nx) = next.get_mut(k) {
+                    *nx = old;
+                }
+                if let Some(pv) = next.get_mut(prev) {
+                    *pv = Some(k);
+                }
+            }
+            None => {
+                let old = next.get(head).copied().flatten();
+                if let Some(nx) = next.get_mut(k) {
+                    *nx = old;
+                }
+                if let Some(h) = next.get_mut(head) {
+                    *h = Some(k);
+                }
+                if let Some(o) = old
+                    && let Some(slot) = buckets.get_mut((hash(o) % count.max(1)) as usize)
+                {
+                    *slot = Some(k);
+                }
+                if let Some(slot) = buckets.get_mut(b) {
+                    *slot = Some(head);
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut p = next.get(head).copied().flatten();
+    while let Some(x) = p {
+        if out.len() > n {
+            break;
+        }
+        out.push(x);
+        p = next.get(x).copied().flatten();
+    }
+    out
+}
+
 /// `std::sort` as libstdc++ does it, so that equal keys land the same way.
 pub fn std_sort<T: Clone>(v: &mut [T], less: &dyn Fn(&T, &T) -> bool) {
     const THRESHOLD: usize = 16;
@@ -892,6 +1021,43 @@ fn connect_scaled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hashes_doubles_as_libstdcxx() {
+        // From g++ 13: `std::hash<double>()`.
+        assert_eq!(std_hash_f64(0.0), 0);
+        assert_eq!(std_hash_f64(-0.0), 0);
+        assert_eq!(std_hash_f64(1.0), 8386164645967068059);
+        assert_eq!(std_hash_f64(-1571.0), 6474224985528964055);
+        assert_eq!(std_hash_f64(3142.0), 16523478708180157915);
+    }
+
+    /// Compares with a file of `K keys` / `O order` lines printed by libstdc++
+    /// (`STD_UNORDERED_REF=<file>`).
+    #[test]
+    #[ignore]
+    fn walks_unordered_maps_as_libstdcxx() {
+        let Ok(path) = std::env::var("STD_UNORDERED_REF") else { return };
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().filter(|l| l.starts_with('K') || l.starts_with('O')).collect();
+        let mut checked = 0;
+        for pair in lines.chunks(2) {
+            let [k, o] = pair else { continue };
+            let keys: Vec<f64> = k.split_whitespace().skip(1).filter_map(|v| v.parse().ok()).collect();
+            let want: Vec<usize> = o.split_whitespace().skip(1).filter_map(|v| v.parse().ok()).collect();
+            let mut firsts: Vec<usize> = Vec::new();
+            for (i, key) in keys.iter().enumerate() {
+                if !firsts.iter().any(|&j| keys[j] == *key) {
+                    firsts.push(i);
+                }
+            }
+            let hashes: Vec<u64> = firsts.iter().map(|&i| std_hash_f64(keys[i])).collect();
+            let got: Vec<usize> = std_unordered_order(&hashes).into_iter().map(|j| firsts[j]).collect();
+            assert_eq!(got, want, "keys {keys:?}");
+            checked += 1;
+        }
+        assert!(checked > 0);
+    }
 
     fn square(s: f64) -> Contour {
         vec![DVec2::ZERO, DVec2::new(s, 0.0), DVec2::new(s, s), DVec2::new(0.0, s)]

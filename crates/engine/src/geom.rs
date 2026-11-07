@@ -339,6 +339,31 @@ pub fn intersect_paths(subject: &[Path], clip: &[Path]) -> Paths {
     guarded(|| clip_paths(ClipType::Intersection, subject, clip, FillType::NonZero))
 }
 
+/// Orca's `closing_ex` of polygons: grown by `delta` and united, then shrunk back, in
+/// Clipper's units.
+pub fn closing_polygons(paths: &[Path], delta: f32) -> Vec<Shape> {
+    guarded(|| {
+        let grown =
+            clip_paths(ClipType::Union, &raw_offset(paths, delta, JoinType::Miter, 3.0)?, &[], FillType::NonZero)?;
+        Ok(to_shapes(&shrink_tree(&grown, delta, JoinType::Miter, 3.0)?))
+    })
+}
+
+/// Shapes in Clipper's units, contour first: Orca's `ExPolygons`.
+pub fn shapes_nm(shapes: &[Shape]) -> Vec<Paths> {
+    shapes.iter().map(paths_of).collect()
+}
+
+/// Shapes back from Clipper's units.
+pub fn shapes_mm(shapes: &[Paths]) -> Vec<Shape> {
+    shapes.iter().map(|s| loops_to_contours(s)).collect()
+}
+
+/// `diff` of polygons, to plain loops as Clipper gives them, in Clipper's units.
+pub fn diff_paths(subject: &[Path], clip: &[Path]) -> Paths {
+    guarded(|| clip_paths(ClipType::Difference, subject, clip, FillType::NonZero))
+}
+
 /// Orca's `offset_ex` of polygons, by a positive `delta` in Clipper's units.
 pub fn expand_polygons(paths: &[Path], delta: f32) -> Vec<Shape> {
     guarded(|| Ok(to_shapes(&expand_tree(paths, delta, JoinType::Miter, 3.0)?)))
