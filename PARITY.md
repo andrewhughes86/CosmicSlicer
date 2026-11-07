@@ -14,20 +14,20 @@ the X1C, MK4 and Voron table further down was taken before this stretch's work (
 
 | Model | Identical lines |
 |---|---|
-| cube20 | 94 % |
-| cylinder | 91 % |
-| thinwalls | 86 % |
-| small | 75 % |
-| overhangs | 72 % |
+| cube20 | 95 % |
+| cylinder | 92 % |
+| thinwalls | 87 % |
+| small | 91 % |
+| overhangs | 77 % |
 | bridge | 71 % |
-| calicat | 68 % |
-| steps | 68 % |
-| ksr_fdmtest_v4 | 63 % |
-| large | 57 % |
-| 3DBenchy | 53 % |
-| OrcaCube_v2 | 47 % |
-| Voron_Design_Cube_v7 | 47 % |
-| Stanford_Bunny | 7 % |
+| calicat | 70 % |
+| steps | 71 % |
+| ksr_fdmtest_v4 | 65 % |
+| large | 58 % |
+| 3DBenchy | 55 % |
+| OrcaCube_v2 | 49 % |
+| Voron_Design_Cube_v7 | 51 % |
+| Stanford_Bunny | 8 % |
 
 What the X2D does that the X1C does not: two nozzles put it on Orca's "traditional timelapse" path
 (the retract, lift, end of object label and picture come at the end of a layer, or before leaving
@@ -104,6 +104,12 @@ lines by row, starting seam polygons at the rear) matched one test model and bro
 - `rectilinear::crossing_lines` with `infill::crossing`: `fill_surface_by_multilines` and
   `make_fill_lines`, for grid, triangles, tri-hexagon, cubic, quarter cubic and lateral lattice.
   Checked against Orca on the cube: 100 % of each pattern's sparse lines, same volume.
+- `arachne`: `WallToolPaths` and `SkeletalTrapezoidation` (with its beading strategies, graph,
+  stitcher and grids), on `boostvoronoi`; used for narrow internal solid infill
+  (`FillConcentricInternal`). Orca's lists, hash-set and multimap orders are kept. Not ported: the
+  CGAL planarity test of the Voronoi repair. `FillConcentricInternal` leaves `min_length_factor`
+  and `is_top_or_bottom_layer` uninitialised in Orca; we use 0.5 and false. `small`'s narrow solid
+  infill now matches Orca's to 100 %.
 - `config::variants`: `update_values_to_printer_extruders`, one value per nozzle from the variants a
   profile lists.
 
@@ -135,7 +141,7 @@ On the cube that is 54 % of lines identical. Each difference is a profile value,
 
 | Difference | Cause | What it would take |
 |---|---|---|
-| MK4 and Voron walls, 30 to 34 % | Their profiles use Arachne. Ours uses the medial axis for the same job, so widths and vertices differ. | Port Arachne, a large job. |
+| MK4 and Voron walls, 30 to 34 % | Their profiles use Arachne walls. Arachne is ported (`arachne`) but walls do not use it yet. | Build walls from `arachne::wall_toolpaths` as `PerimeterGenerator::process_arachne` does. |
 | Arcs on curved walls | Orca fits arcs on the loop as generated, then splits at the seam. We fit after the seam, starting elsewhere, so breaks fall on other vertices. | Fit before placing the seam and carry arcs through `Path::rotate`. |
 | M73 progress lines | Orca places them from its own time estimate after slicing. Ours sit at layer starts. Every layer has some. | Port the post-processor's placement. |
 | Cooled speed, a few units off (F4641 vs F4644 on the cube) | Decided by total layer time, so it settles only when the toolpath does. Includes Orca's parser quirk, ported. | Follows from the rows above. |
@@ -160,7 +166,6 @@ These differ and the cause is not established.
 
 - Bridges 0 %, gap infill 0 %, prime tower 0 %.
 - Benchy internal solid and top surfaces under 1 %, where the cube reaches 96 and 100 %.
-- Narrow solid corners: Orca fills them with Arachne at variable width.
 - `calicat` and the Bunny come out one or two layers short of Orca.
 - Multi-colour flushing: Orca purges 64 to 82 mm per change, ours 45.6.
 - Config block: values are written unquoted, and vector options can have fewer entries than Orca's.

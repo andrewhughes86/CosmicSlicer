@@ -316,12 +316,24 @@ fn closest_point(ends: &mut [End], tree: &KdTree<'_>, reversible: &[bool], first
 /// The order to print pieces in, from `start`: (piece, reversed). `pieces` are each's first and
 /// last point, `reversible` which may print backwards. Every piece comes out once.
 pub fn chain(pieces: &[([f64; 2], [f64; 2])], reversible: &[bool], start: [f64; 2]) -> Vec<(usize, bool)> {
+    chain_from(pieces, reversible, Some(start))
+}
+
+/// `chain_points`: points in Orca's greedy order, starting wherever its links leave free.
+pub fn chain_points(points: &[[f64; 2]]) -> Vec<usize> {
+    let pieces: Vec<_> = points.iter().map(|p| (*p, *p)).collect();
+    chain_from(&pieces, &vec![true; points.len()], None).into_iter().map(|(i, _)| i).collect()
+}
+
+/// [`chain`], or with no `start` (Orca's null `start_near`) from the end its links leave.
+pub fn chain_from(pieces: &[([f64; 2], [f64; 2])], reversible: &[bool], start: Option<[f64; 2]>) -> Vec<(usize, bool)> {
     let n = pieces.len();
     let may_turn = |i: usize| reversible.get(i).copied().unwrap_or(false);
     if n == 0 {
         return Vec::new();
     }
     if n == 1 {
+        let Some(start) = start else { return vec![(0, false)] };
         let d = |p: [f64; 2]| (p[0] - start[0]).powi(2) + (p[1] - start[1]).powi(2);
         return vec![(0, may_turn(0) && d(pieces[0].1) < d(pieces[0].0))];
     }
@@ -334,12 +346,15 @@ pub fn chain(pieces: &[([f64; 2], [f64; 2])], reversible: &[bool], start: [f64; 
     let mut equivalent = Equivalent { last: 0, with: vec![0] };
     let in_order: Vec<(usize, bool)> = (0..n).map(|i| (i, false)).collect();
 
-    let first = tree.closest(start, &mut |idx| idx & 1 == 0 || turns[idx >> 1]);
-    if first == NPOS {
-        return in_order;
+    let mut first = NPOS;
+    if let Some(start) = start {
+        first = tree.closest(start, &mut |idx| idx & 1 == 0 || turns[idx >> 1]);
+        if first == NPOS {
+            return in_order;
+        }
+        ends[first].distance = 0.0;
+        ends[first].chain = equivalent.next();
     }
-    ends[first].distance = 0.0;
-    ends[first].chain = equivalent.next();
     for i in 0..ends.len() {
         if i != first {
             let next = tree.closest(ends[i].pos, &mut |idx| idx != first && (idx ^ i) > 1);
@@ -397,6 +412,12 @@ pub fn chain(pieces: &[([f64; 2], [f64; 2])], reversible: &[bool], start: [f64; 
             ends[one].chain = id;
             ends[two].chain = id;
             if left == 0 {
+                if first == NPOS {
+                    let Some(top) = queue.top() else { return in_order };
+                    first = top;
+                    queue.pop(&mut ends);
+                    ends[first].edge_out = NPOS;
+                }
                 let Some(last) = queue.top() else { return in_order };
                 ends[last].edge_out = NPOS;
                 queue.pop(&mut ends);
@@ -452,6 +473,18 @@ mod tests {
 
     fn line(x: f64) -> ([f64; 2], [f64; 2]) {
         ([x, 0.0], [x, 10.0])
+    }
+
+    #[test]
+    fn points_chain_without_a_start() {
+        let order = chain_points(&[[0.0, 0.0], [10.0, 0.0], [1.0, 0.0], [11.0, 0.0]]);
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, [0, 1, 2, 3]);
+        // Neighbours stay neighbours.
+        let at = |i: usize| order.iter().position(|o| *o == i).unwrap_or(9);
+        assert_eq!(at(0).abs_diff(at(2)), 1);
+        assert_eq!(at(1).abs_diff(at(3)), 1);
     }
 
     #[test]

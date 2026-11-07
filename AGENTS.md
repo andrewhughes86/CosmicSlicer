@@ -42,6 +42,8 @@ OrcaSlicer's crashes are the reason this exists.
   estimate; the engine tests check that our own G-code reads back with the same time and
   filament. Travel inside an island uses `travel::Region` (no retraction needed inside;
   routed round walls with "Avoid crossing walls").
+- `arachne` is Orca's Arachne (variable-width lines from the Voronoi diagram), used for narrow
+  internal solid infill; keep its orders (lists, dense sets, multimap cells) as Orca's.
 - Walls: `walls` makes the loops; narrow parts and gaps go through `medial` (centre lines with
   widths, split into constant-width `Path`s). `overhang` marks each wall segment's overhang
   degree in `Path::overhang` (kept through `Path::rotate` / `Path::reverse`); the G-code writer

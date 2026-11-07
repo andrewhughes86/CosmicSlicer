@@ -209,6 +209,130 @@ fn paths_of(lines: Vec<infill::Line>, role: Role, width: f64, speed: f64, flow: 
         .collect()
 }
 
+/// `FillConcentricInternal::fill_surface_extrusion`: a narrow solid region (less its overlap
+/// into the walls) filled by Arachne with lines of varying width, loops started nearest the
+/// origin and cut short by the seam gap, printed in the order Orca's shortest traverse gives.
+fn concentric_internal(
+    part: &Shape,
+    no_overlap: &[Shape],
+    s: &Settings,
+    width: f64,
+    h: f64,
+    speed: f64,
+    flow: f64,
+) -> Vec<Path> {
+    use crate::arachne;
+    let nm = 1.0e-6;
+    let spacing = f64::from(walls::flow_spacing(width as f32, h as f32));
+    let min_spacing = (spacing / nm) as i64;
+    if min_spacing <= 0 {
+        return Vec::new();
+    }
+    let areas = if no_overlap.is_empty() {
+        vec![part.clone()]
+    } else {
+        // `intersection_ex(no_overlap, {expoly})`.
+        geom::boolean(no_overlap, std::slice::from_ref(part), Op::Intersect)
+    };
+    let params = arachne::Params::concentric_internal(s.nozzle);
+    let clip = (s.seams.gap / nm) as i64;
+    let mut thick: Vec<(Vec<crate::clipper::Pt>, Vec<i64>)> = Vec::new();
+    for area in &areas {
+        let polygons = geom::shape_paths(std::slice::from_ref(area));
+        let Some(contour) = polygons.first() else { continue };
+        let (mut lo, mut hi) =
+            (crate::clipper::Pt::new(i64::MAX, i64::MAX), crate::clipper::Pt::new(i64::MIN, i64::MIN));
+        for q in contour {
+            lo = crate::clipper::Pt::new(lo.x.min(q.x), lo.y.min(q.y));
+            hi = crate::clipper::Pt::new(hi.x.max(q.x), hi.y.max(q.y));
+        }
+        let loops = ((hi.x - lo.x).max(hi.y - lo.y) / min_spacing + 1).clamp(1, 10_000) as usize;
+        let first = thick.len();
+        for line in arachne::wall_toolpaths(&polygons, min_spacing, min_spacing, loops, 0, h, &params).iter().flatten()
+        {
+            if line.junctions.len() < 2 {
+                continue;
+            }
+            let mut points: Vec<crate::clipper::Pt> = line.junctions.iter().map(|j| j.p).collect();
+            let mut widths: Vec<i64> = Vec::with_capacity(2 * points.len());
+            for k in 1..line.junctions.len() {
+                widths.push(line.junctions.get(k - 1).map_or(0, |j| j.w));
+                widths.push(line.junctions.get(k).map_or(0, |j| j.w));
+            }
+            if line.is_closed && points.first() == points.last() && widths.first() == widths.last() {
+                points.pop();
+                // Started at the point nearest Orca's `last_pos`, which stays at the origin.
+                let nearest = points
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, q)| (q.x as i128) * (q.x as i128) + (q.y as i128) * (q.y as i128))
+                    .map_or(0, |(k, _)| k);
+                points.rotate_left(nearest);
+                if 2 * nearest <= widths.len() {
+                    widths.rotate_left(2 * nearest);
+                }
+                if let Some(&f) = points.first() {
+                    points.push(f);
+                }
+            }
+            thick.push((points, widths));
+        }
+        for t in thick.iter_mut().skip(first) {
+            clip_end(&mut t.0, clip as f64);
+        }
+        let mut k = first;
+        while k < thick.len() {
+            if thick.get(k).is_some_and(|t| t.0.len() < 2) {
+                thick.remove(k);
+            } else {
+                k += 1;
+            }
+        }
+        let starts: Vec<[f64; 2]> =
+            thick.iter().skip(first).map(|t| t.0.first().map_or([0.0; 2], |q| [q.x as f64, q.y as f64])).collect();
+        let order = crate::chain::chain_points(&starts);
+        let mut taken: Vec<Option<(Vec<crate::clipper::Pt>, Vec<i64>)>> = thick.drain(first..).map(Some).collect();
+        for i in order {
+            if let Some(t) = taken.get_mut(i).and_then(Option::take) {
+                thick.push(t);
+            }
+        }
+    }
+    let lines: Vec<crate::medial::Thick> = thick
+        .into_iter()
+        .map(|(points, widths)| {
+            let n = points.len();
+            crate::medial::Thick {
+                points: points.iter().map(|q| glam::DVec2::new(q.x as f64 * nm, q.y as f64 * nm)).collect(),
+                width: widths.iter().take(2 * n.saturating_sub(1)).map(|w| *w as f64 * nm).collect(),
+                ends: (true, true),
+            }
+        })
+        .collect();
+    let group = Path::new_group();
+    let mut out = crate::medial::variable_width(&lines, Role::SolidInfill, speed, flow, h);
+    for p in &mut out {
+        p.group = group;
+    }
+    out
+}
+
+/// `Polyline::clip_end`: `distance` off the end, in Orca's units.
+fn clip_end(points: &mut Vec<crate::clipper::Pt>, mut distance: f64) {
+    while distance > 0.0 {
+        let Some(last) = points.pop() else { return };
+        let Some(&prev) = points.last() else { return };
+        let v = ((prev.x - last.x) as f64, (prev.y - last.y) as f64);
+        let lsqr = v.0 * v.0 + v.1 * v.1;
+        if lsqr > distance * distance {
+            let k = distance / lsqr.sqrt();
+            points.push(crate::clipper::Pt::new((last.x as f64 + v.0 * k) as i64, (last.y as f64 + v.1 * k) as i64));
+            return;
+        }
+        distance -= lsqr.sqrt();
+    }
+}
+
 /// Fills each region of `area` on its own, as OrcaSlicer does: each gets its own line spacing
 /// and width.
 fn solid_paths(area: &[Shape], kind: Kind, p: &Params, role: Role, speed: f64, flow: f64) -> Vec<Path> {
@@ -593,6 +717,9 @@ struct Around<'a> {
     combined: Option<&'a Combined>,
     /// The object's last layer with anything on it.
     topmost: bool,
+    /// The island's infill area without the overlap into its walls (Orca's
+    /// `fill_no_overlap_expolygons`).
+    no_overlap: &'a [Shape],
 }
 
 /// The islands of one object on every layer.
@@ -748,6 +875,7 @@ pub fn object(
                 lightning: lightning.as_ref().and_then(|l| l.get(i)),
                 combined: combined.get(i),
                 topmost: i == topmost,
+                no_overlap: &[],
             };
             let overhangs = match below {
                 Some(below) if s.walls.detect_overhang => {
@@ -785,6 +913,7 @@ pub fn object(
                         extruder: None,
                         pressure_advance: None,
                     };
+                    let around = Around { no_overlap: &w.walled.inner_edge, ..around.clone() };
                     for p in &w.pieces {
                         match p.settings.as_deref() {
                             None => fills(&mut out.fills, &p.regions, &p.area, s, &around),
@@ -1093,13 +1222,9 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
         solid_speed,
         inf.solid_flow,
     ));
-    out.extend(paths_of(
-        infill::fill_with(&narrow, Kind::Concentric, &solid_params(solid_w, 1.0)),
-        Role::SolidInfill,
-        solid_w,
-        solid_speed,
-        inf.solid_flow,
-    ));
+    for part in &narrow {
+        out.extend(concentric_internal(part, at.no_overlap, s, solid_w, h, solid_speed, inf.solid_flow));
+    }
     out.extend(gaps);
     match sparse_left {
         Some(sparse) => {

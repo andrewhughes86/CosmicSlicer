@@ -11,6 +11,7 @@
 
 #![allow(non_snake_case)]
 
+pub mod arachne;
 pub mod arcs;
 pub mod calib;
 pub mod chain;
