@@ -1073,7 +1073,21 @@ impl<'a> Writer<'a> {
         let speed = speed.max(1.0);
         let e_per_mm = area / fil.area() * fil.flow_ratio;
         self.last_speed = speed;
-        let fit = !first.scarf
+        // Orca's overhang speeds: a wall whose speed varies anywhere along it (by over a millimetre
+        // a second) goes out point by point, all of it in lines (`variable_speed`).
+        let varies = path.role.is_wall()
+            && s.walls.overhang_speed
+            && self.layer > 0
+            && (0..path.overhang.len()).any(|i| {
+                let h = path.hang_at(i);
+                crate::toolpath::degree_of(h) > 0
+                    && (overhang_speed(f64::from(h) / 100.0, path.speed, &s.walls.overhang_speeds, s.speeds.bridge)
+                        - path.speed)
+                        .abs()
+                        > 1.0
+            });
+        let fit = !varies
+            && !first.scarf
             && run.iter().all(|st| st.dz == 0.0)
             && match s.motion.arc_fitting {
                 ArcFitting::All => true,
@@ -1085,7 +1099,9 @@ impl<'a> Writer<'a> {
         pts.push(from);
         pts.extend(run.iter().map(|st| st.to));
         // Each step's own height and flow (a scarf's), else straight or fitted arcs.
-        let pieces: Vec<(Piece, f64, f64)> = if path.fitted && run.iter().all(|st| st.dz == 0.0) {
+        let pieces: Vec<(Piece, f64, f64)> = if varies {
+            run.iter().map(|st| (Piece::Line(st.to), st.dz, st.flow)).collect()
+        } else if path.fitted && run.iter().all(|st| st.dz == 0.0) {
             // Neighbouring steps on one arc print as that arc.
             let mut out: Vec<(Piece, f64, f64)> = Vec::with_capacity(run.len());
             let mut last_id = None;

@@ -24,8 +24,8 @@ the X1C, MK4 and Voron table further down was taken before this stretch's work (
 | steps | 71 % |
 | ksr_fdmtest_v4 | 65 % |
 | large | 58 % |
-| 3DBenchy | 55 % |
-| OrcaCube_v2 | 49 % |
+| 3DBenchy | 57 % |
+| OrcaCube_v2 | 51 % |
 | Voron_Design_Cube_v7 | 51 % |
 | Stanford_Bunny | 8 % |
 
@@ -142,7 +142,7 @@ On the cube that is 54 % of lines identical. Each difference is a profile value,
 | Difference | Cause | What it would take |
 |---|---|---|
 | MK4 and Voron walls, 30 to 34 % | Their profiles use Arachne walls. Arachne is ported (`arachne`) but walls do not use it yet. | Build walls from `arachne::wall_toolpaths` as `PerimeterGenerator::process_arachne` does. |
-| Arcs on curved walls | Orca fits arcs on the loop as generated, then splits at the seam. We fit after the seam, starting elsewhere, so breaks fall on other vertices. | Fit before placing the seam and carry arcs through `Path::rotate`. |
+| Walls with overhang speeds | Orca's `ExtrusionProcessor` splits a slowed wall where its overlap with the layer below changes and writes it all in lines; we split at our own per-segment marks. Walls whose speed varies at all are lines in both. | Port `ExtrusionProcessor::estimate_extrusion_quality`. |
 | M73 progress lines | Orca places them from its own time estimate after slicing. Ours sit at layer starts. Every layer has some. | Port the post-processor's placement. |
 | Cooled speed, a few units off (F4641 vs F4644 on the cube) | Decided by total layer time, so it settles only when the toolpath does. Includes Orca's parser quirk, ported. | Follows from the rows above. |
 | Time and filament totals | Orca's estimator also counts heating and loading; `filament used` includes the start purge. | Port `GCodeProcessor` accounting. |
