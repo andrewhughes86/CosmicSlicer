@@ -1487,7 +1487,7 @@ impl<'a> Writer<'a> {
         let m = &cx.settings.motion;
         for (o, islands) in &plan.objects {
             let own = cx.object_extruder.get(*o).copied().unwrap_or(0);
-            let mut remaining: Vec<&Island> =
+            let remaining: Vec<&Island> =
                 islands.iter().filter(|isl| isl.extruder.unwrap_or(own).min(n_ext - 1) == e).collect();
             if remaining.is_empty() {
                 continue;
@@ -1506,26 +1506,16 @@ impl<'a> Writer<'a> {
             } else if labels && matches!(m.flavor, Flavor::Marlin | Flavor::Marlin2) {
                 self.label_start = Some(format!("M486 S{o}"));
             }
-            while !remaining.is_empty() {
-                let here = self.pos.truncate();
-                let next = remaining
-                    .iter()
-                    .enumerate()
-                    .map(|(i, isl)| {
-                        let d = isl
-                            .walls
-                            .first()
-                            .and_then(|ws| ws.first())
-                            .or_else(|| isl.fills.first())
-                            .map_or(f64::INFINITY, |p| {
-                                p.points.iter().map(|q| q.distance_squared(here)).fold(f64::INFINITY, f64::min)
-                            });
-                        (i, d)
-                    })
-                    .min_by(|a, b| a.1.total_cmp(&b.1))
-                    .map_or(0, |x| x.0);
-                let island = remaining.swap_remove(next);
-                self.island(island, *o);
+            // Orca prints a layer's islands in `lslices` order: `Layer::make_slices` chains them
+            // by their outlines' first points, from no start (`chain_points`).
+            let starts: Vec<[f64; 2]> = remaining
+                .iter()
+                .map(|isl| isl.outline.first().and_then(|c| c.first()).map_or([0.0; 2], |p| nm_point(*p)))
+                .collect();
+            for k in crate::chain::chain_points(&starts) {
+                if let Some(island) = remaining.get(k) {
+                    self.island(island, *o);
+                }
             }
             if cx.settings.label_objects {
                 self.line(format!("; stop printing object {name} id:{o} copy 0"));
