@@ -354,7 +354,7 @@ fn object_seams(
 /// OrcaSlicer's size compensation: outlines and holes grown or shrunk on every layer, and the
 /// first layers drawn in against elephant's foot (on the plate only, not on a raft), the most
 /// at the bottom, less on each layer above. Parts too thin to lose that much keep their size.
-fn compensate(slices: &mut [Vec<Shape>], s: &Settings) {
+fn compensate(slices: &mut [Vec<Shape>], s: &mut Settings) {
     if s.xy_contour != 0.0 || s.xy_hole != 0.0 {
         for layer in slices.iter_mut() {
             let mut out: Vec<Shape> = Vec::new();
@@ -381,6 +381,7 @@ fn compensate(slices: &mut [Vec<Shape>], s: &Settings) {
     if s.elephant_foot > 0.0 && s.raft.layers == 0 {
         let n = s.elephant_layers.max(1);
         let w = s.widths.outer;
+        s.uncompensated = slices.iter().take(n).cloned().collect();
         for (k, layer) in slices.iter_mut().enumerate().take(n) {
             let c = s.elephant_foot * (1.0 - k as f64 / n as f64);
             if c <= 0.0 || layer.is_empty() {
@@ -519,7 +520,7 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
             let heights: Vec<f64> = layers.iter().map(|l| l.height).collect();
             overhang::make_printable(&mut slices, &heights, angle);
         }
-        compensate(&mut slices, &os);
+        compensate(&mut slices, &mut os);
         let mut islands = if o.color_paint.is_empty() {
             plan::object(&slices, &layers, &os, &regions, &cancelled)
         } else {
@@ -1279,7 +1280,7 @@ mod tests {
         c.set("elefant_foot_compensation", "0.2");
         c.set("elefant_foot_compensation_layers", "2");
         c.set("xy_hole_compensation", "0.1");
-        let s = Settings::read(Schema::get(), &c);
+        let mut s = Settings::read(Schema::get(), &c);
         // A 10 mm square with a 4 mm hole, and a 0.3 mm fin beside it.
         let mut sq = geom::rectangle(glam::DVec2::ZERO, glam::DVec2::splat(10.0));
         let mut hole = geom::rectangle(glam::DVec2::splat(3.0), glam::DVec2::splat(7.0)).remove(0);
@@ -1288,7 +1289,7 @@ mod tests {
         let fin = geom::rectangle(glam::DVec2::new(12.0, 0.0), glam::DVec2::new(12.3, 10.0));
         let layer = vec![sq, fin];
         let mut slices = vec![layer.clone(), layer.clone(), layer.clone()];
-        compensate(&mut slices, &s);
+        compensate(&mut slices, &mut s);
         let area = |l: &[Shape]| geom::area(l);
         // The hole grows by 0.1 all round on every layer: 4.2² instead of 4².
         let plain = 100.0 - 4.2 * 4.2 + 3.0;

@@ -665,7 +665,7 @@ pub fn medial_axis(shape: &Shape, min: f64, max: f64) -> Option<Vec<Thick>> {
 /// each at the average of its stretch and widened back from spacing to extrusion width.
 pub fn variable_width(lines: &[Thick], role: Role, speed: f64, flow: f64, height: f64) -> Vec<Path> {
     const TOLERANCE: f64 = 0.05;
-    let extra = height * (1.0 - std::f64::consts::FRAC_PI_4);
+    let extra_f32 = (1.0 - 0.25 * std::f64::consts::PI) as f32;
     let mut out = Vec::new();
     for thick in lines {
         // (from, to, width at from, width at to)
@@ -694,7 +694,9 @@ pub fn variable_width(lines: &[Thick], role: Role, speed: f64, flow: f64, height
             let mut points: Vec<DVec2> = run.iter().map(|s| s.0).collect();
             points.push(last.1);
             let _ = first;
-            paths.push(Path::new(role, points, false, sum / length + extra, speed, flow));
+            // `flow.with_width(unscale<float>(w) + height * float(1 - π/4))`, in Orca's floats.
+            let width = f64::from(((sum / length) / 1.0e-6) as f32 * 1.0e-6f32 + height as f32 * extra_f32);
+            paths.push(Path::new(role, points, false, width, speed, flow));
         };
         let (mut start, mut i) = (0usize, 0usize);
         let (mut max_w, mut min_w) = segs.first().map_or((0.0, 0.0), |s| (s.2, s.2));

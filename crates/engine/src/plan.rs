@@ -864,8 +864,9 @@ pub fn object(
                 return Vec::new();
             }
             let (Some(layer_walled), Some(layer)) = (walled.get(i), layers.get(i)) else { return Vec::new() };
+            let uncompensated = &s.uncompensated;
             let s = regions.get(i).and_then(|r| r.base.as_deref()).unwrap_or(s);
-            let below = i.checked_sub(1).and_then(|b| slices.get(b));
+            let below = i.checked_sub(1).and_then(|b| uncompensated.get(b).or(slices.get(b)));
             let around = Around {
                 i,
                 origin,

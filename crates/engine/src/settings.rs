@@ -67,6 +67,9 @@ pub struct Settings {
     /// A Bambu Lab printer: OrcaSlicer writes those files' comments its own way.
     pub bbl: bool,
     /// The object's centre on the plate, once placed: what fill patterns are measured from.
+    /// The first layers' outlines before elephant's foot compensation: Orca keeps these as
+    /// their `lslices`, which the layer above measures its overhangs against.
+    pub uncompensated: Vec<Vec<crate::geom::Shape>>,
     pub origin: Option<glam::DVec2>,
     /// A bed-slinger (OrcaSlicer's "i3" structure): timelapse pictures differ.
     pub i3: bool,
@@ -1320,6 +1323,7 @@ impl Settings {
             seams,
             bbl: r.text("printer_model").starts_with("Bambu"),
             origin: None,
+            uncompensated: Vec::new(),
             i3: r.text("printer_structure") == "i3",
             label_objects: r.flag("gcode_label_objects"),
             xy_contour: r.range("xy_contour_compensation", 0.0, -10.0, 10.0),
