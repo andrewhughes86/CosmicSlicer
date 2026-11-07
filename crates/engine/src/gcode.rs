@@ -1410,6 +1410,22 @@ impl<'a> Writer<'a> {
         }
     }
 
+    /// A brim as Orca prints its collection: loops chained from here by their first points
+    /// (`chained_path_from`), each split where the head is nearest it (`ExtrusionLoop::split_at`).
+    fn print_brim(&mut self, paths: Vec<Path>) {
+        if paths.is_empty() {
+            return;
+        }
+        let ends: Vec<_> = paths.iter().map(|p| (end_point(p, true), end_point(p, true))).collect();
+        let order = crate::chain::chain(&ends, &vec![true; paths.len()], nm_point(self.pos.truncate()));
+        let mut paths: Vec<Option<Path>> = paths.into_iter().map(Some).collect();
+        for (i, _) in order {
+            let Some(mut p) = paths.get_mut(i).and_then(Option::take) else { continue };
+            split_loop_at(&mut p, self.pos.truncate());
+            self.extrude(&p);
+        }
+    }
+
     fn print_nearest(&mut self, paths: Vec<Path>, object: Option<usize>, depth: Option<usize>) {
         let mut groups: Vec<Vec<Path>> = Vec::new();
         let mut free: Vec<Path> = Vec::with_capacity(paths.len());
@@ -1868,6 +1884,45 @@ fn overhang_points(
         out.push(next);
     }
     out
+}
+
+/// `ExtrusionLoop::split_at` without overhang preference: the loop starts at the point of it
+/// nearest `here`, snapped to a vertex within `SCALED_EPSILON`.
+fn split_loop_at(path: &mut Path, here: DVec2) {
+    let n = path.points.len();
+    if n < 2 {
+        return;
+    }
+    let mut best = (f64::INFINITY, 0usize, here);
+    for i in 0..n {
+        let (Some(&a), Some(&b)) = (path.points.get(i), path.points.get((i + 1) % n)) else { continue };
+        let ab = b - a;
+        let l2 = ab.length_squared();
+        let t = if l2 > 0.0 { ((here - a).dot(ab) / l2).clamp(0.0, 1.0) } else { 0.0 };
+        let q = a + ab * t;
+        let d = q.distance_squared(here);
+        if d < best.0 {
+            best = (d, i, q);
+        }
+    }
+    let (_, i, q) = best;
+    let (Some(&a), Some(&b)) = (path.points.get(i), path.points.get((i + 1) % n)) else { return };
+    let eps = 1.0e-4;
+    let (da, db) = (here.distance_squared(a), here.distance_squared(b));
+    let q = if da < db && da < eps * eps {
+        a
+    } else if db <= da && db < eps * eps {
+        b
+    } else {
+        q
+    };
+    if q == a {
+        path.rotate(i);
+    } else if q == b {
+        path.rotate((i + 1) % n);
+    } else {
+        path.start_on_segment(i, q);
+    }
 }
 
 /// One move of a path as printed: to `to`, `dz` below the layer, at `flow` of the full bead.
@@ -2524,7 +2579,10 @@ pub fn emit(plans: &[LayerPlan], cx: &Context<'_>) -> Output {
 
         // Skirt and brim, then support and the objects grouped by filament.
         if !plan.skirt.is_empty() {
-            w.print_nearest(plan.skirt.clone(), None, None);
+            let (brim, skirt): (Vec<Path>, Vec<Path>) =
+                plan.skirt.iter().cloned().partition(|p| p.role == Role::Brim && p.closed && p.fitted);
+            w.print_nearest(skirt, None, None);
+            w.print_brim(brim);
         }
         let steps = layer_steps(plan, cx, n_ext, w.extruder);
         for (part, e) in steps {

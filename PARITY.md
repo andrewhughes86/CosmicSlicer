@@ -113,6 +113,11 @@ lines by row, starting seam polygons at the rear) matched one test model and bro
 - `gcode::overhang_speeds` with `overhang::Boundary`: `ExtrusionQualityEstimator` (points'
   signed distances past the layer below, its added points, speed sections) and `_extrude`'s
   variable-speed writing. The distance search stops at 20 mm; curled-edge slowdown is not ported.
+- `skirt::orca_brims`: `outer_inner_brim_area` and `makeBrimInfill` for outer, inner and auto
+  brims (bands per island less every island and hole edge, kept only where they touch, loops from
+  `tryExPolygonOffset` through `union_pt_chained_outside_in`), printed as Orca's collection: chained
+  by first points, each loop split nearest the head, at the first layer's infill speed. Brim ears
+  and painted brims keep our own. The brim's bed-edge clearance is not applied.
 - `config::variants`: `update_values_to_printer_extruders`, one value per nozzle from the variants a
   profile lists.
 

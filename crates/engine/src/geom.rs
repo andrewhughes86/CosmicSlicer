@@ -339,6 +339,33 @@ pub fn union_paths(paths: &[Path]) -> Vec<Shape> {
     guarded(|| Ok(to_shapes(&clip_tree(ClipType::Union, paths, &[], FillType::NonZero)?)))
 }
 
+/// `union_pt_chained_outside_in`: the loops' even-odd union, outermost first, each level
+/// chained by its first points, holes turned counter-clockwise.
+pub fn chained_outside_in(paths: &[Path]) -> Paths {
+    fn walk(tree: &PolyTree, nodes: &[usize], depth: usize, out: &mut Paths) {
+        if depth > 10_000 {
+            return;
+        }
+        let starts: Vec<[f64; 2]> = nodes
+            .iter()
+            .map(|n| tree.nodes.get(*n).and_then(|x| x.contour.first()).map_or([0.0; 2], |p| [p.x as f64, p.y as f64]))
+            .collect();
+        for k in crate::chain::chain_points(&starts) {
+            let Some(node) = nodes.get(k).and_then(|n| tree.nodes.get(*n)) else { continue };
+            let mut c = node.contour.clone();
+            if depth % 2 == 1 {
+                c.reverse();
+            }
+            out.push(c);
+            walk(tree, &node.children, depth + 1, out);
+        }
+    }
+    let tree = guarded(|| union_tree(paths, FillType::EvenOdd));
+    let mut out = Vec::new();
+    walk(&tree, &tree.children, 0, &mut out);
+    out
+}
+
 /// All the shapes' contours in Clipper's units, outers before their holes.
 pub fn shape_paths(shapes: &[Shape]) -> Paths {
     to_paths(shapes)

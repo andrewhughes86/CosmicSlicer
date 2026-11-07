@@ -548,6 +548,11 @@ fn slice_inner(job: &Job, progress: &Progress) -> Result<Sliced, SliceError> {
         if enforced && !os.support.enabled {
             warnings.push(format!("\"{}\" has support enforcers, but support is turned off", o.name));
         }
+        // From here on (brim, skirt, support) the layers are Orca's `lslices`: the first ones as
+        // they were before elephant's foot compensation.
+        for (layer, original) in slices.iter_mut().zip(&os.uncompensated) {
+            *layer = original.clone();
+        }
         object_slices.push(slices);
         object_plans.push(islands);
         object_settings.push(os);

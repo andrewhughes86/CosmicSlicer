@@ -52,6 +52,11 @@ fn second_moments(shapes: &[Shape]) -> Option<(f64, f64)> {
 /// footprint is in its weakest direction, how fast it prints and how well the filament holds;
 /// none under 5 mm, at most 18 mm, in whole pairs of brim lines.
 fn auto_brim_width(footprint: &[Shape], height: f64, max_speed: f64, material_kind: &str, spacing: f64) -> f64 {
+    pairs(auto_brim_raw(footprint, height, max_speed, material_kind), spacing)
+}
+
+/// `configBrimWidthByVolumeGroups`, before rounding to pairs of lines.
+fn auto_brim_raw(footprint: &[Shape], height: f64, max_speed: f64, material_kind: &str) -> f64 {
     let Some((lo, hi)) = geom::bounds(footprint) else { return 0.0 };
     let Some((ixx, iyy)) = second_moments(footprint) else { return 0.0 };
     let (adhesion, reference) = material(material_kind);
@@ -63,7 +68,7 @@ fn auto_brim_width(footprint: &[Shape], height: f64, max_speed: f64, material_ki
     if w < 5.0 && w < 1.5 * thermal {
         w = 0.0;
     }
-    pairs(w.min(18.0), spacing)
+    w.min(18.0)
 }
 
 /// `w` rounded down to whole pairs of lines `spacing` apart.
@@ -86,9 +91,12 @@ pub struct BrimObject<'a> {
 /// Every object's brim, each by its own settings and kept off the other objects, and the area
 /// the brims cover.
 pub fn brims(objects: &[BrimObject]) -> (Vec<Path>, Vec<Shape>) {
-    let mut paths = Vec::new();
-    let mut covered = Vec::new();
+    let ported = |t: &str| matches!(t, "outer_only" | "inner_only" | "outer_and_inner" | "auto_brim");
+    let (mut paths, mut covered) = orca_brims(objects, &ported);
     for (k, o) in objects.iter().enumerate() {
+        if ported(o.settings.brim_type.as_str()) {
+            continue;
+        }
         let (mut p, area) = if o.settings.brim_type == "painted" {
             painted_brim(o.footprint, o.settings, o.ears)
         } else {
@@ -112,6 +120,156 @@ pub fn brims(objects: &[BrimObject]) -> (Vec<Path>, Vec<Shape>) {
         covered.extend(area);
     }
     (paths, geom::union(&covered))
+}
+
+/// The brim flow's spacing: `print.brim_flow()`, the first layer's line.
+fn brim_spacing(s: &Settings) -> f64 {
+    f64::from(crate::walls::flow_spacing(s.widths.first_layer as f32, s.first_layer_height as f32))
+}
+
+/// Orca's `outer_inner_brim_area` and `makeBrimInfill` for the outer, inner and auto brims:
+/// each island's brim band, less every island and the holes' edges, kept only where it touches
+/// an island or another brim, then filled with loops from the outside in.
+fn orca_brims(objects: &[BrimObject], ported: &dyn Fn(&str) -> bool) -> (Vec<Path>, Vec<Shape>) {
+    let mut areas: Vec<Vec<Shape>> = vec![Vec::new(); objects.len()];
+    let mut no_brim: Vec<Shape> = Vec::new();
+    let mut islands: Vec<Shape> = Vec::new();
+    for (k, o) in objects.iter().enumerate() {
+        let s = o.settings;
+        let kind = s.brim_type.as_str();
+        let sp = brim_spacing(s);
+        if !ported(kind) || sp <= 0.0 {
+            continue;
+        }
+        let round_pairs = |w: f64| (w / sp / 2.0).floor() * sp * 2.0;
+        let auto = kind == "auto_brim";
+        let width = if auto {
+            let max_speed =
+                [s.speeds.inner, s.speeds.outer, s.speeds.sparse, s.speeds.solid, s.speeds.top, s.speeds.support]
+                    .into_iter()
+                    .fold(0.0, f64::max);
+            let max_speed = if max_speed > 0.0 { max_speed } else { 250.0 };
+            round_pairs(auto_brim_raw(o.footprint, o.height, max_speed, o.material))
+        } else {
+            round_pairs(s.brim_width)
+        };
+        let gap = s.brim_gap;
+        let outer = matches!(kind, "outer_only" | "outer_and_inner" | "auto_brim");
+        let inner = matches!(kind, "inner_only" | "outer_and_inner");
+        for sh in o.footprint {
+            let Some(contour) = sh.first() else { continue };
+            let contour_shape = vec![vec![contour.clone()]];
+            let holes: Vec<Shape> = sh
+                .iter()
+                .skip(1)
+                .map(|h| {
+                    let mut h = h.clone();
+                    h.reverse();
+                    vec![h]
+                })
+                .collect();
+            let mut w = width;
+            if w < 5.0 && auto && o.height > 10.0 {
+                let perimeter =
+                    geom::length(contour) + contour.first().zip(contour.last()).map_or(0.0, |(a, b)| a.distance(*b));
+                let ratio = if perimeter > 0.0 { geom::area(std::slice::from_ref(sh)) / perimeter } else { 0.0 };
+                if ratio < 1.1 && w < sp {
+                    w += round_pairs(5.0);
+                }
+            }
+            if auto && let Some((lo, hi)) = geom::bounds(&contour_shape) {
+                w = w.min((hi - lo).max_element());
+            }
+            let w = round_pairs(w);
+            if outer {
+                let inside = geom::offset(&contour_shape, gap, Join::Round);
+                let outside = geom::offset(&inside, w, Join::Round);
+                areas[k].extend(geom::boolean(&outside, &inside, Op::Difference));
+            }
+            if inner && !holes.is_empty() {
+                let deep = geom::offset(&holes, -width - gap, Join::Miter);
+                let edge = geom::offset(&holes, -gap, Join::Miter);
+                areas[k].extend(geom::boolean(&geom::boolean(&edge, &deep, Op::Difference), &holes, Op::Intersect));
+            }
+            if !inner && !holes.is_empty() {
+                no_brim.extend(geom::boolean(&holes, &geom::offset(&holes, -sp, Join::Miter), Op::Difference));
+            }
+            if !outer {
+                no_brim.extend(geom::boolean(&geom::offset(&contour_shape, sp, Join::Miter), &holes, Op::Difference));
+            }
+        }
+        let island = geom::offset(o.footprint, gap, Join::Round);
+        no_brim.extend(island.iter().cloned());
+        islands.extend(island);
+    }
+    let no_brim = geom::union(&no_brim);
+    for a in &mut areas {
+        if !a.is_empty() {
+            *a = geom::boolean(a, &no_brim, Op::Difference);
+        }
+    }
+    // A brim must touch an island or some other brim.
+    let mut kept: Vec<Vec<Shape>> = vec![Vec::new(); areas.len()];
+    for (k, a) in areas.iter().enumerate() {
+        let sp = objects.get(k).map_or(0.4, |o| brim_spacing(o.settings));
+        let others: Vec<Shape> =
+            areas.iter().enumerate().filter(|(j, _)| *j != k).flat_map(|(_, b)| b.iter().cloned()).collect();
+        for (i, piece) in a.iter().enumerate() {
+            let grown = geom::offset(std::slice::from_ref(piece), sp * 2.0, Join::Round);
+            let touches = |set: &[Shape]| !set.is_empty() && !geom::boolean(&grown, set, Op::Intersect).is_empty();
+            let siblings: Vec<Shape> = a.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, p)| p.clone()).collect();
+            if touches(&islands) || touches(&siblings) || touches(&others) {
+                kept[k].push(piece.clone());
+            }
+        }
+    }
+    let mut paths = Vec::new();
+    let mut covered = Vec::new();
+    for (k, area) in kept.iter().enumerate() {
+        let Some(o) = objects.get(k) else { continue };
+        if area.is_empty() {
+            continue;
+        }
+        let s = o.settings;
+        let sp = brim_spacing(s);
+        let simplify = |shapes: Vec<Shape>| -> Vec<Shape> {
+            shapes
+                .into_iter()
+                .map(|sh| sh.iter().map(|c| geom::simplify_loop(c, 0.0125)).filter(|c| c.len() >= 3).collect())
+                .collect()
+        };
+        let mut ex = geom::offset(&simplify(area.clone()), -0.5 * sp, Join::Round);
+        let mut loops: Vec<crate::clipper::Path> = Vec::new();
+        let mut guard = 0;
+        while !ex.is_empty() && guard < 1000 {
+            guard += 1;
+            ex = simplify(ex);
+            loops.extend(geom::shape_paths(&ex));
+            ex = simplify(geom::offset(&ex, -1.3 * sp, Join::Round));
+            ex = geom::offset(&ex, 0.3 * sp, Join::Round);
+        }
+        for c in geom::chained_outside_in(&loops) {
+            let points = geom::from_nm(&c);
+            if points.len() < 3 {
+                continue;
+            }
+            paths.push(Path {
+                role: Role::Brim,
+                points,
+                closed: true,
+                width: s.widths.first_layer,
+                speed: s.speeds.first_layer_infill,
+                flow: 1.0,
+                overhang: Vec::new(),
+                group: 0,
+                one_way: false,
+                bends: Vec::new(),
+                fitted: true,
+            });
+        }
+        covered.extend(area.iter().cloned());
+    }
+    (paths, covered)
 }
 
 /// `paths` with what crosses `others` cut away.
