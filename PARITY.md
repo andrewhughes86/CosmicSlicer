@@ -171,7 +171,10 @@ steps. What is left cannot be read from Orca's G-code; it needs a build of Orca 
 
 These differ and the cause is not established.
 
-- Bridges 0 %, gap infill 0 %, prime tower 0 %.
+- Bridges: each group's direction is now Orca's `detect_bridging_direction` against the layer
+  below. Benchy's second-layer bridges over the first layer's gaps still run across (we find no
+  floating edges there and use principal components; Orca finds some and runs them along).
+- Gap infill 0 %, prime tower 0 %.
 - Benchy internal solid and top surfaces under 1 %, where the cube reaches 96 and 100 %.
 - `calicat` and the Bunny come out one or two layers short of Orca.
 - Multi-colour flushing: Orca purges 64 to 82 mm per change, ours 45.6.

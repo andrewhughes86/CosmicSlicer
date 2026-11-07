@@ -797,7 +797,7 @@ pub fn object(
     if whole {
         let input: Vec<surfaces::Input> = (0..walled.len())
             .map(|i| surfaces::Input {
-                slices: slices.get(i).cloned().unwrap_or_default(),
+                slices: s.uncompensated.get(i).or(slices.get(i)).cloned().unwrap_or_default(),
                 fill: walled
                     .get(i)
                     .map(|l| l.iter().flat_map(|w| w.walled.infill_area.iter().cloned()).collect())

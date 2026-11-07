@@ -429,10 +429,11 @@ fn bridging_direction(floating: &[[DVec2; 2]], area: &[Shape]) -> DVec2 {
     best.1
 }
 
-/// The edges of `shape` away from `anchors`.
-fn floating_edges(shape: &Shape, anchors: &[Shape]) -> Vec<[DVec2; 2]> {
-    let rings: Vec<Polyline> = shape
+/// The edges of `shapes` away from `anchors`: `diff_pl(to_polylines(overhang), anchors)`.
+fn floating_edges_of(shapes: &[Shape], anchors: &[Shape]) -> Vec<[DVec2; 2]> {
+    let rings: Vec<Polyline> = shapes
         .iter()
+        .flatten()
         .map(|c| {
             let mut r = c.clone();
             r.extend(c.first().copied());
@@ -444,7 +445,7 @@ fn floating_edges(shape: &Shape, anchors: &[Shape]) -> Vec<[DVec2; 2]> {
 }
 
 /// `process_external_surfaces`: bridges, bottoms and tops grow into the fill round them.
-fn external(f: Fill, s: &Settings, first: bool, h: f64) -> Typed {
+fn external(f: Fill, s: &Settings, first: bool, h: f64, below: &[Shape]) -> Typed {
     let (outer, inner, solid_w) = widths(s, first);
     let (so, si) = (Settings::spacing(outer, h), Settings::spacing(inner, h));
     let (shell, least) =
@@ -460,27 +461,16 @@ fn external(f: Fill, s: &Settings, first: bool, h: f64) -> Typed {
     struct Grown {
         source: Shape,
         grown: Vec<Shape>,
-        angle: f64,
     }
     let mut bridges: Vec<Grown> = Vec::new();
     for b in geom::union(&bridge) {
         let one = std::slice::from_ref(&b);
         let (a, c, d) = (into_solid.into(one, &shells), into_sparse.into(one, &sparse), into_solid.into(one, &top));
-        // What it anchors on: the pieces of fill it touches.
-        let touching = |zone: &[Shape], wave: Wave| -> Vec<Shape> {
-            let seed = geom::offset(one, wave.tiny, Join::Miter);
-            zone.iter().filter(|z| !both(&seed, std::slice::from_ref(z)).is_empty()).cloned().collect()
-        };
-        let mut anchors = touching(&shells, into_solid);
-        anchors.extend(touching(&sparse, into_sparse));
-        anchors.extend(touching(&top, into_solid));
-        let dir = bridging_direction(&floating_edges(&b, &anchors), one);
-        let angle = std::f64::consts::PI + dir.y.atan2(dir.x);
         let mut grown = vec![b.clone()];
         grown.extend(a);
         grown.extend(c);
         grown.extend(d);
-        bridges.push(Grown { source: b, grown: geom::union(&grown), angle });
+        bridges.push(Grown { source: b, grown: geom::union(&grown) });
     }
     let mut group: Vec<usize> = (0..bridges.len()).collect();
     for i in 0..bridges.len() {
@@ -499,17 +489,25 @@ fn external(f: Fill, s: &Settings, first: bool, h: f64) -> Typed {
             continue;
         }
         let mut acc: Vec<Shape> = Vec::new();
+        let mut initial: Vec<Shape> = Vec::new();
         for (g, b) in group.iter().zip(&bridges) {
             if *g == head {
+                initial.push(b.source.clone());
                 acc.push(b.source.clone());
                 acc.extend_from_slice(&b.grown);
             }
         }
+        // `detect_bridging_direction(initial, lower_layer->lslices)`, over the group together.
+        let overhang = geom::boolean(&initial, below, Op::Difference);
+        let anchors = geom::offset(below, 1.0e-4, Join::Miter);
+        let floating = floating_edges_of(&overhang, &anchors);
+        let dir = bridging_direction(&floating, &overhang);
+        let angle = std::f64::consts::PI + dir.y.atan2(dir.x);
         let merged = closing(&geom::union(&acc), close_by);
         shells = diff(&shells, &merged);
         sparse = diff(&sparse, &merged);
         top = diff(&top, &merged);
-        out_bridges.push((merged, bridges.get(head).map_or(0.0, |b| b.angle)));
+        out_bridges.push((merged, angle));
     }
 
     let grow = |src: Vec<Shape>, shells: &mut Vec<Shape>, sparse: &mut Vec<Shape>| -> Vec<Shape> {
@@ -1022,7 +1020,10 @@ pub fn prepare(
         .into_par_iter()
         .zip(layers.par_iter())
         .enumerate()
-        .map(|(i, (f, l))| external(f, s, i == 0, l.height))
+        .map(|(i, (f, l))| {
+            let below = i.checked_sub(1).and_then(|b| layers.get(b)).map_or(&[][..], |b| b.slices.as_slice());
+            external(f, s, i == 0, l.height, below)
+        })
         .collect();
     if s.density > 0.0 && s.density < 0.999 {
         bridge_over_infill(&mut typed, layers, s, lines_below);
