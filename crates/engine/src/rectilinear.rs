@@ -81,7 +81,7 @@ fn align_to_grid(coord: i64, spacing: i64) -> i64 {
 }
 
 /// `MultiPoint::rotate`.
-fn rotate(points: &mut [Pt], angle: f64) {
+pub(crate) fn rotate(points: &mut [Pt], angle: f64) {
     let (s, c) = angle.sin_cos();
     for p in points {
         let (x, y) = (p.x as f64, p.y as f64);

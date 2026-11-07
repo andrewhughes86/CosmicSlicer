@@ -531,89 +531,221 @@ fn regions(pieces: Vec<Polyline>, a: f64, spacing: f64, phase: f64) -> Vec<Vec<P
 }
 
 /// Splits solid infill into what fills well with lines and the narrow rest, which fills better
-/// concentrically (OrcaSlicer's "detect narrow internal solid infill", after PrusaSlicer's
-/// anti-vibration filter): what stays after opening by two and three spacings, with runs of
-/// short lines at `angle` filtered out, fills with lines. `line_pattern` says the solid pattern
-/// is one of lines; others only lose what an opening removes. Returns (lines, narrow).
-pub fn split_narrow_solid(area: &[Shape], spacing: f64, angle: f64, line_pattern: bool) -> (Vec<Shape>, Vec<Shape>) {
-    if area.is_empty() || !(spacing > 0.0 && spacing.is_finite()) {
+/// concentrically: OrcaSlicer's `split_solid_surface` ("detect narrow internal solid infill",
+/// after PrusaSlicer's anti-vibration filter), in its integers. For line patterns, the lines
+/// (`angle` as the region sets it, `odd` turning them a quarter more) that stay after opening
+/// by two and three spacings, less runs of short ones, fill with lines; other patterns only
+/// lose what an opening by one spacing removes. `width` and `height` are the solid flow's,
+/// `origin` the object's centre Orca slices round. Returns (lines, narrow).
+pub fn split_narrow_solid(
+    area: &[Shape],
+    width: f64,
+    height: f64,
+    angle: f64,
+    odd: bool,
+    origin: DVec2,
+    kind: Kind,
+) -> (Vec<Shape>, Vec<Shape>) {
+    let spacing = f64::from(crate::walls::flow_spacing(width as f32, height as f32));
+    let sp = (spacing / 1e-6) as i64;
+    if area.is_empty() || !spacing.is_finite() || sp <= 0 {
         return (area.to_vec(), Vec::new());
     }
-    if !line_pattern {
-        // Other patterns: only the parts an opening removes are thin.
-        let core = geom::offset(&geom::offset(area, -spacing, Join::Miter), spacing, Join::Miter);
-        let core = geom::boolean(area, &core, geom::Op::Intersect);
-        let narrow = geom::boolean(area, &core, geom::Op::Difference);
-        return if narrow.is_empty() { (area.to_vec(), Vec::new()) } else { (core, narrow) };
+    let shift = |shapes: Vec<Shape>, by: DVec2| -> Vec<Shape> {
+        shapes.into_iter().map(|sh| sh.into_iter().map(|c| c.into_iter().map(|q| q + by).collect()).collect()).collect()
+    };
+    let moved = shift(area.to_vec(), -origin);
+    let lines = matches!(kind, Kind::Rectilinear { .. } | Kind::Monotonic | Kind::MonotonicLine);
+    let (normal, narrow) = if lines {
+        // `AlignedRectilinear` keeps one direction.
+        let odd = odd && !matches!(kind, Kind::Rectilinear { alternate: false });
+        split_lines(&moved, sp, angle, odd)
+    } else {
+        split_core(&moved, sp)
+    };
+    if narrow.is_empty() {
+        return (area.to_vec(), Vec::new());
     }
-    // Frame turned so the lines stand upright.
-    let (sin, cos) = (FRAC_PI_2 - angle).sin_cos();
-    let back = (-sin, cos);
-    let to = (sin, cos);
-    let turned_shape =
-        |sh: &Shape, by: (f64, f64)| -> Shape { sh.iter().map(|c| c.iter().map(|q| turn(*q, by)).collect()).collect() };
-    let mut normal_areas: Vec<Shape> = Vec::new();
+    (shift(normal, origin), shift(narrow, origin))
+}
+
+/// Patterns other than lines: the parts an opening by a spacing keeps fill as set.
+fn split_core(area: &[Shape], sp: i64) -> (Vec<Shape>, Vec<Shape>) {
+    let (mut normal, mut narrow) = (Vec::new(), Vec::new());
     for shape in area {
-        let filled = vec![turned_shape(shape, to)];
-        let Some((lo, hi)) = geom::bounds(&filled) else { continue };
-        let opened = geom::offset(&geom::offset(&filled, -2.0 * spacing, Join::Miter), 3.0 * spacing, Join::Miter);
-        let inner = geom::boolean(&filled, &opened, geom::Op::Intersect);
-        let inner = geom::offset(&inner, -spacing * 0.5, Join::Miter);
-        let walls: Vec<[DVec2; 2]> = inner
+        let filled = geom::paths_of(shape);
+        let opened = geom::offset_polygons(&geom::shrink_polygons(&filled, sp as f32), sp as f32);
+        let inner = geom::intersect_paths(&filled, &opened);
+        if inner.is_empty() {
+            narrow.push(shape.clone());
+            continue;
+        }
+        let inner = geom::union_paths(&inner);
+        let one = std::slice::from_ref(shape);
+        narrow.extend(geom::boolean(one, &inner, geom::Op::Difference));
+        normal.extend(geom::boolean(one, &inner, geom::Op::Intersect));
+    }
+    (normal, narrow)
+}
+
+/// Line patterns: Orca's sections of upright lines, filtered and traced round.
+fn split_lines(area: &[Shape], sp: i64, angle: f64, odd: bool) -> (Vec<Shape>, Vec<Shape>) {
+    // `params.angle + float(M_PI / 2.)` adds in floats; the odd layers' quarter in doubles.
+    let quarter = FRAC_PI_2 as f32;
+    let mut base = f64::from(angle as f32 + quarter);
+    if odd {
+        base += f64::from(quarter);
+    }
+    let aligning = -base + PI;
+    let mut normal_paths: Paths = Vec::new();
+    for shape in area {
+        let mut filled = geom::paths_of(shape);
+        filled.iter_mut().for_each(|p| crate::rectilinear::rotate(p, aligning));
+        let Some((lo, hi)) = path_bounds(&filled) else { continue };
+        let opened = geom::offset_polygons(&geom::shrink_polygons(&filled, (2 * sp) as f32), (3 * sp) as f32);
+        let inner = geom::intersect_paths(&filled, &opened);
+        let inner = geom::shrink_polygons(&inner, (sp as f64 * 0.5) as f32);
+        let walls: Vec<(Pt, Pt)> = inner
             .iter()
-            .flatten()
-            .flat_map(|c| (0..c.len()).filter_map(|i| Some([*c.get(i)?, *c.get((i + 1) % c.len())?])))
+            .flat_map(|c| (0..c.len()).filter_map(|i| Some((*c.get(i)?, *c.get((i + 1) % c.len())?))))
             .collect();
-        let rows = (((hi.x - lo.x) + spacing - 1e-6) / spacing).floor().clamp(0.0, 100_000.0) as usize;
+        let rows = ((hi.x - lo.x + sp - 1) / sp).clamp(0, 100_000) as usize;
         let mut sections: Vec<Vec<Section>> = Vec::with_capacity(rows);
         for row in 0..rows {
-            let x = lo.x + row as f64 * spacing;
-            let mut ys: Vec<f64> = walls
+            let x = (lo.x as f64 + row as f64 * sp as f64) as i64;
+            let (a, b) = (Pt::new(x, lo.y), Pt::new(x, hi.y));
+            let mut hits: Vec<(f64, Pt)> = walls
                 .iter()
-                .filter(|[a, b]| (a.x <= x) != (b.x <= x))
-                .map(|[a, b]| a.y + (x - a.x) / (b.x - a.x) * (b.y - a.y))
+                .filter_map(|&(c, d)| line_intersection(a, b, c, d))
+                .map(|p| {
+                    let (dx, dy) = ((p.x - a.x) as f64, (p.y - a.y) as f64);
+                    (dx * dx + dy * dy, p)
+                })
                 .collect();
-            ys.sort_by(f64::total_cmp);
+            hits.sort_by(|p, q| p.0.total_cmp(&q.0));
             let mut section = Vec::new();
-            for pair in ys.windows(2) {
-                let (a, b) = (pair[0], pair[1]);
-                if b - a > spacing && geom::contains(&inner, DVec2::new(x, (a + b) / 2.0)) {
-                    section.push(Section { x, low: a, high: b });
+            for pair in hits.windows(2) {
+                let [(_, p), (_, q)] = pair else { continue };
+                let mid = Pt::new((p.x + q.x) / 2, (p.y + q.y) / 2);
+                if outside(&walls, mid) < 0 && (p.y - q.y).abs() > sp {
+                    section.push(Section { x: p.x, low: p.y, high: q.y });
                 }
             }
             sections.push(section);
         }
         let kept = filter_vibrating_lines(&sections);
-        normal_areas.extend(trace_sections(&kept, spacing).into_iter().map(|c| turned_shape(&vec![c], back)));
-    }
-    let mut normal = geom::union(&normal_areas);
-    let mut narrow = geom::boolean(area, &normal, geom::Op::Difference);
-    // Areas under a line wide that touch the normal infill join it.
-    let mut joined = Vec::new();
-    narrow.retain(|piece| {
-        let one = std::slice::from_ref(piece);
-        let tiny = geom::offset(one, -spacing * 0.5, Join::Miter).is_empty();
-        let touches = tiny
-            && !geom::boolean(&geom::offset(one, spacing * 0.3, Join::Miter), &normal, geom::Op::Intersect).is_empty();
-        if touches {
-            joined.push(piece.clone());
+        for mut traced in trace_sections(&kept, sp) {
+            crate::rectilinear::rotate(&mut traced, -aligning);
+            normal_paths.push(traced);
         }
-        !touches
-    });
-    normal.extend(joined);
-    if narrow.is_empty() {
-        return (area.to_vec(), Vec::new());
     }
-    let normal = geom::boolean(&geom::offset(&normal, spacing * 0.5, Join::Miter), area, geom::Op::Intersect);
-    (normal, narrow)
+    // `union_safety_offset_ex`.
+    let mut normal = geom::expand_polygons(&normal_paths, 10.0);
+    let narrow = geom::boolean(area, &normal, geom::Op::Difference);
+    // Bits under a line wide that touch the normal infill join it.
+    let mut kept = Vec::new();
+    for piece in narrow {
+        let one = std::slice::from_ref(&piece);
+        if geom::offset_nm(one, (-sp as f64 * 0.5) as f32, Join::Miter).is_empty() {
+            let grown = geom::offset_nm(one, (sp as f64 * 0.3) as f32, Join::Miter);
+            if !geom::boolean(&normal, &grown, geom::Op::Intersect).is_empty() {
+                normal.push(piece);
+                continue;
+            }
+        }
+        kept.push(piece);
+    }
+    if kept.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let normal =
+        geom::boolean(&geom::offset_nm(&normal, (sp as f64 * 0.5) as f32, Join::Miter), area, geom::Op::Intersect);
+    (normal, kept)
+}
+
+/// `get_extents` of polygons.
+fn path_bounds(paths: &[Path]) -> Option<(Pt, Pt)> {
+    let mut it = paths.iter().flatten();
+    let first = *it.next()?;
+    Some(it.fold((first, first), |(lo, hi), p| {
+        (Pt::new(lo.x.min(p.x), lo.y.min(p.y)), Pt::new(hi.x.max(p.x), hi.y.max(p.y)))
+    }))
+}
+
+/// `line_alg::intersection` of `a`–`b` with `c`–`d`, the point truncated to integers.
+fn line_intersection(a: Pt, b: Pt, c: Pt, d: Pt) -> Option<Pt> {
+    let v1 = ((b.x - a.x) as f64, (b.y - a.y) as f64);
+    let v2 = ((d.x - c.x) as f64, (d.y - c.y) as f64);
+    let denom = v1.0 * v2.1 - v1.1 * v2.0;
+    if denom.abs() < 1e-4 {
+        return None;
+    }
+    let v12 = ((a.x - c.x) as f64, (a.y - c.y) as f64);
+    let t1 = (v2.0 * v12.1 - v2.1 * v12.0) / denom;
+    let t2 = (v1.0 * v12.1 - v1.1 * v12.0) / denom;
+    if (0.0..=1.0).contains(&t1) && (0.0..=1.0).contains(&t2) {
+        Some(Pt::new((a.x as f64 + t1 * v1.0) as i64, (a.y as f64 + t1 * v1.1) as i64))
+    } else {
+        None
+    }
+}
+
+/// `coordinate_aligned_ray_hit_count`: walls passed on each side of `p` along x (or y when
+/// `along_y`); `None` when `p` lies on one.
+fn ray_hits(walls: &[(Pt, Pt)], p: Pt, along_y: bool) -> Option<(i32, i32)> {
+    let (mut above, mut below) = (0, 0);
+    for &(a, b) in walls {
+        let ((pc, ac, bc), (po, ao, bo)) =
+            if along_y { ((p.y, a.y, b.y), (p.x, a.x, b.x)) } else { ((p.x, a.x, b.x), (p.y, a.y, b.y)) };
+        if po < ao.min(bo) || po >= ao.max(bo) {
+            continue;
+        }
+        if pc > ac.max(bc) {
+            above += 1;
+        } else if pc < ac.min(bc) {
+            below += 1;
+        } else {
+            let t = (po - ao) as f64 / (bo - ao) as f64;
+            let val = ac as f64 + t * (bc - ac) as f64;
+            let pc = pc as f64;
+            if pc > val {
+                above += 1;
+            } else if pc < val {
+                below += 1;
+            } else {
+                return None;
+            }
+        }
+    }
+    Some((above, below))
+}
+
+/// `point_outside_closed_contours`: -1 inside, 1 outside, 0 on a wall or unclear.
+fn outside(walls: &[(Pt, Pt)], p: Pt) -> i32 {
+    if walls.is_empty() {
+        return 1;
+    }
+    let parity = |hits: Option<(i32, i32)>| match hits {
+        None => Some(0),
+        Some((a, b)) if a % 2 == 1 && b % 2 == 1 => Some(-1),
+        Some((a, b)) if a % 2 == 0 && b % 2 == 0 => Some(1),
+        _ => None,
+    };
+    parity(ray_hits(walls, p, false)).or_else(|| parity(ray_hits(walls, p, true))).unwrap_or(0)
 }
 
 /// One line of a solid fill in the upright frame: at `x`, from `low` to `high`.
 #[derive(Clone, Copy, Debug)]
 struct Section {
-    x: f64,
-    low: f64,
-    high: f64,
+    x: i64,
+    low: i64,
+    high: i64,
+}
+
+impl Section {
+    fn length(&self) -> f64 {
+        (self.high - self.low).abs() as f64
+    }
 }
 
 #[derive(Clone, Default)]
@@ -632,7 +764,10 @@ struct LineNode {
     state: LineState,
 }
 
-const SHORT_LINE: f64 = 4.0;
+/// `_MAX_LINE_LENGTH_TO_FILTER`: `scaled<coord_t>(4.)`.
+fn short_line() -> f64 {
+    ((4.0 / 1e-6) as i64) as f64
+}
 const MAX_SKIPS: i32 = 2;
 const MIN_DEPTH: i32 = 5;
 
@@ -644,8 +779,7 @@ fn removable(nodes: &[Vec<LineNode>], at: (usize, usize)) -> bool {
     let Some(n) = node(nodes, at) else { return false };
     let initial_touching = n.previous.iter().any(|p| node(nodes, *p).is_some_and(|q| q.state.initial_touches_long));
     let has_next = n.next.iter().any(|p| node(nodes, *p).is_some_and(|q| !q.removed));
-    n.section.high - n.section.low < SHORT_LINE
-        && (n.state.total_short_lines > MIN_DEPTH || (!initial_touching && !has_next))
+    n.section.length() < short_line() && (n.state.total_short_lines > MIN_DEPTH || (!initial_touching && !has_next))
 }
 
 /// Filters out runs of short lines, which shake the printer (from OrcaSlicer's
@@ -685,13 +819,13 @@ fn filter_vibrating_lines(sections: &[Vec<Section>]) -> Vec<Vec<Section>> {
     for initial in 0..count {
         for i in 0..nodes.get(initial).map_or(0, Vec::len) {
             let Some(n) = node(&nodes, (initial, i)) else { continue };
-            if n.removed || n.section.high - n.section.low >= SHORT_LINE {
+            if n.removed || n.section.length() >= short_line() {
                 continue;
             }
             let touches = n
                 .previous
                 .iter()
-                .any(|p| node(&nodes, *p).is_some_and(|q| !q.removed && q.section.high - q.section.low >= SHORT_LINE));
+                .any(|p| node(&nodes, *p).is_some_and(|q| !q.removed && q.section.length() >= short_line()));
             if let Some(n) = nodes.get_mut(initial).and_then(|l| l.get_mut(i)) {
                 n.state = LineState {
                     min_skips_taken: 0,
@@ -717,7 +851,7 @@ fn filter_vibrating_lines(sections: &[Vec<Section>]) -> Vec<Vec<Section>> {
                     if m.removed {
                         continue;
                     }
-                    let short = m.section.high - m.section.low < SHORT_LINE;
+                    let short = m.section.length() < short_line();
                     let skip_allowed = state.min_skips_taken < MAX_SKIPS;
                     if !short && !skip_allowed {
                         continue;
@@ -764,26 +898,32 @@ fn filter_vibrating_lines(sections: &[Vec<Section>]) -> Vec<Vec<Section>> {
     nodes.into_iter().map(|l| l.into_iter().filter(|n| !n.removed).map(|n| n.section).collect()).collect()
 }
 
-/// Polygons round runs of neighbouring lines (each widened half a line along its length).
-fn trace_sections(sections: &[Vec<Section>], spacing: f64) -> Vec<Contour> {
+/// Polygons round runs of neighbouring lines, each widened half a spacing at both ends.
+fn trace_sections(sections: &[Vec<Section>], sp: i64) -> Vec<Path> {
     struct Traced {
-        lows: Vec<DVec2>,
-        highs: Vec<DVec2>,
+        lows: Vec<Pt>,
+        highs: Vec<Pt>,
     }
-    let limit = 2.0 * spacing;
-    let half = DVec2::new(spacing / 2.0, 0.0);
-    let close = |t: Traced, out: &mut Vec<Contour>| {
+    let limit = 2.0 * sp as f64;
+    let limit2 = limit * limit;
+    let widen = (0.5 * sp as f64).round() as i64;
+    let half = sp / 2;
+    let near = |p: Pt, q: Pt| {
+        let (dx, dy) = ((p.x - q.x) as f64, (p.y - q.y) as f64);
+        dx * dx + dy * dy < limit2
+    };
+    let left = |p: Pt| Pt::new(p.x - half, p.y);
+    let right = |p: Pt| Pt::new(p.x + half, p.y);
+    let close = |t: Traced, out: &mut Vec<Path>| {
         let mut c = t.lows;
         c.extend(t.highs.into_iter().rev());
         out.push(c);
     };
-    let mut out: Vec<Contour> = Vec::new();
+    let mut out: Vec<Path> = Vec::new();
     let mut open: Vec<Traced> = Vec::new();
     for section in sections {
-        let lines: Vec<(DVec2, DVec2)> = section
-            .iter()
-            .map(|l| (DVec2::new(l.x, l.low - spacing / 2.0), DVec2::new(l.x, l.high + spacing / 2.0)))
-            .collect();
+        let lines: Vec<(Pt, Pt)> =
+            section.iter().map(|l| (Pt::new(l.x, l.low - widen), Pt::new(l.x, l.high + widen))).collect();
         let mut used = vec![false; lines.len()];
         let mut still: Vec<Traced> = Vec::with_capacity(open.len());
         for mut t in open.drain(..) {
@@ -794,15 +934,15 @@ fn trace_sections(sections: &[Vec<Section>], spacing: f64) -> Vec<Contour> {
             let free = (first..end).any(|k| !used.get(k).copied().unwrap_or(true));
             match lines.get(first).filter(|_| free) {
                 Some(&(a, b)) => {
-                    if low.distance(a) < limit {
+                    if near(low, a) {
                         t.lows.push(a);
                     } else {
-                        t.lows.extend([low + half, a - half, a]);
+                        t.lows.extend([right(low), left(a), a]);
                     }
-                    if high.distance(b) < limit {
+                    if near(high, b) {
                         t.highs.push(b);
                     } else {
-                        t.highs.extend([high + half, b - half, b]);
+                        t.highs.extend([right(high), left(b), b]);
                     }
                     if let Some(u) = used.get_mut(first) {
                         *u = true;
@@ -810,8 +950,8 @@ fn trace_sections(sections: &[Vec<Section>], spacing: f64) -> Vec<Contour> {
                     still.push(t);
                 }
                 None => {
-                    t.lows.push(low + half);
-                    t.highs.push(high + half);
+                    t.lows.push(right(low));
+                    t.highs.push(right(high));
                     close(t, &mut out);
                 }
             }
@@ -819,7 +959,7 @@ fn trace_sections(sections: &[Vec<Section>], spacing: f64) -> Vec<Contour> {
         open = still;
         for (line, was_used) in lines.iter().zip(&used) {
             if !*was_used {
-                open.push(Traced { lows: vec![line.0 - half, line.0], highs: vec![line.1 - half, line.1] });
+                open.push(Traced { lows: vec![left(line.0), line.0], highs: vec![left(line.1), line.1] });
             }
         }
     }

@@ -39,10 +39,12 @@ What is left on the X2D, largest first:
 
 - Seams (Benchy's outer walls 50 %, see below); a seam that lands elsewhere also moves the wipe, the
   lift, and the travel to whatever comes next.
-- Concentric internal fill: about 40 % of Benchy's solid length, and the corners of `large`. Orca
-  fills narrow solid with `FillConcentricInternal`, which is Arachne; ours is a plain offset. Those
-  pieces also leave the rest of the region a different shape, so its bounding box moves every
-  rectilinear line by under a micron. Needs `split_narrow_solid` in integers and Arachne.
+- Narrow internal solid: `split_narrow_solid` is Orca's `split_solid_surface` in its integers now
+  (rotation, opening, the upright sections and their ray test, the anti-vibration filter, the
+  tracing, the safety offset and the merge of small pieces), and the pieces fill with Arachne as
+  `FillConcentricInternal` does. Where the cut runs along a line of the fill (rectangle corners,
+  `overhangs`, `large`) which end of that line the fill starts from turns on single nanometres of
+  the region; where our region matches Orca's to the nanometre, so does the fill.
 - Solid regions: where lines differ on Benchy layers 31 and 41, Orca's region has a small protrusion
   ours lacks, which shifts all the lines. The lines themselves match wherever the region does.
 - Layer cooling: a differing layer time gives a differing `F` on that layer's slowed moves.
@@ -177,7 +179,7 @@ These differ and the cause is not established.
 - Gap infill 0 %, prime tower 0 %.
 - Internal solid infill is the weakest feature (calicat 31 %, Benchy 55 %, steps 58 %): region edges
   come out a few hundredths of a millimetre off Orca's, so lines end elsewhere and fitted widths
-  differ. `split_narrow_solid` follows Orca's rules but in millimetres; an integer port is next.
+  differ. The narrow split is no longer the cause (calicat barely moved when it was ported).
 - Internal bridges: on `large`'s layer at 2.2 mm one corner of the anchored polygon extends the
   other way, and the zigzag then links the other way round; `anchored_polygon` is in millimetres too.
 - Islands: printed in `lslices` order now. Where our outlines' first points differ from Orca's the

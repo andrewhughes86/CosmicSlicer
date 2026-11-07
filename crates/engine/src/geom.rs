@@ -334,6 +334,16 @@ pub fn diff(subject: &[Path], clip: &[Path], safety: bool) -> Vec<Shape> {
     })
 }
 
+/// `intersection` of polygons, to plain loops, in Clipper's units.
+pub fn intersect_paths(subject: &[Path], clip: &[Path]) -> Paths {
+    guarded(|| clip_paths(ClipType::Intersection, subject, clip, FillType::NonZero))
+}
+
+/// Orca's `offset_ex` of polygons, by a positive `delta` in Clipper's units.
+pub fn expand_polygons(paths: &[Path], delta: f32) -> Vec<Shape> {
+    guarded(|| Ok(to_shapes(&expand_tree(paths, delta, JoinType::Miter, 3.0)?)))
+}
+
 /// `union_ex` of plain loops.
 pub fn union_paths(paths: &[Path]) -> Vec<Shape> {
     guarded(|| Ok(to_shapes(&clip_tree(ClipType::Union, paths, &[], FillType::NonZero)?)))

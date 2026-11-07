@@ -1213,11 +1213,9 @@ fn fills(out: &mut Vec<Path>, r: &Regions, infill_area: &[Shape], s: &Settings, 
     let (solid, gaps) = with_gap_fill(solid, s, solid_w, s.walls.gap_fill == GapFill::Everywhere, gap_speed);
     // Narrow strips of solid infill go round concentrically, quicker than short zig-zags.
     let (solid, narrow) = if s.walls.narrow_solid {
-        // The lines' direction on this layer, as the fill will lay them.
-        let as_set = !inf.solid_template.is_empty() || i.is_multiple_of(2);
-        let angle = solid_angle + if as_set { 0.0 } else { std::f64::consts::FRAC_PI_2 };
-        let line_pattern = infill::is_line_pattern(infill::kind_of(&s.solid_pattern));
-        infill::split_narrow_solid(&solid, Settings::spacing(solid_w, h), angle, line_pattern)
+        // Orca turns the lines a quarter on odd layers here even under a rotation template.
+        let kind = infill::kind_of(&s.solid_pattern);
+        infill::split_narrow_solid(&solid, solid_w, h, solid_angle, i % 2 == 1, at.origin, kind)
     } else {
         (solid, Vec::new())
     };
